@@ -9,3 +9,5 @@ description = "rezidnt socket protocol: versioned hello, JSONL frames, socket pa
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# ulid: Request::Attach carries a run id (S1 protocol addition).
+ulid.workspace = true

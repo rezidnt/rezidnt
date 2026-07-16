@@ -1,0 +1,27 @@
+# Dependency notes (rust-conventions: additions get a written note):
+# - toml: §13 project-spec parsing. NOT in the approved set — flagged in the
+#   S1 oracle work order for the auditor.
+# - rand: badge minting needs 256 cryptographically random bits (doc §12);
+#   nothing in the approved set provides randomness. Flagged likewise.
+# portable-pty stays phase-gated OUT of S1: claude-code headless needs no TTY;
+# the dep arrives with the first TTY-demanding harness (I7 — no idle deps).
+[package]
+name = "rezidnt-run"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rezidnt-types = { path = "../rezidnt-types" }
+rezidnt-cas = { path = "../rezidnt-cas" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "time", "io-util"] }
+toml = "0.8"
+rand = "0.9"
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -5,6 +5,8 @@ members = [
     "crates/rezidnt-fabric",
     "crates/rezidnt-state",
     "crates/rezidnt-proto",
+    "crates/rezidnt-cas",
+    "crates/rezidnt-run",
     "bins/rezidentd",
     "bins/rezidnt",
 ]
@@ -20,6 +22,13 @@ rezidnt-types = { path = "crates/rezidnt-types" }
 rezidnt-fabric = { path = "crates/rezidnt-fabric" }
 rezidnt-state = { path = "crates/rezidnt-state" }
 rezidnt-proto = { path = "crates/rezidnt-proto" }
+rezidnt-cas = { path = "crates/rezidnt-cas" }
+rezidnt-run = { path = "crates/rezidnt-run" }
+
+# dependency additions noted by the oracle (S1) — declared in rezidnt-run:
+# - toml: §13 project-spec parsing (NOT in the approved set; auditor-flagged)
+# - rand: 256-bit badge minting, doc §12 (NOT in the approved set; auditor-flagged)
+# portable-pty stays out until a TTY-demanding harness arrives (I7).
 
 # approved set (rust-conventions)
 serde = { version = "1", features = ["derive"] }

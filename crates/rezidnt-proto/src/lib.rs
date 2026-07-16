@@ -66,6 +66,38 @@ pub fn check_hello(hello: &Hello) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// Client request — the first line a client sends after reading the hello
+/// (S1 protocol addition). Tagged by `op`; unknown ops are a decode error.
+///
+/// Back-compat rule (S0 clients sent no request line): a connection that
+/// writes nothing is served as `Tail { subject: None }` — the S0 behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    /// Replay from seq 0 then stream live, optionally filtered by subject.
+    Tail {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+    },
+    /// Materialize a project: parse the §13 spec, allocate, spawn (S1).
+    Open { spec_toml: String },
+    /// Replay a run's capture ring, then proxy live bytes (dtach model).
+    Attach { run: ulid::Ulid },
+}
+
+/// Encode a request as one JSONL frame (single line, no trailing newline).
+pub fn encode_request(request: &Request) -> Result<String, ProtoError> {
+    let _ = request;
+    todo!("S1: single-line serde_json")
+}
+
+/// Decode a request frame. Unknown fields tolerated; unknown `op` is an
+/// honest decode error.
+pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
+    let _ = line;
+    todo!("S1: serde_json from line")
+}
+
 /// Pure socket-path resolution (testable without touching the process env):
 /// `Some(xdg_runtime_dir)` → `<xdg>/rezidnt.sock`; otherwise
 /// `<home>/.local/state/rezidnt/rezidnt.sock` (doc §9 fallback).

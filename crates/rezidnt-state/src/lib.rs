@@ -29,14 +29,41 @@ pub enum WorkspaceStatus {
     Closed,
 }
 
-/// The S0 entity graph. `BTreeMap` everywhere so equality and serialization
+/// One agent run's derived state (S1: the dossier's accounting seed).
+///
+/// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
+/// `s1_agent_run` golden fixture; payload schemas pending warden ratification):
+/// - `agent.spawned` `{run, ...}` → insert with `status = "spawning"`;
+/// - `agent.status.changed` `{run, from, to}` → `status = to`;
+/// - `agent.completed` `{run, status, cost{total_usd,input_tokens,
+///   output_tokens}, session_id, ...}` → `status = "completed"`, accounting
+///   fields recorded.
+///
+/// Statuses stay payload-strings in the graph: reducers must fold any live
+/// payload version, so they do not gatekeep through an enum (I3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentRunState {
+    pub status: String,
+    pub total_usd: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub session_id: Option<String>,
+}
+
+/// The entity graph. `BTreeMap` everywhere so equality and serialization
 /// are deterministic (the property tests compare whole graphs).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// S1 adds `agent_runs` additively: `#[serde(default)]` keeps every S0
+/// golden fixture parsing (and comparing equal) unedited.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     pub events_folded: u64,
     pub last_event: Option<Ulid>,
     pub counts_by_subject: BTreeMap<Subject, u64>,
     pub workspaces: BTreeMap<WorkspaceId, WorkspaceStatus>,
+    /// Keyed by the run ULID's canonical text form (payload `run` field).
+    #[serde(default)]
+    pub agent_runs: BTreeMap<String, AgentRunState>,
 }
 
 /// The pure reducer (doc §6: `fn apply(&mut Graph, &Event)`). No IO, no

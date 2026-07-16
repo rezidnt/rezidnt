@@ -1,0 +1,19 @@
+{
+  "events_folded": 3,
+  "last_event": "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+  "counts_by_subject": {
+    "agent.completed": 1,
+    "agent.spawned": 1,
+    "agent.status.changed": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01ARZ3NDEKTSV4RRFFQ69G5A01": {
+      "status": "completed",
+      "total_usd": 0.190075,
+      "input_tokens": 7441,
+      "output_tokens": 45,
+      "session_id": "83c61e05-aecf-4c70-93f4-ada974db33df"
+    }
+  }
+}

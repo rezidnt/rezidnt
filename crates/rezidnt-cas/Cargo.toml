@@ -1,0 +1,14 @@
+[package]
+name = "rezidnt-cas"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rezidnt-types = { path = "../rezidnt-types" }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }

@@ -82,7 +82,7 @@ Verdicts are `pass | fail | inconclusive` — never a bare boolean; `inconclusiv
 
 | Subject | v | Emitter | Semantics | Payload sketch |
 |---|---|---|---|---|
-| `artifact.captured` | 1 | any capturing component (run capture, gate evidence, git adapter) | Bytes were persisted to the CAS; the fabric carries the ref only (I2). | `{ref, mime, bytes, provenance}` |
+| `artifact.captured` | 1 | any capturing component (run capture, gate evidence, git adapter) | Bytes were persisted to the CAS; the fabric carries the ref only (I2). | `{ref: CasRef, provenance}` — ratified below; the v0 sketch's top-level `mime`/`bytes` ride inside the ref |
 
 ### diff
 
@@ -120,6 +120,66 @@ WARN and above from `tracing` are mirrored onto the fabric as `daemon.*` events 
 | `badge.issued` | 1 | daemon (security layer) | A per-run capability badge was minted: 256-bit token scoped to `{workspace, verb set, expiry}` (doc §12), injected at spawn (DR-001). Makes an agent's writes attributable in the log. |
 | `badge.revoked` | 1 | daemon (security layer) | A badge was revoked; mutating calls bearing it are refused thereafter. |
 
+## Payload schemas — v1 baselines
+
+Ratified per-subject payload shapes. A field marked `?` is optional and may be absent; readers tolerate unknown fields (additive evolution, doc §5). Types map JSON onto the rezidnt-types Rust shapes; `CasRef` is `{hash: blake3 hex string, bytes: u64, mime: string}`. Subjects not listed here have no ratified payload schema yet — their shape is proposal-stage until a warden session ratifies it. These baselines define v = 1; a breaking change to any of them mints v+1 per the change discipline above.
+
+### S1 set (ratified 2026-07-16)
+
+**`workspace.opened` v1** — the envelope `workspace` id is the entity key (reducers fold on it); the payload carries human-facing identity.
+- `name: string` — workspace name from the project spec.
+- `root: string` — canonicalized absolute path of the workspace root.
+
+**`workspace.spec.applied` v1**
+- `spec_ref?: CasRef` — the applied spec file as persisted to the CAS; optional because an open may apply an inline/default spec with no persisted blob.
+- `agents: [string]` — spec agent names configured by the applied spec.
+
+**`worktree.allocated` v1**
+- `path: string` — canonicalized worktree path; exists on disk at emission time.
+- `branch?: string` — branch checked out in the worktree, when one was requested.
+- `allocator: "rezidnt"` — sole-allocator model (DR-001). The value `"human"` is reserved for out-of-band observation and is never emitted by rezidnt on this subject.
+
+**`agent.spawned` v1**
+- `run: string` — RunId ULID; the key every `agent.*` fact carries.
+- `agent: string` — spec agent name.
+- `harness: string` — harness identifier (e.g. `claude-code`).
+- `harness_version?: string` — as probed at spawn; version-gated per adapter.
+- `pid?: u32` — OS process id when known at emission.
+- `badge_id: string` — loggable badge identifier. NEVER the badge token (doc §12); the token exists only in the spawned environment.
+
+**`agent.status.changed` v1** — state delta.
+- `run: string`
+- `from: string`, `to: string` — run-status vocabulary: `spawning | running | completed | failed | signaled`.
+
+**`agent.completed` v1** — dossier accounting (DR-001).
+- `run: string`
+- `status: "success" | "error"` — the harness result outcome. This is a distinct vocabulary from the run-status values of `agent.status.changed` (`completed`/`failed`); reducers must not conflate the two.
+- `cost: {total_usd: f64, input_tokens: u64, output_tokens: u64}`
+- `num_turns: u64`
+- `duration_ms: u64`
+- `session_id?: string` — harness session id, captured for run checkpointing (`--resume`, DR-001).
+
+**`agent.signaled` v1**
+- `run: string`
+- `signal: string` — the delivered signal name (e.g. `SIGTERM`, `SIGKILL`).
+- `escalation?: "term" | "kill"` — present when the signal came from the reaper's TERM→KILL escalation path, recording the stage; absent for out-of-band signals.
+
+**`agent.tool.invoked` v1** — harness telemetry (DR-001).
+- `run: string`
+- `tool: string` — tool name as reported by the harness.
+- `input_summary?: string` — truncated human-readable summary of the tool input; bulk input goes to the CAS and rides `artifact.captured`, never inline (I2).
+
+**`agent.message` v1** — harness telemetry (DR-001). Carries exactly one of `text` / `ref`.
+- `run: string`
+- `role: "assistant"` — fixed in v1; other roles arrive additively.
+- `text?: string` — inline only when ≤ 8 KiB (DEFAULT cap; keeps envelope headroom under the 32 KiB I2 hard cap).
+- `ref?: CasRef` — bulk message body persisted to the CAS.
+
+**`artifact.captured` v1**
+- `ref: CasRef` — carries `hash`, `bytes`, `mime`; the v0 sketch's top-level `mime`/`bytes` live inside the ref (no duplicated fields).
+- `provenance: {run?: string, kind: string, chunk?: u64}` — `run` when the artifact belongs to an agent run; `kind` names the capture class (e.g. `capture-chunk`, `diff`, `gate-evidence`); `chunk` is the 0-based ordinal within the run's capture stream, present iff `kind = "capture-chunk"`. DR-001 chunked run output rides this subject via ref-only manifest facts (`rezidnt-run` `ManifestEntry {run, chunk, ref}`); whether high-rate capture chunks deserve a dedicated subject is an open question flagged for `/dr` — not minted here.
+
 ## Changelog
 
 - 2026-07-16 · warden · bootstrap: taxonomy v0 transcribed from architecture doc v0.2 Appendix B; DR-001 additions `agent.tool.invoked` and `agent.message` (native harness telemetry); DR-001 scope note on `worktree.observed`/`worktree.conflict` (out-of-band guard only, rezidnt sole allocator); all subjects minted at `v = 1`.
+- 2026-07-16 · warden · S1 payload ratification: v1 payload baselines recorded for `workspace.opened`, `workspace.spec.applied`, `worktree.allocated`, `agent.spawned`, `agent.status.changed`, `agent.completed`, `agent.signaled`, `agent.tool.invoked`, `agent.message`, `artifact.captured` — additive documentation of shape, every subject stays `v = 1`; `artifact.captured` sketch normalized (top-level `mime`/`bytes` subsumed into `ref: CasRef`); capture chunks ride `artifact.captured` via `provenance.kind = "capture-chunk"` + `provenance.chunk`, dedicated capture subject deferred and flagged for `/dr`.

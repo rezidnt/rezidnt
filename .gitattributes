@@ -1,0 +1,6 @@
+# The daemon and exit demos run in WSL2; the vet gauntlet runs host-side.
+# Shell scripts and golden fixtures must check out byte-identical everywhere.
+* text=auto
+*.sh text eol=lf
+*.jsonl text eol=lf
+*.expected.json text eol=lf

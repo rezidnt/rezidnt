@@ -1,0 +1,7 @@
+{
+  "name": "rezidnt-harness",
+  "version": "0.1.0",
+  "description": "Agent team, skills, commands, and enforcement hooks for building the rezidnt daemon under maker-checker discipline.",
+  "author": { "name": "TwofoldTech LLC" },
+  "keywords": ["rust", "agents", "claude-code", "harness", "event-sourcing", "maker-checker"]
+}

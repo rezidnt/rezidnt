@@ -25,7 +25,6 @@ criteria pass /vet and /debrief. Nothing else counts as done.
 ## Guardrails (hooks, enforced)
 - `spec/ontology.md` edits are blocked outside a /subject session (ontology-gate).
 - herdr/AGPL sources are blocked from Read/Fetch/clone everywhere (firewall, DR-002).
-- `git push` is blocked until `.claude/state/ip-memo-cleared` exists (pushgate — the employer IP memo gate).
 - edited .rs files are auto-rustfmt'd (fmt, PostToolUse).
 
 ## Style (full text: rust-conventions skill)

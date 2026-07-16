@@ -18,8 +18,8 @@
 - Warden: `daemon.warning` payload ratification (bounded error); `badge.issued` emit-or-drop decision; capture-chunk dedicated-subject question.
 - Fixtures: re-record tool_use transcript from a real run (PROVISIONAL); regenerate s0_rebuild_equality line 3 (pre-ratification payload).
 
-## Standing gates (owner-only, unchanged)
-employer IP memo (push blocked until `.claude/state/ip-memo-cleared`); name registry checks (fallback `rezident`).
+## Standing gate (owner-only)
+Name registry checks (fallback `rezident`). The IP-memo pushgate was retired by DR-003 (2026-07-16); push is unblocked.
 
 ## Environment (unchanged)
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo at `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`. Vet hooks run host-side Windows cargo; unix tests need WSL.

@@ -38,11 +38,10 @@ Drop the `.claude/` directory and `CLAUDE.md` at the root of the rezidnt repo. A
 
 ## The guardrails (hooks — verified blocking, not advisory)
 - **firewall** — blocks Read/Fetch/clone of herdr (AGPL) sources everywhere (I8 / DR-002). Omnigent docs pass.
-- **pushgate** — blocks `git push` until `.claude/state/ip-memo-cleared` exists (the employer IP memo gate). Commits pass.
 - **ontology-gate** — blocks direct `spec/ontology.md` edits outside a `/subject` session.
 - **fmt** — auto-rustfmt on every edited `.rs` file.
 
-All four were behavioral-smoke-tested (10/10) — they consume real tool-call JSON on stdin and were
+All were behavioral-smoke-tested — they consume real tool-call JSON on stdin and were
 confirmed to block what must block and pass what must pass.
 
 ## The skills (shared knowledge, auto-loaded)
@@ -52,8 +51,8 @@ confirmed to block what must block and pass what must pass.
 `prior-art-protocol` (DR-002 mechanics) · `slice-discipline` (roadmap + per-slice acceptance criteria).
 
 ## First session
-1. Clear the two things the harness can't do for you: register the name across crates.io/npm/domains, and
-   execute the employer IP memo + carve-out. Until the memo is signed, `git push` stays blocked by design.
+1. Clear the one thing the harness can't do for you: register the name across crates.io/npm/domains
+   (`rezident` is the fallback string).
 2. `/slice` → `/oracle fabric` → build S0 to green → `/vet` → `/debrief`.
 3. `/handoff` before you stop.
 

@@ -3,7 +3,7 @@
 **Version:** 0.1 (pre-code) · **Owner:** TwofoldTech LLC · **License posture:** Apache-2.0 (see §17)
 **Status flags used throughout:** **BINDING** (change requires a written decision record), **DEFAULT** (best current call; cheap to revisit), **PROVISIONAL** (expected to change; do not build against).
 
-> Standing gates, restated once: the name ships only after registry checks pass (`rezident` is the fallback string), and the repository stays private until the employer IP memo and carve-out letter are executed. Nothing in this document overrides either gate.
+> Standing gate, restated once: the name ships only after registry checks pass (`rezident` is the fallback string). Nothing in this document overrides it. (A second gate — repository privacy pending an employer IP memo — was retired by DR-003.)
 
 ---
 
@@ -297,7 +297,7 @@ Sequencing law, restated because it is the project's most-violated invariant in 
 
 ## 17. Repository, licensing, and the commercial seam
 
-Public repo `rezidnt/rezidnt` from first push (post-memo): Apache-2.0 at root, `MIT OR Apache-2.0` on `crates/*` libs, DCO enforced, NOTICE carrying Omnigent attributions for ported code, TRADEMARKS.md (mark owned by TwofoldTech LLC), SECURITY.md, CONTRIBUTING.md. Excluded from this repo permanently: `rezidnt-enterprise` (RBAC/SSO/audit-export, hosted control plane if ever), domain verifier judgment packs, the benchmark held-out set, and anything employer-affiliated pending the memo. The seam is structural — separate repos, separate crates — so a future dual-license or paid tier requires zero untangling, exercised or not.
+Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apache-2.0` on `crates/*` libs, DCO enforced, NOTICE carrying Omnigent attributions for ported code, TRADEMARKS.md (mark owned by TwofoldTech LLC), SECURITY.md, CONTRIBUTING.md. Excluded from this repo permanently: `rezidnt-enterprise` (RBAC/SSO/audit-export, hosted control plane if ever), domain verifier judgment packs, and the benchmark held-out set. The seam is structural — separate repos, separate crates — so a future dual-license or paid tier requires zero untangling, exercised or not.
 
 ## 18. Risk register
 
@@ -449,3 +449,23 @@ Concern raised: using Omnigent as a "donor" — even read-only — anchors rezid
 7. **Post-freeze gap-diff.** The single sanctioned design-adjacent use: after ontology v1 freezes, one scoped read of Omnigent's event/policy taxonomy to diff for *coverage gaps* ("do they handle a lifecycle fact we lack a subject for?"). Output is a memo per rule 2; additions require a DR per rule 3.
 
 *Amendments to this record require DR-003.*
+
+---
+
+# Decision Record DR-003 — Retire the employer IP memo standing gate
+
+**Date:** 2026-07-16 · **Status:** ACCEPTED (owner) · **Amends:** the preamble standing gates and §17; removes the pushgate guardrail from the development harness. Reverses nothing in DR-001/DR-002.
+
+## Decision
+
+The repository-stays-private-until-the-employer-IP-memo-is-executed standing gate is retired in full. `git push` is no longer blocked; the repository may be made public at the owner's discretion. The name-registry standing gate (`rezident` fallback) is unchanged.
+
+## Basis
+
+Owner determination, 2026-07-16: the employer-IP question the gate guarded against is not a concern for this project. The maintainers raised the risk profile of removing the gate without an executed memo (publication is the irreversible step; an IP dispute surfacing post-publication is the expensive form) and the owner accepted it and directed removal. This record exists so the decision is dated and attributable rather than implicit.
+
+## Mechanical changes
+
+Preamble standing-gates line reduced to the name gate. §17's "(post-memo)" qualifier and its memo-pending exclusion clause deleted. Harness: `.claude/hooks/pushgate.sh` deleted, its PreToolUse registration removed from `.claude/settings.json`, the session-start gate notice dropped from `slice-status.sh`, and the README/CLAUDE.md guardrail references updated. The `.claude/state/ip-memo-cleared` marker mechanism ceases to exist.
+
+*Amendments to this record require DR-004.*

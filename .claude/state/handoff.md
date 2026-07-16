@@ -1,22 +1,25 @@
-# Handoff — 2026-07-16
+# Handoff — 2026-07-16 (session 2 close)
 
 ## State of play
-**Current slice: S1** (native run substrate) — not started. Pointer advanced this session after S0 closed clean: vet pass on Windows host AND WSL2, auditor /debrief pass (second round; first round failed on a real defect, remediated), composed exit demo on the record (301 events → two identical concurrent subscribers → kill -9 → byte-identical rebuilds).
+**Current slice: S2** (git adapter) — not started. S1 closed this session: first debrief FAILED (no `rezidnt open`/`attach` CLI verbs — daemon mechanics existed but weren't human-typeable; plus I4 harness-field-ignored), remediated oracle-first (4 CLI-surface pins at affeb89, verbs + atomic harness refusal at 15a34d8), re-debrief PASS. Boards at close: Windows vet pass; WSL 41 suites / 77 tests / 0 failed; fixtures green.
 
-## What changed this session (all of git history is this session)
-- `320886b` foundation: harness, docs/rezidnt-architecture.md (DR-002 flipped to ACCEPTED 2026-07-16 by owner), spec/ontology.md (warden-bootstrapped, 33 subjects, v=1).
-- `cfbc270` S0 oracle board: 33 oracle tests + 3 implementer regression files (all failing-first), golden fixtures, replay script.
-- `c1a890d` S0 implementation: types/fabric/state/proto crates + rezidentd/rezidnt bins. Delivery adjudicates by log seq, never id order (the debrief fail-driver).
-- Environment: WSL Ubuntu-24.04 got rustup (stable+fmt+clippy). NOT the default distro — invoke `wsl.exe -d Ubuntu-24.04`, use `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`.
+## What changed this session (since 029781b)
+- `b75ea03` S1 oracle board (36 red; REAL recorded claude 2.1.191 transcript fixture) → `06f3edc` warden payload ratification (10 subjects, zero drift) → `b300a27` fixture provenance fix (oracle recorded 2 runs, installed the wrong one; restored pinned run verbatim) → `1ac0cff` S1 implementation (rezidnt-cas, rezidnt-run, proto requests, agent-run reducers, daemon open/attach) → `affeb89` CLI pins → `15a34d8` remediation.
+- Agent-path note: a sustained 529 outage forced the S1 oracle round to run INLINE in the main session (fixture mixup above was the cost); agents recovered from the warden round on.
 
 ## Next action
-**`/oracle run`** — oracle writes failing S1 tests: rezidnt-run (DR-001: spawner/capture/persistence/reaper), `rezidnt open` materialization, kill-client-survives, attach tail replay. Prereq inside that round: record a REAL `claude -p --output-format stream-json --verbose` transcript once as the adapter contract fixture (testing-oracles skill).
+**S2 planning: triage the tracked list below into S2 scope vs deferred, then `/oracle git`** (S2 criteria: `diff.ready` ≤1 s post-debounce; out-of-band worktree collision → exactly one `worktree.conflict`).
 
-## Open /debrief findings (non-blocking, need slice assignment during S1 planning)
-1. Streaming replay — tail currently builds O(log) String per connection; needed before S1 event volume (likely S1 scope).
-2. §12 fabric-ingress redaction pass — DEFAULT-on in doc, unbuilt; assign a slice or /dr it out.
-3. `tail --subject` has zero automated coverage.
-4. Nits: bind→chmod window on the UDS; stale "todo stub" doc comment in rezidnt-types; fixture_replay.rs comment slightly inaccurate post-I2-hardening.
+## Tracked items (auditor's list, re-debrief-updated — triage at S2 planning)
+- **/dr REQUIRED before Phase 2**: exit-code table collision (local-input exit 2 vs §9 gate-fail=2; daemon-refusal exit 3 semantics).
+- S2-adjacent (natural scope): committed-repo detach worktree test; `worktree.released` + `.rezidnt/worktrees` registry; `worktree.allocated` source-id → git adapter; streaming tail backlog (S0 carryover, O(log) String per client).
+- Hardening: `open` watch-loop deadline (same-millisecond marker skip → hang); strengthen `open_refuses_unknown_harness` (assert zero workspace/worktree facts; multi-agent case); version_gate wiring (bite: init line's `claude_code_version`); reaper wiring (pidfiles at spawn, startup reconcile, emit `agent.signaled`); harness stderr capture; denylist widening; `agent.message` >8 KiB swap-path test.
+- Proto/S3: request-scoped open ack (deletes name-match heuristic); attach unknown-run error frame (currently reads as silent success).
+- Warden: `daemon.warning` payload ratification (bounded error); `badge.issued` emit-or-drop decision; capture-chunk dedicated-subject question.
+- Fixtures: re-record tool_use transcript from a real run (PROVISIONAL); regenerate s0_rebuild_equality line 3 (pre-ratification payload).
 
-## Decisions needing /dr
-None pending. Standing gates (owner-only, unchanged): employer IP memo (push blocked until `.claude/state/ip-memo-cleared`), name registry checks (fallback `rezident`).
+## Standing gates (owner-only, unchanged)
+employer IP memo (push blocked until `.claude/state/ip-memo-cleared`); name registry checks (fallback `rezident`).
+
+## Environment (unchanged)
+WSL = `wsl.exe -d Ubuntu-24.04`, cargo at `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`. Vet hooks run host-side Windows cargo; unix tests need WSL.

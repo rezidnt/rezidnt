@@ -1,0 +1,21 @@
+{
+  "events_folded": 12,
+  "last_event": "01KXM48540000000001G000070",
+  "counts_by_subject": {
+    "adapter.health.changed": 1,
+    "agent.completed": 1,
+    "agent.spawned": 1,
+    "agent.status.changed": 1,
+    "agent.tool.invoked": 1,
+    "daemon.started": 1,
+    "gate.entered": 1,
+    "gate.passed": 1,
+    "workspace.closed": 1,
+    "workspace.opened": 2,
+    "workspace.spec.applied": 1
+  },
+  "workspaces": {
+    "01KXM3J60000000000000002PE": "Open",
+    "01KXM3J6000000000000001FKT": "Closed"
+  }
+}

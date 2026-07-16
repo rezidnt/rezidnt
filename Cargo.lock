@@ -596,6 +596,7 @@ dependencies = [
  "clap",
  "rezidnt-fabric",
  "rezidnt-proto",
+ "rezidnt-run",
  "rezidnt-state",
  "rezidnt-types",
  "serde_json",

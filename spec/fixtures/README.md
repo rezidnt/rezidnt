@@ -17,7 +17,7 @@ independently of the implementation — they are the oracle, not its echo.
 - `s0_envelope_additive.jsonl` — envelopes carrying unknown fields at both the
   envelope and payload level; must always decode (additive evolution, doc §5).
 
-## Current set (S0)
+## Current set
 
 | Fixture | Pins |
 |---|---|
@@ -25,6 +25,8 @@ independently of the implementation — they are the oracle, not its echo.
 | `s0_chain_valid.jsonl` | the exact chain formula — an honest log with precomputed links verifies end-to-end |
 | `s0_chain_tamper.jsonl` | tamper-evidence — row 4's payload was edited after the chain was written; verification must name seq 4 |
 | `s0_envelope_additive.jsonl` | unknown envelope/payload fields never break deserialization |
+| `s1_agent_run.jsonl` (+ `.expected.json`) | S1 agent-run reducers: `agent.spawned` / `agent.status.changed` / `agent.completed` fold into `agent_runs` keyed by payload `run` — status transitions plus dossier accounting (cost, tokens, session id) |
+| `transcripts/` | recorded claude-code stream-json for the adapter contract — see `transcripts/README.md` for provenance |
 
 Regenerating or editing a fixture is an oracle act: expected values must be
 derived independently of `rezidnt-fabric`/`rezidnt-state` internals.

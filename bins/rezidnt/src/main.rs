@@ -1,24 +1,40 @@
 //! `rezidnt` — the CLI.
 //!
-//! S0 verbs (doc §9):
+//! Verbs (doc §9):
 //! - `rezidnt rebuild --db <path> --json` — refold from seq 0, print the
 //!   `rezidnt_state::Graph` as JSON on stdout, exit 0. Pinned by
 //!   `tests/rebuild_cli.rs`. Cross-platform.
 //! - `rezidnt tail [--subject …]` — connect to the daemon socket, print the
 //!   stream. Exercised by the S0 exit demo (two concurrent `rezidnt tail`
 //!   clients), not by an automated oracle test — see the S0 work order.
+//! - `rezidnt open <spec-path>` — materialize a workspace from a §13 spec
+//!   file through the daemon; prints EXACTLY one stdout line
+//!   `opened <workspace-name> run <run-ulid>` once `agent.spawned` is
+//!   observed on the stream (the id is the fabric's, not decoration).
+//!   Pinned by `bins/rezidentd/tests/cli_verbs.rs`.
+//! - `rezidnt attach <run-ulid>` — replay the run's capture ring, then
+//!   stream live bytes to stdout until EOF (dtach model). Pinned likewise.
 //!
 //! Stable exit codes (doc §9): 0 ok, 2 gate-fail, 3 substrate-fault,
-//! 4 daemon-unreachable. S0 mapping: `rebuild` failures are substrate faults
-//! (the log store misbehaved) → 3; `tail` failures are daemon-side
-//! (unreachable socket, bad hello, proto mismatch) → 4.
+//! 4 daemon-unreachable. Mapping: `rebuild` failures are substrate faults
+//! (the log store misbehaved) → 3; `tail`/`attach` failures are daemon-side
+//! (unreachable socket, bad hello, proto mismatch) → 4. `open`: a
+//! missing/unreadable/unparseable spec file is a LOCAL input error → 2
+//! (clap's usage-error convention, pinned by cli_verbs.rs; the §9 gate-fail
+//! collision on the number 2 is flagged for /dr, not resolved here); a
+//! daemon-side open-failed refusal → 3; connection failures → 4.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rezidnt", version, about = "rezidnt CLI (S0: rebuild, tail)")]
+#[command(
+    name = "rezidnt",
+    version,
+    about = "rezidnt CLI: rebuild, tail, open, attach"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -41,6 +57,17 @@ enum Cmd {
         #[arg(long)]
         subject: Option<String>,
     },
+    /// Materialize a workspace from a project spec file (doc §13) and spawn
+    /// its agents through the daemon.
+    Open {
+        /// Path to the project spec (rezidnt.toml shape).
+        spec: PathBuf,
+    },
+    /// Replay a run's capture tail, then stream live bytes (dtach model).
+    Attach {
+        /// The run ULID, as printed by `rezidnt open`.
+        run: String,
+    },
 }
 
 fn main() {
@@ -49,11 +76,44 @@ fn main() {
     let (failure_code, result) = match cli.cmd {
         Cmd::Rebuild { db, json } => (3, rebuild(&db, json)),
         Cmd::Tail { subject } => (4, tail(subject.as_deref())),
+        Cmd::Open { spec } => {
+            // Local input phase: exit 2 (see module docs for the /dr flag).
+            let (name, spec_toml) = match read_spec(&spec) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    eprintln!("rezidnt: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            (4, open(&name, spec_toml))
+        }
+        Cmd::Attach { run } => {
+            // A malformed run id is the same local-input class as a bad spec.
+            let run = match run.parse::<ulid::Ulid>() {
+                Ok(run) => run,
+                Err(e) => {
+                    eprintln!("rezidnt: run id {run:?} is not a ULID: {e}");
+                    std::process::exit(2);
+                }
+            };
+            (4, attach(run))
+        }
     };
     if let Err(e) = result {
         eprintln!("rezidnt: {e:#}");
         std::process::exit(failure_code);
     }
+}
+
+/// Read and parse the spec file locally: the success line needs
+/// `[project].name`, and a spec that cannot be read or parsed should fail
+/// fast with the offending path on stderr, before any daemon traffic.
+fn read_spec(path: &Path) -> anyhow::Result<(String, String)> {
+    let spec_toml = std::fs::read_to_string(path)
+        .with_context(|| format!("read spec file {}", path.display()))?;
+    let spec = rezidnt_run::spec::ProjectSpec::from_toml_str(&spec_toml)
+        .with_context(|| format!("parse spec file {}", path.display()))?;
+    Ok((spec.name, spec_toml))
 }
 
 /// `rebuild` = fold(log from seq 0); the log is truth, the graph is derived (I3).
@@ -74,14 +134,16 @@ fn rebuild(db: &std::path::Path, compact: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Unix socket client plumbing shared by `tail`/`open`/`attach`: connect,
+/// consume + check the hello, send the request line, hand back the reader.
 #[cfg(unix)]
-fn tail(subject: Option<&str>) -> anyhow::Result<()> {
+fn connect_and_request(
+    request: &rezidnt_proto::Request,
+) -> anyhow::Result<std::io::BufReader<std::os::unix::net::UnixStream>> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    use anyhow::Context;
-    use rezidnt_proto::{check_hello, decode_hello, socket_path};
-    use rezidnt_types::Event;
+    use rezidnt_proto::{check_hello, decode_hello, encode_request, socket_path};
 
     let sock = socket_path();
     let stream = UnixStream::connect(&sock)
@@ -93,21 +155,24 @@ fn tail(subject: Option<&str>) -> anyhow::Result<()> {
     let hello = decode_hello(hello_line.trim_end()).context("decode hello")?;
     check_hello(&hello).context("proto check")?;
 
-    // S1 request line: an explicit tail (with server-side subject filter)
-    // skips the daemon's S0 back-compat silence window.
-    let request = rezidnt_proto::encode_request(&rezidnt_proto::Request::Tail {
+    let frame = encode_request(request).context("encode request")?;
+    let stream = reader.get_mut();
+    stream.write_all(frame.as_bytes()).context("send request")?;
+    stream.write_all(b"\n").context("send request newline")?;
+    Ok(reader)
+}
+
+#[cfg(unix)]
+fn tail(subject: Option<&str>) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    use rezidnt_types::Event;
+
+    // Explicit tail request (server-side subject filter) skips the daemon's
+    // S0 back-compat silence window.
+    let mut reader = connect_and_request(&rezidnt_proto::Request::Tail {
         subject: subject.map(String::from),
-    })
-    .context("encode tail request")?;
-    {
-        let stream = reader.get_mut();
-        stream
-            .write_all(request.as_bytes())
-            .context("send tail request")?;
-        stream
-            .write_all(b"\n")
-            .context("send tail request newline")?;
-    }
+    })?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -131,10 +196,109 @@ fn tail(subject: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
+/// `open`: send the spec, then watch the stream for THIS open's facts and
+/// print the pinned one-line identity once `agent.spawned` lands.
+///
+/// Discriminating "this open" from replayed history: envelope ids are
+/// time-ordered ULIDs minted by the daemon on the same host (UDS), so a
+/// marker ULID minted client-side before the request separates history
+/// (id ≤ marker) from consequences (id > marker). The chain itself is then
+/// followed by correlation: our `workspace.opened` (matching the spec's
+/// name) names the correlation, and the `agent.spawned` on that correlation
+/// carries the authoritative run id.
+#[cfg(unix)]
+fn open(name: &str, spec_toml: String) -> anyhow::Result<()> {
+    use std::io::BufRead;
+
+    use rezidnt_types::Event;
+
+    let marker = ulid::Ulid::new();
+    let mut reader = connect_and_request(&rezidnt_proto::Request::Open { spec_toml })?;
+
+    let mut correlation: Option<ulid::Ulid> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).context("read event")?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the stream before the open completed");
+        }
+        let frame = line.trim_end();
+        if frame.is_empty() {
+            continue;
+        }
+        let event = Event::from_json_line(frame).context("decode event frame")?;
+        if event.id <= marker {
+            continue; // replayed history from before this open
+        }
+        match event.subject.as_str() {
+            "workspace.opened"
+                if correlation.is_none() && event.payload()["name"].as_str() == Some(name) =>
+            {
+                correlation = Some(event.correlation);
+            }
+            "agent.spawned" if correlation == Some(event.correlation) => {
+                let run = event.payload()["run"]
+                    .as_str()
+                    .context("agent.spawned payload carries no run id")?;
+                // The pinned output shape (cli_verbs.rs): exactly one line.
+                println!("opened {name} run {run}");
+                return Ok(());
+            }
+            "daemon.warning" if event.payload()["what"] == "open-failed" => {
+                // Daemon-side refusal: substrate fault class (§9 → 3).
+                eprintln!(
+                    "rezidnt: open failed: {}",
+                    event.payload()["error"].as_str().unwrap_or("(no detail)")
+                );
+                std::process::exit(3);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `attach`: raw byte copy of the daemon's replay-then-live capture stream
+/// to stdout until EOF (dtach model — no TTY work, no decoding).
+#[cfg(unix)]
+fn attach(run: ulid::Ulid) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut reader = connect_and_request(&rezidnt_proto::Request::Attach { run })?;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).context("read capture bytes")?;
+        if n == 0 {
+            return Ok(()); // run finished (or daemon closed): EOF
+        }
+        out.write_all(&buf[..n]).context("write capture bytes")?;
+        out.flush().context("flush capture bytes")?;
+    }
+}
+
 #[cfg(not(unix))]
 fn tail(_subject: Option<&str>) -> anyhow::Result<()> {
     anyhow::bail!(
-        "rezidnt tail S0 speaks a Unix domain socket only; the Windows named pipe \
+        "rezidnt tail speaks a Unix domain socket only; the Windows named pipe \
+         (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
+    )
+}
+
+#[cfg(not(unix))]
+fn open(_name: &str, _spec_toml: String) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "rezidnt open speaks a Unix domain socket only; the Windows named pipe \
+         (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
+    )
+}
+
+#[cfg(not(unix))]
+fn attach(_run: ulid::Ulid) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "rezidnt attach speaks a Unix domain socket only; the Windows named pipe \
          (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
     )
 }

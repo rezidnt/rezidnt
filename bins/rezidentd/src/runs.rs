@@ -166,8 +166,29 @@ pub async fn materialize_open(daemon: Arc<Daemon>, spec_toml: String) {
     }
 }
 
+/// Harnesses this daemon's S1 run substrate can drive. The AgentSubstrate
+/// trait seam (I4) is S2+ architecture; until it lands this name gate is the
+/// refusal point.
+const SUPPORTED_HARNESSES: &[&str] = &["claude-code"];
+
 async fn try_materialize_open(daemon: &Arc<Daemon>, spec_toml: &str) -> anyhow::Result<()> {
     let spec = ProjectSpec::from_toml_str(spec_toml).context("parse project spec")?;
+
+    // I4: refusal keys on the harness NAME, before anything materializes —
+    // a spec naming an unknown harness produces no workspace, no worktree,
+    // and no agent.spawned; the refusal surfaces in `tail` as the
+    // `daemon.warning {what: "open-failed"}` this function's caller emits.
+    for agent in &spec.agents {
+        if !SUPPORTED_HARNESSES.contains(&agent.harness.as_str()) {
+            anyhow::bail!(
+                "unknown harness {:?} for agent {:?} — this daemon speaks {SUPPORTED_HARNESSES:?}; \
+                 refused at open, nothing materialized",
+                agent.harness,
+                agent.name,
+            );
+        }
+    }
+
     let correlation = Ulid::new();
     let workspace = WorkspaceId::new(Ulid::new());
 

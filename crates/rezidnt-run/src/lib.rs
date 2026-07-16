@@ -1,8 +1,5 @@
 //! The run substrate (DR-001's `rezidnt-run`): spawner, capture, persistence,
 //! reaper, plus the claude-code adapter and the §13 project-spec parser.
-//!
-//! S1 oracle note: everything below the type layer is a `todo!()` stub. The
-//! failing tests under `tests/` are the implementer's work order.
 
 pub mod adapter;
 pub mod badge;

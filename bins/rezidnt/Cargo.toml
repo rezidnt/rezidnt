@@ -10,10 +10,15 @@ anyhow.workspace = true
 clap.workspace = true
 rezidnt-fabric.workspace = true
 rezidnt-proto.workspace = true
+# rezidnt-run: `open` parses the §13 spec locally (success line needs
+# [project].name; bad specs fail fast with the path named) — S1 CLI verbs.
+rezidnt-run.workspace = true
 rezidnt-state.workspace = true
 rezidnt-types.workspace = true
 serde_json.workspace = true
+# ulid: approved set; `attach <run-ulid>` parses its argument and `open`
+# mints the history/consequence marker.
+ulid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-ulid.workspace = true

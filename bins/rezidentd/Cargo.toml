@@ -1,0 +1,23 @@
+[package]
+name = "rezidentd"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "the rezidnt daemon"
+
+[dependencies]
+anyhow.workspace = true
+# blake3: approved set; the hello's `schema` field is a blake3 hash of the
+# compiled-in taxonomy (doc §9: ontology hash).
+blake3.workspace = true
+rezidnt-fabric.workspace = true
+rezidnt-proto.workspace = true
+rezidnt-types.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# ulid: approved set; the daemon mints correlation ids for its own events.
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

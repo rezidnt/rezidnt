@@ -1,0 +1,13 @@
+[package]
+name = "rezidnt-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt event envelope, subjects, and entity id newtypes (doc §5)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+ulid.workspace = true

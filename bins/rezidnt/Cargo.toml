@@ -1,0 +1,19 @@
+[package]
+name = "rezidnt"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "the rezidnt CLI"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rezidnt-fabric.workspace = true
+rezidnt-proto.workspace = true
+rezidnt-state.workspace = true
+rezidnt-types.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ulid.workspace = true

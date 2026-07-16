@@ -1,0 +1,32 @@
+[package]
+name = "rezidnt-fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt event bus, append-only log, hash chain, replay (doc §5–§6)"
+
+[dependencies]
+rezidnt-types.workspace = true
+blake3.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# time: promoted from dev-deps by the S0 implementation — the log's `ts`
+# column is RFC3339 TEXT, formatted on append and parsed back on read.
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+# dev-dep on rezidnt-state is intentional: the crash-safety oracle folds the
+# recovered log into a Graph. state depends only on rezidnt-types, so this is
+# acyclic.
+rezidnt-state.workspace = true
+proptest.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "burst-writer"
+path = "src/bin/burst-writer.rs"

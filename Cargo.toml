@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rezidnt-types",
+    "crates/rezidnt-fabric",
+    "crates/rezidnt-state",
+    "crates/rezidnt-proto",
+    "bins/rezidentd",
+    "bins/rezidnt",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# path crates
+rezidnt-types = { path = "crates/rezidnt-types" }
+rezidnt-fabric = { path = "crates/rezidnt-fabric" }
+rezidnt-state = { path = "crates/rezidnt-state" }
+rezidnt-proto = { path = "crates/rezidnt-proto" }
+
+# approved set (rust-conventions)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+ulid = { version = "1", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+tokio = { version = "1", features = [
+    "sync",
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "net",
+    "io-util",
+    "process",
+    # fs: added with the S0 daemon (socket/db directory setup + stale-socket
+    # unlink on the async startup path).
+    "fs",
+] }
+tracing = "0.1"
+# clap: approved set (rust-conventions); arrives with the S0 CLI verbs
+# (`rezidnt rebuild`/`tail`) as the bin-side arg parser.
+clap = { version = "4", features = ["derive"] }
+
+# dependency additions noted by the oracle (S0):
+# - time: envelope `ts: OffsetDateTime` per doc §5 (serde-well-known for RFC3339)
+# - proptest (dev): reducer-determinism property tests (testing-oracles skill)
+# - tempfile (dev): temp SQLite logs in tests
+time = { version = "0.3", features = [
+    "serde-well-known",
+    "formatting",
+    "parsing",
+    "macros",
+] }
+proptest = "1"
+tempfile = "3"

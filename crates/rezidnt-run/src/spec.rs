@@ -35,12 +35,42 @@ pub struct AgentSpec {
     pub bin_override: Option<PathBuf>,
 }
 
+/// Raw wire shape: every field optional so missing values surface as honest
+/// `RunError::Spec` messages naming the field, never a serde panic or a
+/// silently defaulted value. Unknown tables (`[[workspace.tab]]`, `[gates.*]`)
+/// are tolerated because serde ignores unknown fields by default.
+#[derive(Deserialize)]
+struct RawSpec {
+    project: Option<RawProject>,
+    #[serde(default)]
+    agent: Vec<AgentSpec>,
+}
+
+#[derive(Deserialize)]
+struct RawProject {
+    name: Option<String>,
+    repo: Option<PathBuf>,
+}
+
 impl ProjectSpec {
     /// Parse the §13 TOML. Unknown tables (e.g. `[[workspace.tab]]`,
     /// `[gates.*]`) are tolerated; a missing `[project]` name/repo is an
     /// honest `RunError::Spec`.
     pub fn from_toml_str(input: &str) -> Result<Self, RunError> {
-        let _ = input;
-        todo!("S1: parse [project] + [[agent]], tolerate layout/gate tables")
+        let raw: RawSpec = toml::from_str(input).map_err(|e| RunError::Spec(e.to_string()))?;
+        let project = raw
+            .project
+            .ok_or_else(|| RunError::Spec("missing [project] table (name, repo)".to_string()))?;
+        let name = project
+            .name
+            .ok_or_else(|| RunError::Spec("missing field `name` in [project]".to_string()))?;
+        let repo = project
+            .repo
+            .ok_or_else(|| RunError::Spec("missing field `repo` in [project]".to_string()))?;
+        Ok(Self {
+            name,
+            repo,
+            agents: raw.agent,
+        })
     }
 }

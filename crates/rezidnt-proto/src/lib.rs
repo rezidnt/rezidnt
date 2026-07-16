@@ -87,15 +87,13 @@ pub enum Request {
 
 /// Encode a request as one JSONL frame (single line, no trailing newline).
 pub fn encode_request(request: &Request) -> Result<String, ProtoError> {
-    let _ = request;
-    todo!("S1: single-line serde_json")
+    Ok(serde_json::to_string(request)?)
 }
 
 /// Decode a request frame. Unknown fields tolerated; unknown `op` is an
 /// honest decode error.
 pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
-    let _ = line;
-    todo!("S1: serde_json from line")
+    Ok(serde_json::from_str(line)?)
 }
 
 /// Pure socket-path resolution (testable without touching the process env):

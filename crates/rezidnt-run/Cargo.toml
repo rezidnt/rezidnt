@@ -3,6 +3,10 @@
 #   S1 oracle work order for the auditor.
 # - rand: badge minting needs 256 cryptographically random bits (doc §12);
 #   nothing in the approved set provides randomness. Flagged likewise.
+# - libc (unix only, implementer S1): kill(pid, 0) liveness probe and
+#   TERM→KILL delivery for the reaper. The boring syscall wrapper the I8
+#   component clause mandates over NIH; tokio already links it. NOT in the
+#   approved set — flagged for the auditor.
 # portable-pty stays phase-gated OUT of S1: claude-code headless needs no TTY;
 # the dep arrives with the first TTY-demanding harness (I7 — no idle deps).
 [package]
@@ -14,6 +18,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 rezidnt-types = { path = "../rezidnt-types" }
 rezidnt-cas = { path = "../rezidnt-cas" }
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -21,6 +26,9 @@ tokio = { workspace = true, features = ["process", "time", "io-util"] }
 toml = "0.8"
 rand = "0.9"
 ulid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

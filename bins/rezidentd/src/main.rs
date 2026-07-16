@@ -1,18 +1,27 @@
-//! `rezidentd` — the daemon (S0 scope: fabric + log + broadcast + UDS tail).
+//! `rezidentd` — the daemon (S1 scope: fabric + log + broadcast + UDS
+//! requests: tail / open / attach).
 //!
-//! S0 contract pinned by `tests/tail_socket.rs`:
+//! Contract pinned by `tests/tail_socket.rs` (S0) and `tests/open_flow.rs` +
+//! `tests/run_persistence.rs` (S1):
 //! - env `REZIDNT_SOCKET` overrides the UDS path (else `rezidnt_proto::socket_path()`);
-//!   env `REZIDNT_DB` overrides the event-log path;
+//!   env `REZIDNT_DB` overrides the event-log path; env `REZIDNT_CAS`
+//!   overrides the CAS root (else `<db dir>/cas`);
 //! - on startup: open the log, publish `daemon.started` onto the fabric;
-//! - per connection: send the versioned hello line first, then replay the log
-//!   from seq 0 as event-envelope JSONL, then continue with live events
-//!   (S0 pin: replay-then-live makes "two concurrent subscribers observe the
-//!   stream" deterministic; I1: this daemon renders nothing — every UI is a
-//!   socket client).
+//! - per connection: send the versioned hello line first, then read the
+//!   client's request line — `tail` (replay from seq 0 + live, optional
+//!   subject filter; also the back-compat default when the client sends
+//!   nothing, the S0 behavior), `open` (materialize a §13 spec: workspace,
+//!   worktree, agent spawn under capture — the run is daemon-owned and
+//!   survives the client), or `attach` (replay the run's capture ring, then
+//!   proxy live bytes). I1: this daemon renders nothing — every UI is a
+//!   socket client.
 //!
 //! Platform: UDS is `#[cfg(unix)]`. On Windows this binary compiles clean and
 //! exits with a runtime error naming the designed-but-unimplemented named
 //! pipe (doc §9, S0 platform decision).
+
+#[cfg(unix)]
+mod runs;
 
 fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -33,21 +42,31 @@ mod unix_daemon {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Context;
+    use rezidnt_cas::Cas;
     use rezidnt_fabric::{EventLog, Fabric, RecvError, Subscriber};
-    use rezidnt_proto::{Hello, PROTO_VERSION, encode_hello, socket_path};
+    use rezidnt_proto::{Hello, PROTO_VERSION, Request, decode_request, encode_hello, socket_path};
     use rezidnt_types::taxonomy::{ONTOLOGY_VERSION, SUBJECTS_V0};
     use rezidnt_types::{Event, SourceId, Subject};
     use serde_json::json;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::unix::OwnedWriteHalf;
     use tokio::net::{UnixListener, UnixStream};
     use tracing::Instrument;
+
+    use crate::runs::{Daemon, RunRegistry, materialize_open, serve_attach};
 
     /// Broadcast ring size (DEFAULT). Sized for control-plane volume (doc §5:
     /// facts and refs only); an overflowing subscriber takes the BINDING
     /// Lagged→resync path rather than back-pressuring the daemon.
     const BROADCAST_CAPACITY: usize = 1024;
+
+    /// How long a connection may stay silent after the hello before it is
+    /// served as a bare tail — the S0 back-compat default (S0 clients sent no
+    /// request line). S1 clients send their request immediately.
+    const REQUEST_WAIT: Duration = Duration::from_millis(500);
 
     /// The hello's `schema` field: identity hash of the compiled-in subject
     /// taxonomy (version string + subjects, newline-delimited). Derived from
@@ -76,6 +95,17 @@ mod unix_daemon {
             .join("state")
             .join("rezidnt")
             .join("events.db")
+    }
+
+    /// `REZIDNT_CAS` override, else `cas/` next to the event log — log + CAS
+    /// together are the whole persistent truth (I3).
+    fn cas_path(db: &std::path::Path) -> PathBuf {
+        if let Some(explicit) = std::env::var_os("REZIDNT_CAS") {
+            return PathBuf::from(explicit);
+        }
+        db.parent()
+            .map(|dir| dir.join("cas"))
+            .unwrap_or_else(|| PathBuf::from("cas"))
     }
 
     pub fn run() -> anyhow::Result<()> {
@@ -129,6 +159,23 @@ mod unix_daemon {
             .context("startup task panicked")??
         };
 
+        // CAS root next to the log (blocking fs — off the async threads).
+        let cas = {
+            let root = cas_path(&db);
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<Cas>> {
+                Ok(Arc::new(Cas::open(&root).with_context(|| {
+                    format!("open cas root {}", root.display())
+                })?))
+            })
+            .await
+            .context("cas open task panicked")??
+        };
+        let daemon = Arc::new(Daemon {
+            fabric,
+            cas,
+            registry: Arc::new(RunRegistry::default()),
+        });
+
         let listener =
             UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
         // §12: control socket at mode 0600 — owner-only.
@@ -139,11 +186,11 @@ mod unix_daemon {
 
         loop {
             let (stream, _addr) = listener.accept().await.context("accept")?;
-            let fabric = Arc::clone(&fabric);
-            let span = tracing::info_span!("adapter", kind = "uds-tail");
+            let daemon = Arc::clone(&daemon);
+            let span = tracing::info_span!("adapter", kind = "uds-conn");
             tokio::spawn(
                 async move {
-                    if let Err(e) = handle_conn(stream, fabric).await {
+                    if let Err(e) = handle_conn(stream, daemon).await {
                         // Client disconnects surface here; not daemon faults.
                         tracing::debug!(error = %e, "connection ended");
                     }
@@ -168,8 +215,11 @@ mod unix_daemon {
         .context("resync from log")
     }
 
-    /// Per-connection stream: hello line → replay from seq 0 → live events.
-    async fn handle_conn(mut stream: UnixStream, fabric: Arc<Fabric>) -> anyhow::Result<()> {
+    /// Per-connection protocol: hello line → request line (or S0 silence) →
+    /// the requested stream.
+    async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<()> {
+        let (read_half, mut write_half) = stream.into_split();
+
         let hello = Hello {
             proto: PROTO_VERSION,
             schema: ontology_hash(),
@@ -177,38 +227,80 @@ mod unix_daemon {
         };
         let mut frame = encode_hello(&hello)?;
         frame.push('\n');
-        stream.write_all(frame.as_bytes()).await?;
+        write_half.write_all(frame.as_bytes()).await?;
+
+        // First client line = the request. Silence for REQUEST_WAIT (or an
+        // immediate EOF on the read side) is the S0 back-compat bare tail.
+        let mut reader = BufReader::new(read_half);
+        let mut first = String::new();
+        let request = match tokio::time::timeout(REQUEST_WAIT, reader.read_line(&mut first)).await {
+            Err(_silent) => Request::Tail { subject: None },
+            Ok(Ok(0)) => Request::Tail { subject: None },
+            Ok(Ok(_)) => decode_request(first.trim_end()).context("decode request line")?,
+            Ok(Err(e)) => return Err(e).context("read request line"),
+        };
+
+        match request {
+            Request::Tail { subject } => {
+                serve_tail(&daemon, &mut write_half, subject.as_deref()).await
+            }
+            Request::Open { spec_toml } => {
+                // The materialization is daemon-owned: it is spawned off this
+                // connection task, so the run survives the client (S1 exit
+                // criterion). The opening client is then served the plain
+                // tail so every step is visible on its own socket.
+                let span = tracing::info_span!("open");
+                tokio::spawn(materialize_open(Arc::clone(&daemon), spec_toml).instrument(span));
+                serve_tail(&daemon, &mut write_half, None).await
+            }
+            Request::Attach { run } => serve_attach(&daemon, run, &mut write_half).await,
+        }
+    }
+
+    /// Tail stream: replay from seq 0, then live, optionally filtered by
+    /// subject (the filter drops non-matching envelopes server-side; seq/id
+    /// bookkeeping still covers the full stream).
+    async fn serve_tail(
+        daemon: &Arc<Daemon>,
+        out: &mut OwnedWriteHalf,
+        subject: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let wanted = |event: &Event| subject.is_none_or(|want| event.subject.as_str() == want);
 
         // Subscribe FIRST, then replay: anything published between the
         // subscribe and the log read arrives twice (log + ring) and the
         // subscriber's append-position (seq) tracking discards the ring copy
         // — the same discipline as the BINDING Lagged→resync rule.
-        let sub = fabric.subscribe();
-        let (replayed, mut sub) = resync_blocking(Arc::clone(&fabric), sub).await?;
+        let sub = daemon.fabric.subscribe();
+        let (replayed, mut sub) = resync_blocking(Arc::clone(&daemon.fabric), sub).await?;
         let mut backlog = String::new();
-        for event in &replayed {
+        for event in replayed.iter().filter(|e| wanted(e)) {
             backlog.push_str(&event.to_json_line()?);
             backlog.push('\n');
         }
-        stream.write_all(backlog.as_bytes()).await?;
+        out.write_all(backlog.as_bytes()).await?;
 
         loop {
             match sub.recv().await {
                 Ok(event) => {
+                    if !wanted(&event) {
+                        continue;
+                    }
                     let mut line = event.to_json_line()?;
                     line.push('\n');
-                    stream.write_all(line.as_bytes()).await?;
+                    out.write_all(line.as_bytes()).await?;
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "tail subscriber lagged; resyncing from log");
-                    let (missed, resynced) = resync_blocking(Arc::clone(&fabric), sub).await?;
+                    let (missed, resynced) =
+                        resync_blocking(Arc::clone(&daemon.fabric), sub).await?;
                     sub = resynced;
                     let mut lines = String::new();
-                    for event in &missed {
+                    for event in missed.iter().filter(|e| wanted(e)) {
                         lines.push_str(&event.to_json_line()?);
                         lines.push('\n');
                     }
-                    stream.write_all(lines.as_bytes()).await?;
+                    out.write_all(lines.as_bytes()).await?;
                 }
                 Err(RecvError::Closed) => return Ok(()),
             }

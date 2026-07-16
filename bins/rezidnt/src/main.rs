@@ -93,6 +93,22 @@ fn tail(subject: Option<&str>) -> anyhow::Result<()> {
     let hello = decode_hello(hello_line.trim_end()).context("decode hello")?;
     check_hello(&hello).context("proto check")?;
 
+    // S1 request line: an explicit tail (with server-side subject filter)
+    // skips the daemon's S0 back-compat silence window.
+    let request = rezidnt_proto::encode_request(&rezidnt_proto::Request::Tail {
+        subject: subject.map(String::from),
+    })
+    .context("encode tail request")?;
+    {
+        let stream = reader.get_mut();
+        stream
+            .write_all(request.as_bytes())
+            .context("send tail request")?;
+        stream
+            .write_all(b"\n")
+            .context("send tail request newline")?;
+    }
+
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut line = String::new();

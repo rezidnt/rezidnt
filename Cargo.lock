@@ -576,8 +576,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "blake3",
+ "rezidnt-cas",
  "rezidnt-fabric",
  "rezidnt-proto",
+ "rezidnt-run",
  "rezidnt-types",
  "serde_json",
  "tempfile",
@@ -645,6 +647,8 @@ dependencies = [
 name = "rezidnt-run"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "libc",
  "rand",
  "rezidnt-cas",
  "rezidnt-types",

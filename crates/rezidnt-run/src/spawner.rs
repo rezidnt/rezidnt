@@ -24,7 +24,16 @@ impl SpawnPlan {
         badge: &Badge,
         parent_env: impl Iterator<Item = (String, String)>,
     ) -> Self {
-        let _ = (agent, badge, parent_env);
-        todo!("S1: argv + scrubbed_env")
+        Self {
+            bin: agent
+                .bin_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("claude")),
+            args: ["-p", "--output-format", "stream-json", "--verbose"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            env: crate::badge::scrubbed_env(parent_env, badge),
+        }
     }
 }

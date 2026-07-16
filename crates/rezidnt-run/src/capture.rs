@@ -17,26 +17,39 @@ pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct RingBuffer {
     capacity: usize,
+    buf: std::collections::VecDeque<u8>,
 }
 
 impl RingBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { capacity }
+        Self {
+            capacity,
+            buf: std::collections::VecDeque::new(),
+        }
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Append bytes, evicting the oldest on overflow.
+    /// Append bytes, evicting the oldest on overflow. A single push larger
+    /// than the whole capacity retains only its newest `capacity` bytes.
     pub fn push(&mut self, bytes: &[u8]) {
-        let _ = bytes;
-        todo!("S1: append with oldest-first eviction")
+        let keep = if bytes.len() > self.capacity {
+            // Everything currently retained would be evicted anyway.
+            self.buf.clear();
+            &bytes[bytes.len() - self.capacity..]
+        } else {
+            let overflow = (self.buf.len() + bytes.len()).saturating_sub(self.capacity);
+            self.buf.drain(..overflow);
+            bytes
+        };
+        self.buf.extend(keep);
     }
 
     /// The retained tail, oldest byte first.
     pub fn snapshot(&self) -> Vec<u8> {
-        todo!("S1: contiguous copy of retained bytes")
+        self.buf.iter().copied().collect()
     }
 }
 
@@ -58,6 +71,19 @@ pub fn chunk_into_cas(
     stream: &[u8],
     chunk_bytes: usize,
 ) -> Result<Vec<ManifestEntry>, CasError> {
-    let _ = (cas, run, stream, chunk_bytes);
-    todo!("S1: split, put each chunk, manifest in order")
+    // `chunks(0)` panics; a zero request degrades to 1-byte chunks rather
+    // than panicking in library code (rust-conventions).
+    let chunk_bytes = chunk_bytes.max(1);
+    stream
+        .chunks(chunk_bytes)
+        .enumerate()
+        .map(|(ordinal, chunk)| {
+            let r#ref = cas.put(chunk, "application/octet-stream")?;
+            Ok(ManifestEntry {
+                run,
+                chunk: ordinal as u64,
+                r#ref,
+            })
+        })
+        .collect()
 }

@@ -88,8 +88,39 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 graph.workspaces.insert(ws, WorkspaceStatus::Closed);
             }
         }
+        // S1 agent-run reducers, keyed by the payload `run` string. A payload
+        // without a `run` (pre-ratification fixture lines, foreign versions)
+        // folds as counters-only — reducers never choke, never guess (I3).
+        "agent.spawned" => {
+            if let Some(run) = payload_run(event) {
+                graph.agent_runs.entry(run).or_default().status = "spawning".to_string();
+            }
+        }
+        "agent.status.changed" => {
+            if let Some(run) = payload_run(event)
+                && let Some(to) = event.payload()["to"].as_str()
+            {
+                graph.agent_runs.entry(run).or_default().status = to.to_string();
+            }
+        }
+        "agent.completed" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let state = graph.agent_runs.entry(run).or_default();
+                state.status = "completed".to_string();
+                state.total_usd = payload["cost"]["total_usd"].as_f64();
+                state.input_tokens = payload["cost"]["input_tokens"].as_u64();
+                state.output_tokens = payload["cost"]["output_tokens"].as_u64();
+                state.session_id = payload["session_id"].as_str().map(String::from);
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
+}
+
+/// The `run` key every `agent.*` payload carries (ontology v1 baselines).
+fn payload_run(event: &Event) -> Option<String> {
+    event.payload()["run"].as_str().map(String::from)
 }
 
 /// Fold a whole event sequence from scratch. `rezidnt rebuild` is exactly

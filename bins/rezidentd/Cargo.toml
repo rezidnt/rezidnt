@@ -10,8 +10,10 @@ anyhow.workspace = true
 # blake3: approved set; the hello's `schema` field is a blake3 hash of the
 # compiled-in taxonomy (doc §9: ontology hash).
 blake3.workspace = true
+rezidnt-cas.workspace = true
 rezidnt-fabric.workspace = true
 rezidnt-proto.workspace = true
+rezidnt-run.workspace = true
 rezidnt-types.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

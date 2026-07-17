@@ -50,11 +50,43 @@ pub struct AgentRunState {
     pub session_id: Option<String>,
 }
 
+/// One worktree's derived state (S2: the sole-allocator registry's shadow in
+/// the graph — the log is truth, the `.rezidnt/worktrees` file is the
+/// adapter's working copy).
+///
+/// S2 reducer semantics (pinned by `tests/s2_worktrees.rs` and the
+/// `s2_worktree_conflict` / `s2_diff_ready` golden fixtures). Entries key on
+/// the payload's canonicalized path string:
+/// - `worktree.allocated` `{path, branch?, allocator}` → insert with
+///   `status = "allocated"`, `branch`/`allocator` copied from the payload;
+/// - `worktree.observed` `{path, allocator}` → insert with
+///   `status = "observed"`, allocator copied (out-of-band guard, DR-001);
+/// - `worktree.conflict` `{path}` → `conflicts += 1` on the existing entry
+///   (first claim's fields untouched — never double-tracked); the
+///   exactly-once emission obligation is the ADAPTER's, so the reducer counts
+///   every logged conflict honestly (I3);
+/// - `worktree.released` `{path}` → `status = "released"` (inserted even if
+///   never allocated — the log is truth);
+/// - `diff.ready` `{worktree, diff: CasRef}` → `last_diff = Some(diff.hash)`
+///   on the entry keyed by `worktree`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeState {
+    pub status: String,
+    pub branch: Option<String>,
+    /// `"rezidnt"` (sole allocator) or `"human"` (out-of-band observation).
+    pub allocator: Option<String>,
+    #[serde(default)]
+    pub conflicts: u64,
+    /// blake3 hex of the most recent `diff.ready` summary ref.
+    pub last_diff: Option<String>,
+}
+
 /// The entity graph. `BTreeMap` everywhere so equality and serialization
 /// are deterministic (the property tests compare whole graphs).
 ///
-/// S1 adds `agent_runs` additively: `#[serde(default)]` keeps every S0
-/// golden fixture parsing (and comparing equal) unedited.
+/// S1 adds `agent_runs`, S2 adds `worktrees` — both additively:
+/// `#[serde(default)]` keeps every earlier golden fixture parsing (and
+/// comparing equal) unedited.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     pub events_folded: u64,
@@ -64,6 +96,10 @@ pub struct Graph {
     /// Keyed by the run ULID's canonical text form (payload `run` field).
     #[serde(default)]
     pub agent_runs: BTreeMap<String, AgentRunState>,
+    /// Keyed by the canonicalized worktree path (payload `path` /
+    /// `worktree` field).
+    #[serde(default)]
+    pub worktrees: BTreeMap<String, WorktreeState>,
 }
 
 /// The pure reducer (doc §6: `fn apply(&mut Graph, &Event)`). No IO, no
@@ -114,6 +150,52 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 state.session_id = payload["session_id"].as_str().map(String::from);
             }
         }
+        // S2 worktree reducers, keyed by the payload's canonicalized path
+        // string. A payload without its key folds as counters-only —
+        // reducers never choke, never gatekeep (I3).
+        "worktree.allocated" => {
+            if let Some(path) = payload_path(event) {
+                let payload = event.payload();
+                let wt = graph.worktrees.entry(path).or_default();
+                wt.status = "allocated".to_string();
+                wt.branch = payload["branch"].as_str().map(String::from);
+                wt.allocator = payload["allocator"].as_str().map(String::from);
+            }
+        }
+        "worktree.observed" => {
+            if let Some(path) = payload_path(event) {
+                let payload = event.payload();
+                let wt = graph.worktrees.entry(path).or_default();
+                wt.status = "observed".to_string();
+                wt.branch = payload["branch"].as_str().map(String::from);
+                wt.allocator = payload["allocator"].as_str().map(String::from);
+            }
+        }
+        "worktree.conflict" => {
+            // Never mints a second entry (no double-tracking) and never
+            // touches the first claim's fields; every logged fact counts
+            // once — exactly-once emission is the adapter's obligation (I3).
+            if let Some(path) = payload_path(event) {
+                graph.worktrees.entry(path).or_default().conflicts += 1;
+            }
+        }
+        "worktree.released" => {
+            // Inserted even if never allocated — the log is truth (I3).
+            if let Some(path) = payload_path(event) {
+                graph.worktrees.entry(path).or_default().status = "released".to_string();
+            }
+        }
+        "diff.ready" => {
+            if let Some(path) = event.payload()["worktree"].as_str()
+                && let Some(hash) = event.payload()["diff"]["hash"].as_str()
+            {
+                graph
+                    .worktrees
+                    .entry(path.to_string())
+                    .or_default()
+                    .last_diff = Some(hash.to_string());
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
 }
@@ -121,6 +203,11 @@ pub fn apply(graph: &mut Graph, event: &Event) {
 /// The `run` key every `agent.*` payload carries (ontology v1 baselines).
 fn payload_run(event: &Event) -> Option<String> {
     event.payload()["run"].as_str().map(String::from)
+}
+
+/// The `path` key every `worktree.*` payload carries (ontology v1 baselines).
+fn payload_path(event: &Event) -> Option<String> {
+    event.payload()["path"].as_str().map(String::from)
 }
 
 /// Fold a whole event sequence from scratch. `rezidnt rebuild` is exactly

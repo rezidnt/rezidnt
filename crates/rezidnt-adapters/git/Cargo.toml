@@ -1,0 +1,32 @@
+# S2 git adapter (doc §7): gix reads, git-CLI mutations, notify watcher,
+# sole-allocator worktree registry. Dependency notes (rust-conventions:
+# additions get a written note):
+# - gix (reads: status scan for diff summaries, branch reads) and notify
+#   (watcher, 250 ms debounce DEFAULT) are both in the approved set.
+# - blake3 (approved set) content-hashes changed files inside the summary so
+#   the CAS ref is content-stable (same tree state, same ref — I6-adjacent).
+# - mutations (worktree add/remove) shell out to the `git` CLI via
+#   tokio::process — the CLI is the compatibility truth (doc §7).
+[package]
+name = "rezidnt-adapter-git"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rezidnt-types = { workspace = true }
+rezidnt-cas = { workspace = true }
+blake3 = { workspace = true }
+gix = { workspace = true }
+notify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "process", "fs", "time", "rt", "macros"] }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

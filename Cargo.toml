@@ -7,6 +7,7 @@ members = [
     "crates/rezidnt-proto",
     "crates/rezidnt-cas",
     "crates/rezidnt-run",
+    "crates/rezidnt-adapters/git",
     "bins/rezidentd",
     "bins/rezidnt",
 ]
@@ -24,6 +25,16 @@ rezidnt-state = { path = "crates/rezidnt-state" }
 rezidnt-proto = { path = "crates/rezidnt-proto" }
 rezidnt-cas = { path = "crates/rezidnt-cas" }
 rezidnt-run = { path = "crates/rezidnt-run" }
+rezidnt-adapter-git = { path = "crates/rezidnt-adapters/git" }
+
+# dependency notes by the oracle (S2) — nothing NEW flagged: gix (reads) and
+# notify (watcher) are already in the approved set (rust-conventions) and are
+# declared by the implementer in rezidnt-adapter-git when the stubs land;
+# the failing-test skeleton deliberately stays without them.
+# S2 implementer: both landed below with rezidnt-adapter-git (doc §7: gix for
+# reads — status/branch; git CLI for mutations; notify for the FS watcher).
+gix = "0.85"
+notify = "8"
 
 # dependency additions noted by the oracle (S1) — declared in rezidnt-run:
 # - toml: §13 project-spec parsing (NOT in the approved set; auditor-flagged)

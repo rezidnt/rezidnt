@@ -15,14 +15,16 @@
 //! - `rezidnt attach <run-ulid>` — replay the run's capture ring, then
 //!   stream live bytes to stdout until EOF (dtach model). Pinned likewise.
 //!
-//! Stable exit codes (doc §9): 0 ok, 2 gate-fail, 3 substrate-fault,
-//! 4 daemon-unreachable. Mapping: `rebuild` failures are substrate faults
-//! (the log store misbehaved) → 3; `tail`/`attach` failures are daemon-side
-//! (unreachable socket, bad hello, proto mismatch) → 4. `open`: a
-//! missing/unreadable/unparseable spec file is a LOCAL input error → 2
-//! (clap's usage-error convention, pinned by cli_verbs.rs; the §9 gate-fail
-//! collision on the number 2 is flagged for /dr, not resolved here); a
-//! daemon-side open-failed refusal → 3; connection failures → 4.
+//! Stable exit codes (doc §9, ratified by DR-004): 0 ok, 1 unexpected
+//! internal error, 2 local input/usage error, 3 substrate-fault (incl.
+//! daemon-side refusals), 4 daemon-unreachable, 5 gate-fail (S4+; an
+//! `inconclusive` verdict is 3, never coerced — I6). Mapping: `rebuild`
+//! failures are substrate faults (the log store misbehaved) → 3;
+//! `tail`/`attach` failures are daemon-side (unreachable socket, bad hello,
+//! proto mismatch) → 4. `open`: a missing/unreadable/unparseable spec file
+//! is a LOCAL input error → 2 (clap's usage-error convention, pinned by
+//! cli_verbs.rs); a daemon-side open-failed refusal → 3; connection
+//! failures → 4.
 
 use std::path::{Path, PathBuf};
 

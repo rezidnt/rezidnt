@@ -32,14 +32,11 @@
 //!
 //! ## Exit-code note (flagged for /dr, not resolved here)
 //!
-//! Doc §9 pins 0 ok / 2 gate-fail / 3 substrate-fault / 4 daemon-unreachable.
-//! A missing spec file is none of these cleanly: it is a LOCAL input error.
-//! These tests pin clap's conventional exit 2 for local usage/input errors.
-//! That does not collide in practice in Phase 1 — `open` never reaches a
-//! gate, so a 2 from `open <bad-path>` is unambiguous — but the §9 table and
-//! the clap convention share the number and that collision needs a decision
-//! record before Phase 2 puts gates on this verb. Do not "fix" the collision
-//! by weakening these assertions; route to /dr.
+//! Doc §9 (ratified by DR-004) pins 0 ok / 1 unexpected / 2 local
+//! input-usage / 3 substrate-fault / 4 daemon-unreachable / 5 gate-fail.
+//! These tests pin clap's conventional exit 2 for local usage/input errors,
+//! which DR-004 aligned the table with; gate-fail moved to the previously
+//! unclaimed 5, so the historical collision on the number 2 is resolved.
 #![cfg(unix)]
 
 mod common;
@@ -246,9 +243,8 @@ fn cli_attach_replays_tail() {
 /// is what fails today. Both must hold after implementation.
 ///
 /// Pins: a nonexistent spec path is a LOCAL input error — exit 2 (clap's
-/// usage-error convention; see module docs for the §9 gate-fail collision
-/// flagged for /dr), stderr names the offending path, and no success line
-/// reaches stdout.
+/// usage-error convention, ratified by DR-004), stderr names the offending
+/// path, and no success line reaches stdout.
 #[test]
 fn cli_open_missing_spec_is_exit_2_family() {
     let daemon = start_daemon();

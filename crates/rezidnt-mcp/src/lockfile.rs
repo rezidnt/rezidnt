@@ -46,12 +46,25 @@ pub fn write_atomic(path: &Path, lockfile: &Lockfile) -> Result<(), McpError> {
         .to_string_lossy();
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
 
+    // O_EXCL (create_new) semantics: the tmp file is always FRESHLY minted, so
+    // its mode is always the 0600 we mint here — a pre-existing hostile tmp at
+    // the predictable `.<name>.tmp-<pid>` path can never leak its mode or
+    // content into the lockfile. A stale tmp is unlinked, then recreated
+    // exclusively; if the unlink races another creator, the create_new fails
+    // loudly rather than reusing a foreign fd.
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
+    }
+    // Remove any stale/hostile tmp so create_new can mint a fresh 0600 file.
+    // A missing file is fine; anything else is a real error.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     let mut file = options.open(&tmp)?;
     file.write_all(serde_json::to_string(lockfile)?.as_bytes())?;

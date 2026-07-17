@@ -76,6 +76,13 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// `tail_events` server default when the caller sends no `limit` (DEFAULT).
 const TAIL_DEFAULT_LIMIT: usize = 1024;
 
+/// Max request-body bytes the loopback HTTP transport will accumulate before
+/// rejecting the request 413-class (DEFAULT). Mirrors the 64 KiB HEAD cap and
+/// leaves headroom over the I2 32 KiB *payload* rule (the JSON-RPC envelope
+/// wraps the payload). Bounds the memory a single loopback connection can
+/// force the daemon to allocate. Cheap to revisit.
+const BODY_CAP_BYTES: usize = 64 * 1024;
+
 /// MCP-domain errors (thiserror per lib convention).
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -718,7 +725,17 @@ async fn serve_http_conn(
         .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
+    // I2-adjacent bound: a body over the cap is refused 413-class and never
+    // accumulated unbounded. Reject on the declared Content-Length up front,
+    // and again in the read loop so a lying/short Content-Length cannot slip
+    // an over-cap body past the check.
+    if content_length > BODY_CAP_BYTES {
+        return respond_body_too_large(&mut stream).await;
+    }
     while raw.len() < body_start + content_length {
+        if raw.len().saturating_sub(body_start) > BODY_CAP_BYTES {
+            return respond_body_too_large(&mut stream).await;
+        }
         let n = stream.read(&mut buf).await?;
         if n == 0 {
             return Ok(()); // truncated body: nothing to answer
@@ -744,6 +761,15 @@ async fn serve_http_conn(
             "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
         }
     };
+    stream.write_all(frame.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Answer an over-cap request with a 413-class status and close. The body is
+/// never read unbounded — the caller returns immediately after this.
+async fn respond_body_too_large(stream: &mut tokio::net::TcpStream) -> Result<(), McpError> {
+    let frame = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(frame.as_bytes()).await?;
     stream.flush().await?;
     Ok(())

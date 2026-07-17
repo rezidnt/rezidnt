@@ -99,6 +99,32 @@ struct RawProject {
     repo: Option<PathBuf>,
 }
 
+/// Serialize an agent's governed fields as the `[agent]` TOML blob the vet
+/// natives read (the §8 `refs["spec"]` preimage). Only the fields the three
+/// vet verifiers inspect — the pinned-input surface is intentionally small.
+///
+/// This is the SINGLE source of the preimage: the CLI's `vet` path and the
+/// daemon's gate path both call it, so the CLI and daemon vet byte-identical
+/// bytes by construction (I4-adjacent dedup). A change here moves the CAS hash
+/// on BOTH paths together — it can never silently split them.
+pub fn agent_spec_toml(spec: &AgentSpec) -> String {
+    // Minimal TOML basic-string quoting (the values are short identifiers /
+    // versions / tool names — no control chars): `\`→`\\` then `"`→`\"`.
+    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut s = String::from("[agent]\n");
+    s.push_str(&format!("name = {}\n", q(&spec.name)));
+    s.push_str(&format!("harness = {}\n", q(&spec.harness)));
+    s.push_str(&format!("bare = {}\n", spec.bare));
+    if let Some(v) = &spec.harness_version {
+        s.push_str(&format!("harness_version = {}\n", q(v)));
+    }
+    if !spec.allowed_tools.is_empty() {
+        let items: Vec<String> = spec.allowed_tools.iter().map(|t| q(t)).collect();
+        s.push_str(&format!("allowed_tools = [{}]\n", items.join(", ")));
+    }
+    s
+}
+
 impl ProjectSpec {
     /// Parse the §13 TOML. Unknown tables (e.g. `[[workspace.tab]]`,
     /// `[gates.*]`) are tolerated; a missing `[project]` name/repo is an

@@ -7,8 +7,10 @@
 //! - **Sole allocator (DR-001, BINDING):** every worktree is registered under
 //!   its canonicalized path in the [`REGISTRY_PATH`] file with an `allocator`
 //!   field. A second claim on an already-registered canonicalized path emits
-//!   exactly one `worktree.conflict` — never silent double-tracking, never a
-//!   duplicate registry entry.
+//!   the `worktree.conflict` fact AT LEAST ONCE — exactly once on the
+//!   crash-free path (the dedup mark persists after the emit), but the emit
+//!   precedes the mark-persist, so a crash between them can re-emit on restart.
+//!   Never silent double-tracking, never a duplicate registry entry.
 //! - **Registry format (DEFAULT):** JSON Lines at `<repo>/.rezidnt/worktrees`,
 //!   one live entry per line: `{"path": <canonicalized>, "allocator":
 //!   "rezidnt"|"human", "branch"?: <string>, "id"?: <ULID>,
@@ -29,8 +31,9 @@
 //!   the registered [`WorktreeId`] — branch is NOT identity, S2-T3) are
 //!   rebuilt live — releasable under their persisted id, re-watched; a tree
 //!   without (or with a mismatched) marker on a rezidnt-registered path is a
-//!   takeover, surfaced as exactly one `worktree.conflict` forever;
-//!   unregistered linked
+//!   takeover, surfaced as `worktree.conflict` at least once (exactly once on
+//!   the crash-free path — the mark persists after the emit); unregistered
+//!   linked
 //!   trees are discovered through the same dedup path as
 //!   [`GitAdapter::observe`]. Scan facts ride the broadcast and are pinned
 //!   via [`GitAdapter::startup_facts`].
@@ -45,8 +48,10 @@
 //!   `worktree.observed` (allocator `"human"`, registered so re-observation
 //!   stays silent); already-registered path → `worktree.conflict`,
 //!   deduplicated per canonicalized path so repeated observation of the same
-//!   collision emits nothing further — forever: the dedup marks persist in
-//!   the registry, so restart never resurfaces a fact.
+//!   collision emits nothing further once the mark is persisted: the dedup
+//!   marks persist in the registry, so on the crash-free path restart does not
+//!   resurface a fact. Because the emit precedes the mark-persist, the fact is
+//!   at-least-once — a crash in that window can resurface it on restart.
 //! - **Facts** ride the envelope with `source` = [`SOURCE_ID`], `v = 1`, and
 //!   payloads per `spec/ontology.md`. All facts of one adapter instance share
 //!   a correlation ULID minted at [`GitAdapter::open`] (DEFAULT); `diff.ready`

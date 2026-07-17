@@ -279,12 +279,25 @@ pub struct OpenRefusal {
 
 /// Emit the `daemon.warning {what: "open-failed"}` fact that keeps a failed
 /// open visible in `tail`, never silent (S1 pin).
-async fn warn_open_failed(daemon: &Arc<Daemon>, error: &str) {
+///
+/// `correlation` threads the OPEN CHAIN's correlation through so a
+/// post-materialization warning is scoped by causal chain, not by a time
+/// marker — two concurrent failed opens then carry distinct correlations and
+/// are distinguishable (S3-T6). A pre-materialization refusal (no chain minted
+/// yet) passes `None` and gets a fresh correlation.
+async fn warn_open_failed(daemon: &Arc<Daemon>, correlation: Option<Ulid>, error: &str) {
+    // The open chain's correlation when this failure has one; otherwise a FRESH
+    // random ULID (NOT `Ulid::default()`, which is the nil id) for a
+    // pre-materialization refusal that has no chain.
+    let correlation = match correlation {
+        Some(correlation) => correlation,
+        None => Ulid::new(),
+    };
     let warning = Event::new(
         SourceId::new("daemon"),
         None,
         Subject::new("daemon.warning"),
-        Ulid::new(),
+        correlation,
         None,
         1,
         json!({"what": "open-failed", "error": error}),
@@ -321,7 +334,8 @@ pub async fn begin_open(
         Err(message) => {
             tracing::warn!(error = %message, "open refused");
             if warn_on_refuse {
-                warn_open_failed(daemon, &message).await;
+                // Pre-materialization refusal: no open chain exists yet.
+                warn_open_failed(daemon, None, &message).await;
             }
             return Err(OpenRefusal { message });
         }
@@ -394,7 +408,9 @@ async fn materialize_open(
         if !e.opened {
             daemon.workspaces.lock().await.remove(&workspace.ulid());
         }
-        warn_open_failed(&daemon, &format!("{:#}", e.source)).await;
+        // Thread the open chain's correlation so the warning is scoped to THIS
+        // open, distinguishable from a concurrent failed open (S3-T6).
+        warn_open_failed(&daemon, Some(correlation), &format!("{:#}", e.source)).await;
     }
 }
 

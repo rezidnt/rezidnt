@@ -380,25 +380,6 @@ fn read_log_events(db: &Path) -> anyhow::Result<Vec<rezidnt_types::Event>> {
     Ok(rows.into_iter().map(|r| r.event).collect())
 }
 
-/// Serialize an agent's governed `[agent]` fields as the TOML blob the vet
-/// natives read (the §8 `refs["spec"]` preimage). Mirrors the daemon's
-/// `gates::agent_spec_toml` so the CLI and daemon vet the same bytes.
-fn agent_spec_toml(agent: &rezidnt_run::spec::AgentSpec) -> String {
-    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
-    let mut s = String::from("[agent]\n");
-    s.push_str(&format!("name = {}\n", q(&agent.name)));
-    s.push_str(&format!("harness = {}\n", q(&agent.harness)));
-    s.push_str(&format!("bare = {}\n", agent.bare));
-    if let Some(v) = &agent.harness_version {
-        s.push_str(&format!("harness_version = {}\n", q(v)));
-    }
-    if !agent.allowed_tools.is_empty() {
-        let items: Vec<String> = agent.allowed_tools.iter().map(|t| q(t)).collect();
-        s.push_str(&format!("allowed_tools = [{}]\n", items.join(", ")));
-    }
-    s
-}
-
 /// `rezidnt vet <spec>`: run the three vet natives over each governed agent's
 /// pinned spec blob. DR-004 exits: 5 fail, 3 inconclusive, 0 pass. The verdict
 /// rides `--json` stdout verbatim (I6).
@@ -431,7 +412,7 @@ fn vet(spec_path: &Path, as_json: bool) -> anyhow::Result<()> {
         .collect();
 
     for agent in governed {
-        let blob = agent_spec_toml(agent);
+        let blob = rezidnt_run::spec::agent_spec_toml(agent);
         let cas_ref = cas
             .put(blob.as_bytes(), "application/toml")
             .context("pin spec")?;

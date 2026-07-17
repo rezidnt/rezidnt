@@ -57,6 +57,11 @@ pub enum InconclusiveReason {
     Timeout,
     NonzeroExit,
     MalformedOutput,
+    /// The verifier could not be run at all (spawn failed, or a wait-io error
+    /// before any output): nothing executed, so "malformed output" would be
+    /// untruthful. Distinguishes "your argv is wrong" from "your program
+    /// printed garbage." Additive value in the `gate.inconclusive` reason vocab.
+    CouldNotRun,
 }
 
 /// One evidence item (§8 stdout contract). `ref` is a `cas:blake3:<hex>`
@@ -651,7 +656,9 @@ impl ExecVerifier {
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
-            Err(_) => return inconclusive(InconclusiveReason::MalformedOutput),
+            // The program never started (ENOENT, EACCES, …): nothing ran, so
+            // the honest reason is could_not_run, not malformed_output.
+            Err(_) => return inconclusive(InconclusiveReason::CouldNotRun),
         };
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -667,7 +674,9 @@ impl ExecVerifier {
             // Wall-clock overrun: the child is killed by kill_on_drop when the
             // future is dropped here.
             Err(_elapsed) => return inconclusive(InconclusiveReason::Timeout),
-            Ok(Err(_io)) => return inconclusive(InconclusiveReason::MalformedOutput),
+            // A wait-io error means the run itself broke, not that the child
+            // produced malformed output — could_not_run is the truthful reason.
+            Ok(Err(_io)) => return inconclusive(InconclusiveReason::CouldNotRun),
         };
 
         // Nonzero exit ⇒ inconclusive, NEVER pass — even if stdout says pass.

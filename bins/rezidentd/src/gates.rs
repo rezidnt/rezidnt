@@ -23,7 +23,7 @@ use rezidnt_gate::{
     AllowedTools, BareMode, DiffScope, ExecVerifier, ForbiddenPath, GateDef, NativeVerifier,
     PinnedVersion, Verdict, VerdictRecord, VerifierInput,
 };
-use rezidnt_run::spec::{AgentSpec, GateSpec, VerifierSpec};
+use rezidnt_run::spec::{AgentSpec, GateSpec, VerifierSpec, agent_spec_toml};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
 use serde_json::{Value, json};
 use ulid::Ulid;
@@ -36,30 +36,6 @@ pub struct GateOutcome {
     /// The id of the terminal verdict fact (`gate.passed`/`failed`/
     /// `inconclusive`), for causation chaining of what follows.
     pub verdict_id: Ulid,
-}
-
-/// Serialize an agent's governed fields as the `[agent]` TOML blob the vet
-/// natives read (the §8 `refs["spec"]` preimage). Only the fields the three
-/// vet verifiers inspect — the pinned-input surface is intentionally small.
-fn agent_spec_toml(agent: &AgentSpec) -> String {
-    let mut s = String::from("[agent]\n");
-    s.push_str(&format!("name = {}\n", toml_str(&agent.name)));
-    s.push_str(&format!("harness = {}\n", toml_str(&agent.harness)));
-    s.push_str(&format!("bare = {}\n", agent.bare));
-    if let Some(v) = &agent.harness_version {
-        s.push_str(&format!("harness_version = {}\n", toml_str(v)));
-    }
-    if !agent.allowed_tools.is_empty() {
-        let items: Vec<String> = agent.allowed_tools.iter().map(|t| toml_str(t)).collect();
-        s.push_str(&format!("allowed_tools = [{}]\n", items.join(", ")));
-    }
-    s
-}
-
-/// Minimal TOML basic-string quoting (the values are short identifiers /
-/// versions / tool names — no control chars).
-fn toml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Look up a native verifier by name (the v1 built-in pack).
@@ -223,6 +199,7 @@ pub async fn run_gate(
                 let reason = match record.reason {
                     Some(rezidnt_gate::InconclusiveReason::Timeout) => "timeout",
                     Some(rezidnt_gate::InconclusiveReason::NonzeroExit) => "nonzero_exit",
+                    Some(rezidnt_gate::InconclusiveReason::CouldNotRun) => "could_not_run",
                     Some(rezidnt_gate::InconclusiveReason::MalformedOutput) | None => {
                         "malformed_output"
                     }

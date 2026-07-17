@@ -1,0 +1,260 @@
+//! rezidnt read-only fleet board (S5). Proof that I1 holds: the daemon renders
+//! nothing; this is a PURE socket CLIENT. The board rides the EXISTING
+//! `rezidnt_proto::Request::Tail { subject: None }` op (replay-from-seq-0 then
+//! live — the same path `rezidnt tail` uses), folds each event into a
+//! [`rezidnt_state::Graph`] with the existing pure reducers, and publishes each
+//! snapshot onto a `tokio::sync::watch<Graph>`. The RENDER LOOP consumes ONLY
+//! the watch channel and never touches a raw `Event` — that is the literal
+//! "consuming only watch channels" I1 proof.
+//!
+//! ## Three pure pieces
+//!
+//! The crate is deliberately a pure, in-memory-testable core (the socket wiring
+//! is the `rezidnt board` subcommand in `bins/rezidnt`):
+//! - [`project`] — `&Graph` -> [`BoardView`], the read-only fleet projection;
+//! - [`draw`] — `&BoardView` -> ratatui frame, testable via `TestBackend`;
+//! - [`ingest_into_watch`] — folds an event iterator onto a `watch::Sender<Graph>`.
+//!
+//! The S5 tests pin each against the S4/S1 golden fixtures.
+//!
+//! ## Structural read-only proof (I1)
+//!
+//! See `Cargo.toml`: this crate depends only on `rezidnt-state` +
+//! `rezidnt-types` + ratatui/crossterm — never the fabric writer or any
+//! socket-write path. The board cannot emit an event because it does not link
+//! anything that can.
+
+use rezidnt_state::{Graph, WorkspaceStatus};
+use tokio::sync::watch;
+
+/// The read-only fleet projection: everything the board renders, computed as a
+/// PURE function of a [`Graph`] snapshot. The render path takes a `BoardView`,
+/// never an `Event` — the type system is the I1 seam.
+///
+/// S5 projection semantics (pinned by `tests/board_projection.rs`):
+/// - `events_folded` = `graph.events_folded` (fleet heartbeat);
+/// - `workspaces_open` / `workspaces_closed` = counts over
+///   `graph.workspaces` by [`WorkspaceStatus`];
+/// - `counts_by_subject` = `graph.counts_by_subject` (subject histogram),
+///   carried verbatim for the fleet summary line;
+/// - `runs` = one [`RunRow`] per `graph.agent_runs` entry, in the map's
+///   deterministic (ULID-string) key order;
+/// - `worktrees` = one [`WorktreeRow`] per `graph.worktrees` entry, in
+///   deterministic (path) key order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoardView {
+    pub events_folded: u64,
+    pub workspaces_open: usize,
+    pub workspaces_closed: usize,
+    /// Subject histogram, verbatim from the graph (deterministic order).
+    pub counts_by_subject: Vec<(String, u64)>,
+    pub runs: Vec<RunRow>,
+    pub worktrees: Vec<WorktreeRow>,
+}
+
+/// One agent run's row in the fleet board — the read-only accounting shadow.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunRow {
+    /// The run's ULID key (graph `agent_runs` key).
+    pub run: String,
+    /// Recorded status string, verbatim (`spawning` | `running` | `completed`
+    /// | …) — never re-interpreted (I3: reducers fold every live payload).
+    pub status: String,
+    pub total_usd: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// How many replay-divergence alarms are on this run (DR-006). Zero for a
+    /// healthy run; the board surfaces a nonzero count.
+    pub integrity_alarms: usize,
+}
+
+/// One worktree's row in the fleet board.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorktreeRow {
+    /// The worktree's path key (graph `worktrees` key).
+    pub path: String,
+    pub status: String,
+    pub branch: Option<String>,
+    /// Most recent `diff.ready`/`diff.merged` summary hash, if any.
+    pub last_diff: Option<String>,
+}
+
+/// PURE projection: `&Graph` -> [`BoardView`]. No IO, no clocks, no
+/// randomness. The render path never sees an `Event` — it sees this. Every
+/// field is carried verbatim from derived state (I3): the board re-interprets
+/// nothing.
+pub fn project(graph: &Graph) -> BoardView {
+    // Fleet summary: heartbeat + workspace open/closed split. BTreeMap<Subject,_>
+    // iterates in deterministic key order, so the histogram is stable.
+    let mut workspaces_open = 0usize;
+    let mut workspaces_closed = 0usize;
+    for status in graph.workspaces.values() {
+        match status {
+            WorkspaceStatus::Open => workspaces_open += 1,
+            WorkspaceStatus::Closed => workspaces_closed += 1,
+        }
+    }
+    let counts_by_subject = graph
+        .counts_by_subject
+        .iter()
+        .map(|(subject, count)| (subject.as_str().to_string(), *count))
+        .collect();
+
+    // Per-run rows, in the agent_runs map's deterministic (ULID-string) key
+    // order. Every field is carried verbatim from derived state (I3) — the
+    // board re-interprets nothing.
+    let runs = graph
+        .agent_runs
+        .iter()
+        .map(|(run, state)| RunRow {
+            run: run.clone(),
+            status: state.status.clone(),
+            total_usd: state.total_usd,
+            input_tokens: state.input_tokens,
+            output_tokens: state.output_tokens,
+            integrity_alarms: state.integrity_alarms.len(),
+        })
+        .collect();
+
+    // Per-worktree rows, in deterministic (path) key order.
+    let worktrees = graph
+        .worktrees
+        .iter()
+        .map(|(path, state)| WorktreeRow {
+            path: path.clone(),
+            status: state.status.clone(),
+            branch: state.branch.clone(),
+            last_diff: state.last_diff.clone(),
+        })
+        .collect();
+
+    BoardView {
+        events_folded: graph.events_folded,
+        workspaces_open,
+        workspaces_closed,
+        counts_by_subject,
+        runs,
+        worktrees,
+    }
+}
+
+/// Render a [`BoardView`] onto a ratatui frame. PURE given the view — testable
+/// with `ratatui::backend::TestBackend` golden buffers, no real terminal.
+///
+/// S5 render semantics (pinned by `tests/board_render_golden.rs`): a fleet
+/// summary line (events folded, open/closed workspace counts), a per-run table
+/// (run id, status, cost), and a per-worktree table (path, status). The exact
+/// cells are the committed golden buffer.
+pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
+    use ratatui::text::Text;
+    use ratatui::widgets::Paragraph;
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("rezidnt fleet board (read-only)".to_string());
+    lines.push(format!(
+        "events folded: {}   workspaces: {} open / {} closed",
+        view.events_folded, view.workspaces_open, view.workspaces_closed
+    ));
+    lines.push(String::new());
+
+    // Runs section: header + one row per run. Columns are placed at fixed
+    // offsets so the board reads as a table without box-drawing chrome.
+    lines.push("runs".to_string());
+    let mut header = String::new();
+    place(&mut header, 2, "run");
+    place(&mut header, 30, "status");
+    place(&mut header, 42, "cost usd");
+    place(&mut header, 53, "in/out tokens");
+    place(&mut header, 68, "alarms");
+    lines.push(header);
+    for row in &view.runs {
+        let mut line = String::new();
+        // The run ULID is 26 chars; the fixed board shows a recognizable
+        // prefix (21) so the columns stay aligned at 80 cols.
+        place(&mut line, 2, truncate(&row.run, 21));
+        place(&mut line, 25, &row.status);
+        place(
+            &mut line,
+            40,
+            &row.total_usd
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "-".to_string()),
+        );
+        place(&mut line, 56, &tokens(row.input_tokens, row.output_tokens));
+        place(&mut line, 66, &row.integrity_alarms.to_string());
+        lines.push(line);
+    }
+
+    lines.push(String::new());
+
+    // Worktrees section.
+    lines.push("worktrees".to_string());
+    let mut wt_header = String::new();
+    place(&mut wt_header, 2, "path");
+    place(&mut wt_header, 35, "status");
+    place(&mut wt_header, 45, "last diff");
+    lines.push(wt_header);
+    for wt in &view.worktrees {
+        let mut line = String::new();
+        place(&mut line, 2, &wt.path);
+        place(&mut line, 35, &wt.status);
+        place(
+            &mut line,
+            45,
+            wt.last_diff
+                .as_deref()
+                .map(|d| truncate(d, 12))
+                .unwrap_or(""),
+        );
+        lines.push(line);
+    }
+
+    let text = Text::from(lines.join("\n"));
+    frame.render_widget(Paragraph::new(text), frame.area());
+}
+
+/// Write `text` into `line` starting at column `col`, left-padding with spaces
+/// (never overwriting earlier content — columns are laid out left to right).
+fn place(line: &mut String, col: usize, text: &str) {
+    if line.len() < col {
+        line.push_str(&" ".repeat(col - line.len()));
+    }
+    line.push_str(text);
+}
+
+/// First `max` chars of `s` (byte-truncation is safe here: run ULIDs and
+/// blake3 hashes are ASCII).
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max { s } else { &s[..max] }
+}
+
+/// `in/out` token cell (`-` for an absent count).
+fn tokens(input: Option<u64>, output: Option<u64>) -> String {
+    let cell = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    format!("{}/{}", cell(input), cell(output))
+}
+
+/// Fold an event iterator into a `watch::Sender<Graph>`, publishing a fresh
+/// [`Graph`] snapshot after each event. This is the WATCH SEAM the render loop
+/// consumes: the render side holds a `watch::Receiver<Graph>` and calls
+/// [`project`] on each observed snapshot — it never sees a raw `Event`.
+///
+/// The socket wiring (connect, read the hello, send `Request::Tail`, read the
+/// JSONL event frames) is the implementer's `rezidnt board` subcommand in
+/// `bins/rezidnt`; this helper is the pure, in-memory-testable core: feed it a
+/// `Vec<Event>` and assert the receiver observes the transition.
+pub fn ingest_into_watch<'a, I>(events: I, sender: &watch::Sender<Graph>)
+where
+    I: IntoIterator<Item = &'a rezidnt_types::Event>,
+{
+    // Fold onto the sender's current snapshot (the seam is resumable: the
+    // render loop's initial seed rides through unchanged if there are no
+    // events). One `send` per event so a receiver that redraws on every watch
+    // change observes each transition, not just the terminal one.
+    let mut graph = sender.borrow().clone();
+    for event in events {
+        rezidnt_state::apply(&mut graph, event);
+        // The receiver only ever reads state — never a raw Event (I1).
+        let _ = sender.send(graph.clone());
+    }
+}

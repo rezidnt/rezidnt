@@ -10,6 +10,7 @@ members = [
     "crates/rezidnt-adapters/git",
     "crates/rezidnt-gate",
     "crates/rezidnt-mcp",
+    "crates/rezidnt-tui",
     "bins/rezidentd",
     "bins/rezidnt",
 ]
@@ -30,6 +31,23 @@ rezidnt-run = { path = "crates/rezidnt-run" }
 rezidnt-adapter-git = { path = "crates/rezidnt-adapters/git" }
 rezidnt-gate = { path = "crates/rezidnt-gate" }
 rezidnt-mcp = { path = "crates/rezidnt-mcp" }
+rezidnt-tui = { path = "crates/rezidnt-tui" }
+
+# dependency notes by the oracle (S5) — the fleet board (rezidnt-tui):
+# - ratatui (0.29, MIT) + crossterm (its backend, MIT): doc-blessed for S5 as
+#   the read-only fleet board's render toolkit. Declared IN rezidnt-tui (not
+#   here) since it is board-local; the render path is tested with
+#   `ratatui::backend::TestBackend` (deterministic golden buffers, no real
+#   terminal). This is the FIRST render dep in the workspace and does not touch
+#   the daemon (I1: zero pixels in core — the board is a pure socket client).
+# - tokio `sync` ONLY in rezidnt-tui: the board consumes a `watch<Graph>`; it
+#   deliberately does NOT take net/process/io-util (that socket wiring is the
+#   implementer's `rezidnt board` subcommand in bins/rezidnt, reusing
+#   `connect_and_request`). The lib crate stays writer-free by construction —
+#   the structural read-only proof (I1), asserted by
+#   crates/rezidnt-tui/tests/read_only.rs.
+# - rezidnt-proto is a DEV-only dep of rezidnt-tui (pins the existing
+#   `Request::Tail` op; no new proto op). Not a runtime dep — no daemon change.
 
 # dependency notes by the oracle (S4) — nothing NEW declared by the gate
 # skeleton: the engine needs only the approved set (tokio process/time for the

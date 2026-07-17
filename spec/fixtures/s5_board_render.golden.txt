@@ -1,0 +1,10 @@
+rezidnt fleet board (read-only)
+events folded: 9   workspaces: 0 open / 0 closed
+
+runs
+  run                         status      cost usd   in/out tokens  alarms
+  01S4VER1F1ED000000000  completed      0.001000        1/1       0
+
+worktrees
+  path                             status    last diff
+  /tmp/rezidnt-s4/impl             merged    1d50030ca17a

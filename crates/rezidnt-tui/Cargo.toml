@@ -1,0 +1,43 @@
+[package]
+name = "rezidnt-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt read-only fleet board: pure Graph->BoardView projection + ratatui render (S5, I1)"
+
+# S5 STRUCTURAL READ-ONLY PROOF (I1: zero pixels in core; the board is a pure
+# socket client). The dependency set is the proof by construction: this crate
+# pulls ONLY the state/types crates it reads and the terminal render toolkit.
+# It MUST NOT depend on any WRITE/EMIT path — no rezidnt-fabric (the log
+# writer), no rezidnt-proto/rezidnt-run/rezidnt-mcp socket-write surface, no
+# rusqlite/blake3 append path. The board consumes derived state (a watch<Graph>
+# fed by the existing `Request::Tail` replay-then-live op) and renders it;
+# it never mints or appends an Event. Adding a writer dep here is an I1
+# regression and the `read_only::crate_has_no_writer_dependency` test + the
+# auditor guard it.
+[dependencies]
+rezidnt-state.workspace = true
+rezidnt-types.workspace = true
+# tokio: ONLY the sync feature — the watch seam the render loop consumes. No
+# `net`/`process`/`io-util`: the socket wiring lives with the implementer in
+# bins/rezidnt (the #[cfg(unix)] `rezidnt board` subcommand reusing
+# `connect_and_request`), NOT in this pure lib. Declared directly (not via the
+# workspace tokio) so `default-features = false` can narrow it to the sync
+# seam; the version tracks the workspace's tokio 1.x.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# ratatui + crossterm: doc-blessed for S5 (doc §S5 / roadmap line, MIT). The
+# render path is tested with `ratatui::backend::TestBackend` — no real
+# terminal, deterministic golden buffers.
+ratatui = "0.29"
+
+[dev-dependencies]
+serde_json.workspace = true
+time.workspace = true
+ulid.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+# rezidnt-proto is a DEV-only dep: the `no_daemon_change` test pins that the
+# board rides the EXISTING `Request::Tail` op and introduces no new proto op.
+# It is NOT a runtime dependency — the shipped crate carries no socket-write /
+# proto surface (the structural read-only proof in `read_only.rs` asserts the
+# runtime `[dependencies]` table stays writer-free).
+rezidnt-proto.workspace = true

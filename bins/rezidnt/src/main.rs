@@ -59,6 +59,12 @@ enum Cmd {
         #[arg(long)]
         subject: Option<String>,
     },
+    /// Read-only fleet board (ratatui). Connects to the daemon, tails the
+    /// event stream (replay-from-seq-0 then live via the existing `tail` op),
+    /// folds it into a `rezidnt_state::Graph`, and renders the fleet. Pure
+    /// client — no daemon change, consumes only a watch channel (I1). `q` or
+    /// Ctrl-C quits (read-only navigation).
+    Board,
     /// Materialize a workspace from a project spec file (doc §13) and spawn
     /// its agents through the daemon.
     Open {
@@ -117,6 +123,7 @@ fn main() {
     let (failure_code, result) = match cli.cmd {
         Cmd::Rebuild { db, json } => (3, rebuild(&db, json)),
         Cmd::Tail { subject } => (4, tail(subject.as_deref())),
+        Cmd::Board => (4, board()),
         Cmd::Open { spec } => {
             // Local input phase: exit 2 (see module docs for the /dr flag).
             let (name, spec_toml) = match read_spec(&spec) {
@@ -242,6 +249,192 @@ fn tail(subject: Option<&str>) -> anyhow::Result<()> {
             continue;
         }
         writeln!(out, "{frame}")?;
+    }
+}
+
+/// `board`: the read-only fleet board (S5, I1). A PURE socket client — it
+/// rides the EXISTING `Request::Tail { subject: None }` op (replay-from-seq-0
+/// then live), folds each event into a `rezidnt_state::Graph`, publishes each
+/// snapshot on a `tokio::sync::watch<Graph>`, and renders the fleet from the
+/// watch channel ONLY (never a raw Event — that is the I1 render-side proof).
+/// No daemon change, no new proto op.
+///
+/// Two adapter tasks (each spanned): an INGEST task owns the blocking socket
+/// reader and does the fold+publish; a RENDER task drives crossterm's raw-mode
+/// terminal from the watch receiver. `q`/Esc/Ctrl-C quit (read-only
+/// navigation, not a control-plane action). The terminal is restored on every
+/// normal `Ok`/`Err` return of `render_loop`; a panic inside the draw/poll
+/// closure would unwind past teardown (no Drop guard), but the process is
+/// exiting at that point.
+#[cfg(unix)]
+fn board() -> anyhow::Result<()> {
+    use rezidnt_state::Graph;
+    use tokio::sync::watch;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build board runtime")?;
+
+    runtime.block_on(async {
+        // Connect on a blocking thread: `connect_and_request` returns a
+        // blocking std socket reader (no async socket work in this pure
+        // client — the daemon is untouched).
+        let reader = tokio::task::spawn_blocking(|| {
+            connect_and_request(&rezidnt_proto::Request::Tail { subject: None })
+        })
+        .await
+        .context("join board connect task")??;
+
+        let (tx, rx) = watch::channel(Graph::default());
+
+        // INGEST adapter task: own the blocking reader, fold every event into
+        // a running Graph, publish each snapshot on the watch sender. Runs on
+        // the blocking pool (the socket read is blocking I/O).
+        let ingest = tokio::task::spawn_blocking(move || {
+            let span = tracing::info_span!("adapter", kind = "board-ingest");
+            let _enter = span.enter();
+            ingest_loop(reader, &tx)
+        });
+
+        // RENDER adapter task: drive the terminal from the watch receiver
+        // ONLY. Also blocking (terminal I/O + crossterm event poll).
+        let render = tokio::task::spawn_blocking(move || {
+            let span = tracing::info_span!("adapter", kind = "board-render");
+            let _enter = span.enter();
+            render_loop(rx)
+        });
+
+        // The render loop owns the exit signal (user quit). When it returns,
+        // drop its handle and abort the ingest task; the terminal is already
+        // restored inside `render_loop`.
+        let render_result = render.await.context("join board render task")?;
+        ingest.abort();
+        // Surface an ingest error only if the render side did not already fail
+        // (a clean quit makes ingest's aborted/closed-channel exit expected).
+        render_result
+    })
+}
+
+/// The ingest side: read JSONL event frames off the blocking socket reader,
+/// fold each into the watch-published Graph. Returns when the daemon closes
+/// the stream or the watch receiver is gone (the board quit).
+#[cfg(unix)]
+fn ingest_loop(
+    mut reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    tx: &tokio::sync::watch::Sender<rezidnt_state::Graph>,
+) -> anyhow::Result<()> {
+    use std::io::BufRead;
+
+    use rezidnt_types::Event;
+
+    let mut graph = rezidnt_state::Graph::default();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).context("read event frame")?;
+        if n == 0 {
+            return Ok(()); // daemon closed the stream
+        }
+        let frame = line.trim_end();
+        if frame.is_empty() {
+            continue;
+        }
+        // Validating decode (I2 applies on the wire too), then fold into the
+        // derived Graph and publish the snapshot. The render loop reads state,
+        // never this Event.
+        let event = Event::from_json_line(frame).context("decode event frame")?;
+        rezidnt_state::apply(&mut graph, &event);
+        if tx.send(graph.clone()).is_err() {
+            return Ok(()); // render side gone: board quit
+        }
+    }
+}
+
+/// The render side: crossterm raw-mode terminal, redraw from the watch
+/// receiver on every change, poll for a quit key. ALWAYS restores the terminal
+/// before returning (clean teardown on quit, EOF, or error).
+#[cfg(unix)]
+fn render_loop(mut rx: tokio::sync::watch::Receiver<rezidnt_state::Graph>) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
+    use rezidnt_tui::{draw, project};
+
+    let mut terminal = setup_terminal().context("enter raw-mode terminal")?;
+
+    // Run the loop and guarantee teardown regardless of how it ends.
+    let outcome = (|| -> anyhow::Result<()> {
+        loop {
+            // Draw the current fleet state (the watch snapshot, projected —
+            // never a raw Event).
+            let view = project(&rx.borrow());
+            terminal
+                .draw(|frame| draw(frame, &view))
+                .context("draw board frame")?;
+
+            // Interleave: wait briefly for a quit key; if none, check whether
+            // the watch published a fresh snapshot and redraw.
+            if event::poll(Duration::from_millis(100)).context("poll terminal input")?
+                && let CtEvent::Key(key) = event::read().context("read terminal input")?
+                && key.kind == KeyEventKind::Press
+            {
+                let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL));
+                if quit {
+                    return Ok(());
+                }
+            }
+
+            // Non-blocking check for a new snapshot; also detects the ingest
+            // side closing (daemon stream ended).
+            match rx.has_changed() {
+                Ok(true) => {
+                    rx.borrow_and_update();
+                }
+                Ok(false) => {}
+                Err(_) => return Ok(()), // sender gone: stream ended
+            }
+        }
+    })();
+
+    // Teardown is unconditional — never leave the terminal raw.
+    restore_terminal(&mut terminal);
+    outcome
+}
+
+/// Enter the alternate screen in raw mode and hand back a ratatui terminal.
+#[cfg(unix)]
+fn setup_terminal()
+-> anyhow::Result<ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    Terminal::new(CrosstermBackend::new(stdout)).context("construct terminal")
+}
+
+/// Best-effort terminal restore: leave raw mode and the alternate screen. Runs
+/// on every exit path; failures are logged, never propagated (a teardown error
+/// must not mask the real outcome, and we are exiting anyway).
+#[cfg(unix)]
+fn restore_terminal(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) {
+    use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
+
+    if let Err(e) = disable_raw_mode() {
+        tracing::warn!(error = %e, "board: failed to disable raw mode on teardown");
+    }
+    if let Err(e) = crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        tracing::warn!(error = %e, "board: failed to leave alternate screen on teardown");
+    }
+    if let Err(e) = terminal.show_cursor() {
+        tracing::warn!(error = %e, "board: failed to restore cursor on teardown");
     }
 }
 
@@ -677,6 +870,14 @@ fn gate_why(run: &str, as_json: bool) -> anyhow::Result<()> {
 fn tail(_subject: Option<&str>) -> anyhow::Result<()> {
     anyhow::bail!(
         "rezidnt tail speaks a Unix domain socket only; the Windows named pipe \
+         (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
+    )
+}
+
+#[cfg(not(unix))]
+fn board() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "rezidnt board speaks a Unix domain socket only; the Windows named pipe \
          (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
     )
 }

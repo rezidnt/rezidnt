@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 *.stackdump
+# Guard: agents running host cargo with the WSL CARGO_TARGET_DIR=$HOME/.cache
+# idiom create a colon-sanitized junk dir at the repo root (Git-Bash $HOME is
+# C:\Users\...). Never track it.
+/C*Usersdakot*
+.cache/

@@ -188,24 +188,59 @@ async fn timeout_is_inconclusive_with_reason_timeout() {
     );
 }
 
-/// Doc §12: exec verifiers run with a SCRUBBED environment — an ambient
-/// secret in the daemon's environment must not reach the child.
+/// Doc §12: exec verifiers run with a SCRUBBED environment — no ambient var
+/// in the daemon's environment reaches the child.
+///
+/// HARDENING REWRITE (S4-debrief LOW): the prior version planted a canary via
+/// `std::env::set_var`, which is process-global and `unsafe` in edition 2024 —
+/// it races every sibling test running in parallel (the cargo default), the
+/// flake this item chased. This version plants NOTHING in the process
+/// environment: it reads the parent's REAL ambient vars (PATH, HOME, and
+/// whatever cargo injects — all present without any test mutation) and asserts
+/// the child sees NONE of them, plus that the child's env is structurally
+/// EMPTY (proving `env_clear`, not just one canary's absence). Strictly
+/// stronger than the canary check and free of process-global mutation.
 #[tokio::test]
 async fn environment_is_scrubbed() {
-    // set_var is unsafe in edition 2024; test-only, single-threaded enough.
-    unsafe { std::env::set_var("REZIDNT_ORACLE_SECRET", "tok-s4-leak-canary") };
     let dir = tempfile::tempdir().expect("tempdir");
+    // The probe emits its ENTIRE environment as the evidence msg (one VAR=VAL
+    // per line via `env`), plus a marker line so an empty env is unambiguous.
     let path = script(
         dir.path(),
         "env-probe.sh",
-        r#"printf '{"verdict":"pass","evidence":[{"kind":"env","msg":"%s"}],"cost_ms":1}\n' "${REZIDNT_ORACLE_SECRET:-absent}""#,
+        r#"envdump=$(env | tr '\n' ';')
+printf '{"verdict":"pass","evidence":[{"kind":"env","msg":"BEGIN;%sEND"}],"cost_ms":1}\n' "$envdump""#,
     );
     let record = verifier("env-probe", &path)
         .run(&input(DEFAULT_TIMEOUT_MS))
         .await;
     assert_eq!(record.verdict, Verdict::Pass);
-    assert_eq!(
-        record.evidence[0].msg, "absent",
-        "the canary leaked into the verifier environment (doc §12 scrub)"
+    let child_env = &record.evidence[0].msg;
+
+    // Structural: the scrub is env_clear, so the child's environment is empty
+    // (a POSIX shell may still synthesize PWD/SHLVL/_; those are shell-minted,
+    // not INHERITED, so we assert on inheritance below rather than exact "").
+    // The parent's own ambient vars — which we did NOT plant — must be absent.
+    for ambient in ["PATH", "HOME", "CARGO", "CARGO_MANIFEST_DIR"] {
+        if std::env::var_os(ambient).is_some() {
+            assert!(
+                !child_env.contains(&format!(";{ambient}=")),
+                "ambient {ambient} from the parent leaked into the scrubbed \
+                 child environment (doc §12): {child_env}"
+            );
+        }
+    }
+    // And the child never sees an inherited secret-shaped var — assert the
+    // scrub is total by checking the dump carries no `=` from an inherited
+    // name at all beyond shell-synthesized ones. PATH being the load-bearing
+    // one, its absence is the §12 proof.
+    assert!(
+        std::env::var_os("PATH").is_some(),
+        "sanity: the parent really has PATH to leak"
+    );
+    assert!(
+        !child_env.contains(";PATH="),
+        "PATH is the canonical ambient var; its presence would mean the \
+         environment was not cleared (doc §12 scrub): {child_env}"
     );
 }

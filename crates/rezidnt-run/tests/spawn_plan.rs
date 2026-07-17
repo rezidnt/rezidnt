@@ -11,6 +11,9 @@ fn agent(bin_override: Option<&str>) -> AgentSpec {
         worktree: "auto".into(),
         gates: vec![],
         bin_override: bin_override.map(Into::into),
+        // S4 additive governed-spawn fields — defaulted; this S1 test pins
+        // only the argv/env plan, not the vet posture.
+        ..AgentSpec::default()
     }
 }
 

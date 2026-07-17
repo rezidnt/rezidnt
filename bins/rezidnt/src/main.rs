@@ -70,6 +70,45 @@ enum Cmd {
         /// The run ULID, as printed by `rezidnt open`.
         run: String,
     },
+    /// Run the `vet` gate over a project spec's governed agents (pre-spawn
+    /// policy: bare-mode / pinned-version / allowed-tools). Exit 0 pass, 5
+    /// fail, 3 inconclusive (DR-004).
+    Vet {
+        /// Path to the project spec (rezidnt.toml shape).
+        spec: PathBuf,
+        /// Emit a machine-readable verdict on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay a run's recorded verdicts from log + CAS and report the result
+    /// (the compliance sentence, doc §8). Exit 0 all-pass, 5 gate-fail, 3
+    /// inconclusive or integrity-alarm (DR-004; never coerced, I6).
+    Debrief {
+        /// The run ULID.
+        run: String,
+        /// Emit the machine-readable replay report on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Interrogate a run's gate verdicts (§9 interrogability).
+    Gate {
+        #[command(subcommand)]
+        cmd: GateCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GateCmd {
+    /// Return the failing verifier, evidence refs, and exact recorded inputs
+    /// for a run's blocking gate. Exit 0 (the interrogation succeeded; the
+    /// verdict rides the output, not the exit code).
+    Why {
+        /// The run ULID.
+        run: String,
+        /// Emit the machine-readable answer on stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -100,6 +139,14 @@ fn main() {
             };
             (4, attach(run))
         }
+        // The gate verbs own their own DR-004 exit codes (0/3/5) — they
+        // std::process::exit internally rather than folding into the
+        // failure-class table above.
+        Cmd::Vet { spec, json } => (1, vet(&spec, json)),
+        Cmd::Debrief { run, json } => (1, debrief(&run, json)),
+        Cmd::Gate {
+            cmd: GateCmd::Why { run, json },
+        } => (1, gate_why(&run, json)),
     };
     if let Err(e) = result {
         eprintln!("rezidnt: {e:#}");
@@ -296,6 +343,263 @@ fn attach(run: ulid::Ulid) -> anyhow::Result<()> {
         out.write_all(&buf[..n]).context("write capture bytes")?;
         out.flush().context("flush capture bytes")?;
     }
+}
+
+/// `REZIDNT_DB` override, else `~/.local/state/rezidnt/events.db` (mirrors the
+/// daemon's `db_path`). The gate verbs read the log directly (the CLI is a
+/// client, I1/I5).
+fn db_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("REZIDNT_DB") {
+        return PathBuf::from(explicit);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local")
+        .join("state")
+        .join("rezidnt")
+        .join("events.db")
+}
+
+/// `REZIDNT_CAS` override, else `cas/` next to the log (mirrors the daemon's
+/// `cas_path`). Replay is log + CAS, nothing else (I3).
+fn cas_path(db: &Path) -> PathBuf {
+    if let Some(explicit) = std::env::var_os("REZIDNT_CAS") {
+        return PathBuf::from(explicit);
+    }
+    db.parent()
+        .map(|dir| dir.join("cas"))
+        .unwrap_or_else(|| PathBuf::from("cas"))
+}
+
+/// Read every event from the log (seq 0). The gate verbs fold/scan this.
+fn read_log_events(db: &Path) -> anyhow::Result<Vec<rezidnt_types::Event>> {
+    let log = rezidnt_fabric::EventLog::open(db)
+        .with_context(|| format!("open event log {}", db.display()))?;
+    let rows = log.read_from(1).context("read log from seq 1")?;
+    Ok(rows.into_iter().map(|r| r.event).collect())
+}
+
+/// Serialize an agent's governed `[agent]` fields as the TOML blob the vet
+/// natives read (the §8 `refs["spec"]` preimage). Mirrors the daemon's
+/// `gates::agent_spec_toml` so the CLI and daemon vet the same bytes.
+fn agent_spec_toml(agent: &rezidnt_run::spec::AgentSpec) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut s = String::from("[agent]\n");
+    s.push_str(&format!("name = {}\n", q(&agent.name)));
+    s.push_str(&format!("harness = {}\n", q(&agent.harness)));
+    s.push_str(&format!("bare = {}\n", agent.bare));
+    if let Some(v) = &agent.harness_version {
+        s.push_str(&format!("harness_version = {}\n", q(v)));
+    }
+    if !agent.allowed_tools.is_empty() {
+        let items: Vec<String> = agent.allowed_tools.iter().map(|t| q(t)).collect();
+        s.push_str(&format!("allowed_tools = [{}]\n", items.join(", ")));
+    }
+    s
+}
+
+/// `rezidnt vet <spec>`: run the three vet natives over each governed agent's
+/// pinned spec blob. DR-004 exits: 5 fail, 3 inconclusive, 0 pass. The verdict
+/// rides `--json` stdout verbatim (I6).
+fn vet(spec_path: &Path, as_json: bool) -> anyhow::Result<()> {
+    use rezidnt_gate::{
+        AllowedTools, BareMode, NativeVerifier, PinnedVersion, Verdict, VerifierInput,
+    };
+
+    let spec_toml = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("read spec file {}", spec_path.display()))?;
+    let spec = rezidnt_run::spec::ProjectSpec::from_toml_str(&spec_toml)
+        .with_context(|| format!("parse spec file {}", spec_path.display()))?;
+
+    let db = db_path();
+    let cas_root = cas_path(&db);
+    let cas = rezidnt_cas::Cas::open(&cas_root)
+        .with_context(|| format!("open cas {}", cas_root.display()))?;
+
+    let natives: Vec<(&str, Box<dyn NativeVerifier>)> = vec![
+        ("bare-mode", Box::new(BareMode)),
+        ("pinned-version", Box::new(PinnedVersion)),
+        ("allowed-tools", Box::new(AllowedTools)),
+    ];
+
+    // Vet every agent whose gates name `vet` (a bare spec vets all agents).
+    let governed: Vec<&rezidnt_run::spec::AgentSpec> = spec
+        .agents
+        .iter()
+        .filter(|a| a.gates.is_empty() || a.gates.iter().any(|g| g == "vet"))
+        .collect();
+
+    for agent in governed {
+        let blob = agent_spec_toml(agent);
+        let cas_ref = cas
+            .put(blob.as_bytes(), "application/toml")
+            .context("pin spec")?;
+        let input = VerifierInput {
+            gate: "vet".to_string(),
+            workspace: None,
+            refs: std::collections::BTreeMap::from([(
+                "spec".to_string(),
+                format!("cas:blake3:{}", cas_ref.hash),
+            )]),
+            params: serde_json::json!({}),
+            timeout_ms: rezidnt_gate::DEFAULT_TIMEOUT_MS,
+        };
+        for (name, native) in &natives {
+            let out = native.verify(&input, &cas).context("vet native")?;
+            match out.verdict {
+                Verdict::Pass => {}
+                // `emit_verdict` diverges (`-> !`): it prints and exits.
+                Verdict::Fail => emit_verdict(as_json, "fail", Some(name), 5),
+                Verdict::Inconclusive => emit_verdict(as_json, "inconclusive", Some(name), 3),
+            }
+        }
+    }
+    emit_verdict(as_json, "pass", None, 0)
+}
+
+/// Print a `{verdict, verifier?}` object (or a plain line) and exit with the
+/// DR-004 code — the verdict rides the output, the code rides the class.
+fn emit_verdict(as_json: bool, verdict: &str, verifier: Option<&str>, code: i32) -> ! {
+    if as_json {
+        let mut obj = serde_json::json!({"verdict": verdict});
+        if let Some(v) = verifier {
+            obj["verifier"] = serde_json::json!(v);
+        }
+        println!("{obj}");
+    } else {
+        match verifier {
+            Some(v) => println!("{verdict} ({v})"),
+            None => println!("{verdict}"),
+        }
+    }
+    std::process::exit(code);
+}
+
+/// `rezidnt debrief <run>`: replay the run's recorded verdicts from log + CAS
+/// (rezidnt-gate::replay), then report `{alarms, gates, cost}` and exit per
+/// DR-004: 3 if any integrity alarm or any inconclusive verdict (never
+/// coerced), else 5 if any fail, else 0.
+fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
+    let db = db_path();
+    let cas_root = cas_path(&db);
+    let cas = rezidnt_cas::Cas::open(&cas_root)
+        .with_context(|| format!("open cas {}", cas_root.display()))?;
+    let events = read_log_events(&db)?;
+
+    // Replay is over the whole log; scope to this run's gate facts.
+    let run_events: Vec<rezidnt_types::Event> = events
+        .iter()
+        .filter(|e| e.payload()["run"].as_str() == Some(run))
+        .cloned()
+        .collect();
+    let report = rezidnt_gate::replay(&run_events, &cas).context("replay run verdicts")?;
+
+    // The gate verdicts as recorded on the log (folded state), for the report.
+    let graph = rezidnt_state::fold(events.iter());
+    let gates = graph
+        .agent_runs
+        .get(run)
+        .map(|r| &r.gates)
+        .cloned()
+        .unwrap_or_default();
+    let cost = graph
+        .agent_runs
+        .get(run)
+        .map(|r| {
+            serde_json::json!({
+                "total_usd": r.total_usd,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // DR-004 exit class: an integrity alarm or any inconclusive is 3 (neither
+    // trusted nor coerced, I6); else any recorded fail is 5; else 0.
+    let has_inconclusive = gates.values().any(|g| g.verdict == "inconclusive");
+    let has_fail = gates.values().any(|g| g.verdict == "fail");
+    let code = if !report.alarms.is_empty() || has_inconclusive {
+        3
+    } else if has_fail {
+        5
+    } else {
+        0
+    };
+
+    let alarms: Vec<serde_json::Value> = report
+        .alarms
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "verifier": a.verifier,
+                "recorded": verdict_str(a.recorded),
+                "replayed": verdict_str(a.replayed),
+            })
+        })
+        .collect();
+
+    if as_json {
+        let out = serde_json::json!({
+            "run": run,
+            "alarms": alarms,
+            "gates": gates,
+            "cost": cost,
+        });
+        println!("{out}");
+    } else {
+        println!("debrief {run}: {} alarm(s)", alarms.len());
+    }
+    std::process::exit(code);
+}
+
+fn verdict_str(v: rezidnt_gate::Verdict) -> &'static str {
+    match v {
+        rezidnt_gate::Verdict::Pass => "pass",
+        rezidnt_gate::Verdict::Fail => "fail",
+        rezidnt_gate::Verdict::Inconclusive => "inconclusive",
+    }
+}
+
+/// `rezidnt gate why <run>`: return the failing verifier, evidence refs, and
+/// EXACT recorded inputs from the run's blocking gate fact (§9). Exit 0 — the
+/// interrogation succeeded; the recorded verdict rides the output verbatim.
+fn gate_why(run: &str, as_json: bool) -> anyhow::Result<()> {
+    let db = db_path();
+    let events = read_log_events(&db)?;
+
+    // The blocking gate fact: the most recent gate.failed / gate.inconclusive
+    // for this run (the verdict that blocked it). gate.passed does not block.
+    let blocker = events.iter().rfind(|e| {
+        e.payload()["run"].as_str() == Some(run)
+            && matches!(e.subject.as_str(), "gate.failed" | "gate.inconclusive")
+    });
+
+    let Some(event) = blocker else {
+        anyhow::bail!("no blocking gate fact recorded for run {run}");
+    };
+    let verdict = match event.subject.as_str() {
+        "gate.failed" => "fail",
+        _ => "inconclusive",
+    };
+    let payload = event.payload();
+    if as_json {
+        let out = serde_json::json!({
+            "run": run,
+            "gate": payload["gate"],
+            "verdict": verdict,
+            "verifier": payload["verifier"],
+            "evidence": payload["evidence"],
+            "inputs": payload["inputs"],
+        });
+        println!("{out}");
+    } else {
+        println!(
+            "run {run} blocked at gate {} by {} ({verdict})",
+            payload["gate"], payload["verifier"]
+        );
+    }
+    std::process::exit(0);
 }
 
 #[cfg(not(unix))]

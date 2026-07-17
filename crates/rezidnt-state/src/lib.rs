@@ -242,6 +242,107 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     .last_diff = Some(hash.to_string());
             }
         }
+        "diff.merged" => {
+            // Golden-path merge/worktree-lifecycle-close fact; inserted even
+            // if the worktree was never allocated — the log is truth (I3).
+            if let Some(path) = event.payload()["worktree"].as_str() {
+                let wt = graph.worktrees.entry(path.to_string()).or_default();
+                wt.status = "merged".to_string();
+                if let Some(hash) = event.payload()["diff"]["hash"].as_str() {
+                    wt.last_diff = Some(hash.to_string());
+                }
+            }
+        }
+        // S4 gate reducers, keyed under `AgentRunState::gates` by the payload
+        // `gate` name (last write wins). A gate fact creates the run entry
+        // with no synthesized status — a pre-spawn vet refusal is exactly such
+        // a run (I3: the log is truth, gate facts do not require a spawn).
+        "gate.entered" => {
+            if let Some(run) = payload_run(event)
+                && let Some(gate) = payload_gate(event)
+            {
+                let g = graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .gates
+                    .entry(gate)
+                    .or_default();
+                *g = GateState {
+                    verdict: "entered".to_string(),
+                    ..GateState::default()
+                };
+            }
+        }
+        "gate.passed" => {
+            if let Some(run) = payload_run(event)
+                && let Some(gate) = payload_gate(event)
+            {
+                // Flatten every verifier record's evidence hashes in order.
+                let evidence = event.payload()["verifiers"]
+                    .as_array()
+                    .map(|records| {
+                        records
+                            .iter()
+                            .flat_map(|r| r["evidence"].as_array().cloned().unwrap_or_default())
+                            .filter_map(|e| e["hash"].as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let g = graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .gates
+                    .entry(gate)
+                    .or_default();
+                *g = GateState {
+                    verdict: "pass".to_string(),
+                    verifier: None,
+                    evidence,
+                    reason: None,
+                };
+            }
+        }
+        "gate.failed" => {
+            if let Some(run) = payload_run(event)
+                && let Some(gate) = payload_gate(event)
+            {
+                let g = graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .gates
+                    .entry(gate)
+                    .or_default();
+                *g = GateState {
+                    verdict: "fail".to_string(),
+                    verifier: event.payload()["verifier"].as_str().map(String::from),
+                    evidence: evidence_hashes(event),
+                    reason: None,
+                };
+            }
+        }
+        "gate.inconclusive" => {
+            if let Some(run) = payload_run(event)
+                && let Some(gate) = payload_gate(event)
+            {
+                let g = graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .gates
+                    .entry(gate)
+                    .or_default();
+                *g = GateState {
+                    verdict: "inconclusive".to_string(),
+                    verifier: event.payload()["verifier"].as_str().map(String::from),
+                    evidence: evidence_hashes(event),
+                    // Recorded verbatim — never coerced (I6).
+                    reason: event.payload()["reason"].as_str().map(String::from),
+                };
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
 }
@@ -254,6 +355,24 @@ fn payload_run(event: &Event) -> Option<String> {
 /// The `path` key every `worktree.*` payload carries (ontology v1 baselines).
 fn payload_path(event: &Event) -> Option<String> {
     event.payload()["path"].as_str().map(String::from)
+}
+
+/// The `gate` key every `gate.*` payload carries (ontology v1 baselines).
+fn payload_gate(event: &Event) -> Option<String> {
+    event.payload()["gate"].as_str().map(String::from)
+}
+
+/// Evidence blob hashes (blake3 hex) from a `gate.failed`/`gate.inconclusive`
+/// fact — refs, never bytes (I2).
+fn evidence_hashes(event: &Event) -> Vec<String> {
+    event.payload()["evidence"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e["hash"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fold a whole event sequence from scratch. `rezidnt rebuild` is exactly

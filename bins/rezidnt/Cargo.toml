@@ -8,6 +8,11 @@ description = "the rezidnt CLI"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+# rezidnt-cas / rezidnt-gate (S4): the `vet` / `debrief` / `gate why` verbs
+# read log + CAS directly (the CLI is a client, I1/I5) and run the verifier
+# engine for vet and debrief replay (doc §8, I3/I6).
+rezidnt-cas.workspace = true
+rezidnt-gate.workspace = true
 rezidnt-fabric.workspace = true
 rezidnt-proto.workspace = true
 # rezidnt-run: `open` parses the §13 spec locally (success line needs

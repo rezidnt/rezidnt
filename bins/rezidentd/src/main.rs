@@ -21,6 +21,8 @@
 //! pipe (doc §9, S0 platform decision).
 
 #[cfg(unix)]
+mod gates;
+#[cfg(unix)]
 mod mcp;
 #[cfg(unix)]
 mod runs;

@@ -1,12 +1,12 @@
 //! rezidnt gate engine (doc §8 — the differentiation layer; over-invest
 //! here).
 //!
-//! ## ORACLE SKELETON — S4 board (types real, behavior `todo!()`-stubbed)
+//! ## S4 engine (implemented against the oracle board)
 //!
-//! This crate is scaffolded by the oracle so the S4 failing tests are
-//! assert-red rather than compile-red (the S3 `rezidnt-mcp` precedent).
-//! Every `todo!()` is implementer work; the shapes around them are pinned by
-//! the board and by the §8 BINDING contract:
+//! The oracle scaffolded the type shapes; this crate now carries the real
+//! behavior: strict §8 stdout parsing, the native pack, the exec runner, and
+//! debrief replay. The shapes are pinned by the board and by the §8 BINDING
+//! contract:
 //!
 //! - Verdicts are `pass | fail | inconclusive` — NEVER a bare boolean, never
 //!   coerced (I6). `inconclusive` carries a reason
@@ -29,11 +29,13 @@
 //! plumbing beyond recording is out of S4 scope.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use rezidnt_cas::Cas;
 use rezidnt_types::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 
 /// Wall-clock timeout DEFAULT for a verifier (doc §8 BINDING: 120 s).
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -122,9 +124,14 @@ pub enum GateError {
 /// contract — non-JSON, a bare boolean verdict, an unknown verdict string —
 /// is `Err` (the engine maps that to `inconclusive { malformed_output }`,
 /// NEVER to pass).
+///
+/// The verdict enum's serde derive is the strictness: `#[serde(rename_all =
+/// "lowercase")]` accepts EXACTLY `pass|fail|inconclusive`. A boolean, a
+/// near-miss string (`passed`, `PASS`, `ok`), prose, or empty input all fail
+/// the deserialize — there is no path from garbage to a synthesized verdict.
 pub fn parse_verifier_output(stdout: &[u8]) -> Result<VerifierOutput, GateError> {
-    let _ = stdout;
-    todo!("S4 implementer: strict §8 stdout parse — malformed is Err, never a coerced verdict")
+    let text = std::str::from_utf8(stdout).map_err(|e| GateError::Malformed(e.to_string()))?;
+    serde_json::from_str::<VerifierOutput>(text).map_err(|e| GateError::Malformed(e.to_string()))
 }
 
 /// A gate definition: a named policy point plus its execution policy.
@@ -143,7 +150,12 @@ pub struct GateDef {
 
 impl Default for GateDef {
     fn default() -> Self {
-        todo!("S4 implementer: BINDING defaults — network: false, timeout_ms: DEFAULT_TIMEOUT_MS")
+        // BINDING (doc §8): no network by default, 120 s wall-clock timeout.
+        Self {
+            name: String::new(),
+            network: false,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+        }
     }
 }
 
@@ -157,8 +169,13 @@ impl GateDef {
         refs: BTreeMap<String, String>,
         params: Value,
     ) -> VerifierInput {
-        let _ = (workspace, refs, params);
-        todo!("S4 implementer: assemble the §8 stdin doc from the gate def")
+        VerifierInput {
+            gate: self.name.clone(),
+            workspace,
+            refs,
+            params,
+            timeout_ms: self.timeout_ms,
+        }
     }
 }
 
@@ -171,6 +188,198 @@ pub trait NativeVerifier {
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError>;
 }
 
+/// Resolve a `cas:blake3:<hex>` ref string to its blob. A MISSING blob is a
+/// can't-run signal (`Ok(None)`), never an engine error — the caller maps it
+/// to `inconclusive` (I6 honesty). A malformed ref string is likewise a
+/// can't-run.
+fn resolve_ref(cas: &Cas, ref_str: &str) -> Result<Option<Vec<u8>>, GateError> {
+    let Some(hash) = ref_str.strip_prefix("cas:blake3:") else {
+        return Ok(None);
+    };
+    let want = rezidnt_types::refs::CasRef {
+        hash: hash.to_string(),
+        bytes: 0,
+        mime: String::new(),
+    };
+    match cas.get(&want) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(rezidnt_cas::CasError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The `inconclusive { malformed_output }`-adjacent verdict a native returns
+/// when its pinned input blob is absent: it cannot decide, so it says so.
+fn cannot_run(msg: &str) -> VerifierOutput {
+    VerifierOutput {
+        verdict: Verdict::Inconclusive,
+        evidence: vec![Evidence {
+            kind: "cannot-run".to_string(),
+            msg: msg.to_string(),
+            cas_ref: None,
+        }],
+        cost_ms: 0,
+    }
+}
+
+/// Extract the repo-relative path from one diff-summary line, tolerating both
+/// the oracle fixture format (`M\tsrc/x.rs`) and the S2 git-adapter format
+/// (`M src/x.rs blake3:<hex>`, with a leading `# rezidnt diff summary v1`
+/// header line). Returns `None` for blank / comment / header lines.
+///
+/// The path is the token AFTER the single-character status letter and its
+/// separator (a tab or a run of spaces), up to the next whitespace (which,
+/// in the adapter format, precedes the ` blake3:<hex>` content hash).
+fn diff_line_path(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    // status letter, then a separator, then the path.
+    let mut chars = line.char_indices();
+    let (_i0, letter) = chars.next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let (sep_start, sep_char) = chars.next()?;
+    if sep_char != '\t' && sep_char != ' ' {
+        return None;
+    }
+    let rest = &line[sep_start..];
+    let rest = rest.trim_start();
+    // The path runs up to the next whitespace (the adapter appends
+    // ` blake3:<hex>`; the fixture format has nothing after the path).
+    let path = rest.split_whitespace().next()?;
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// Every touched path in a diff-summary blob, in first-seen order.
+fn touched_paths(blob: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(blob);
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        if let Some(p) = diff_line_path(line) {
+            let owned = p.to_string();
+            if !paths.contains(&owned) {
+                paths.push(owned);
+            }
+        }
+    }
+    paths
+}
+
+/// Two-star glob match over a `/`-segmented path (the subset the board pins:
+/// `src/checkout/**`, `.env`, `secrets/**`, `**`). Semantics:
+/// - `**` matches any number of path segments (including zero);
+/// - `*` matches within one segment;
+/// - `?` matches one non-`/` character; literals match themselves.
+///
+/// Hand-rolled per the root-manifest note (the pinned patterns are a tiny
+/// two-star subset; a full globset dep would be attack surface, I7).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    glob_seg(pattern.as_bytes(), path.as_bytes())
+}
+
+fn glob_seg(pat: &[u8], text: &[u8]) -> bool {
+    // Iterative backtracking matcher with `**` (crosses `/`), `*` (does not
+    // cross `/`), `?` (one non-`/`), literals.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    let mut star_crosses_slash = false;
+    while ti < text.len() {
+        if pi < pat.len() {
+            match pat[pi] {
+                b'*' => {
+                    let double = pi + 1 < pat.len() && pat[pi + 1] == b'*';
+                    star_crosses_slash = double;
+                    star_pi = Some(pi);
+                    star_ti = ti;
+                    pi += if double { 2 } else { 1 };
+                    // Skip a `/` immediately after `**/` so `src/**` matches
+                    // `src/a` and `**` matches everything.
+                    if double && pi < pat.len() && pat[pi] == b'/' {
+                        pi += 1;
+                    }
+                    continue;
+                }
+                b'?' => {
+                    if text[ti] != b'/' {
+                        pi += 1;
+                        ti += 1;
+                        continue;
+                    }
+                }
+                c => {
+                    if c == text[ti] {
+                        pi += 1;
+                        ti += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Mismatch: backtrack to the last star if the char it may consume is
+        // legal (a single `*` never consumes `/`).
+        if let Some(sp) = star_pi {
+            if !star_crosses_slash && text[star_ti] == b'/' {
+                return false;
+            }
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + if star_crosses_slash { 2 } else { 1 };
+            if star_crosses_slash && pi < pat.len() && pat[pi] == b'/' {
+                pi += 1;
+            }
+            continue;
+        }
+        return false;
+    }
+    // Consume trailing stars/slashes in the pattern.
+    while pi < pat.len() {
+        match pat[pi] {
+            b'*' => pi += 1,
+            b'/' if pi > 0 && pat[pi - 1] == b'*' => pi += 1,
+            _ => break,
+        }
+    }
+    pi == pat.len()
+}
+
+/// `params[key]` as a `Vec<String>` of glob patterns (absent ⇒ empty).
+fn glob_list(params: &Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the CAS-pinned agent-spec TOML (`refs["spec"]`) as a parsed table.
+/// Missing/malformed ⇒ `Ok(None)` (cannot-run → inconclusive).
+fn read_spec(input: &VerifierInput, cas: &Cas) -> Result<Option<toml::Value>, GateError> {
+    let Some(ref_str) = input.refs.get("spec") else {
+        return Ok(None);
+    };
+    let Some(bytes) = resolve_ref(cas, ref_str)? else {
+        return Ok(None);
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    Ok(toml::from_str::<toml::Value>(text).ok())
+}
+
+/// The `[agent]` table of an agent-spec blob (the natives read this).
+fn agent_table(spec: &toml::Value) -> Option<&toml::value::Table> {
+    spec.get("agent").and_then(toml::Value::as_table)
+}
+
 /// Built-in: is every touched path inside `params.allow` (glob list)?
 /// Reads `refs["diff"]` — the S2 `diff.ready` summary format, one
 /// `<status>\t<path>` line per touched file.
@@ -181,8 +390,38 @@ impl NativeVerifier for DiffScope {
         "diff-scope"
     }
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
-        let _ = (input, cas);
-        todo!("S4 implementer: diff-scope over the CAS-pinned diff summary")
+        let Some(ref_str) = input.refs.get("diff") else {
+            return Ok(cannot_run("no diff ref in inputs"));
+        };
+        let Some(blob) = resolve_ref(cas, ref_str)? else {
+            return Ok(cannot_run("diff blob absent from CAS"));
+        };
+        let allow = glob_list(&input.params, "allow");
+        // Deterministic scan: first out-of-scope path in summary order is the
+        // named offender (same inputs → same evidence, I6).
+        let out_of_scope: Vec<String> = touched_paths(&blob)
+            .into_iter()
+            .filter(|p| !allow.iter().any(|g| glob_match(g, p)))
+            .collect();
+        if out_of_scope.is_empty() {
+            return Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            });
+        }
+        let msg = format!("out-of-scope paths: {}", out_of_scope.join(", "));
+        // Evidence blob → CAS; the fact carries the ref only (I2).
+        let ev = cas.put(msg.as_bytes(), "text/plain")?;
+        Ok(VerifierOutput {
+            verdict: Verdict::Fail,
+            evidence: vec![Evidence {
+                kind: "scope-violation".to_string(),
+                msg,
+                cas_ref: Some(format!("cas:blake3:{}", ev.hash)),
+            }],
+            cost_ms: 0,
+        })
     }
 }
 
@@ -195,8 +434,35 @@ impl NativeVerifier for ForbiddenPath {
         "forbidden-path"
     }
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
-        let _ = (input, cas);
-        todo!("S4 implementer: forbidden-path touch over the CAS-pinned diff summary")
+        let Some(ref_str) = input.refs.get("diff") else {
+            return Ok(cannot_run("no diff ref in inputs"));
+        };
+        let Some(blob) = resolve_ref(cas, ref_str)? else {
+            return Ok(cannot_run("diff blob absent from CAS"));
+        };
+        let forbid = glob_list(&input.params, "forbid");
+        let touched: Vec<String> = touched_paths(&blob)
+            .into_iter()
+            .filter(|p| forbid.iter().any(|g| glob_match(g, p)))
+            .collect();
+        if touched.is_empty() {
+            return Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            });
+        }
+        let msg = format!("forbidden paths touched: {}", touched.join(", "));
+        let ev = cas.put(msg.as_bytes(), "text/plain")?;
+        Ok(VerifierOutput {
+            verdict: Verdict::Fail,
+            evidence: vec![Evidence {
+                kind: "forbidden-touch".to_string(),
+                msg,
+                cas_ref: Some(format!("cas:blake3:{}", ev.hash)),
+            }],
+            cost_ms: 0,
+        })
     }
 }
 
@@ -211,9 +477,42 @@ impl NativeVerifier for BareMode {
         "bare-mode"
     }
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
-        let _ = (input, cas);
-        todo!("S4 implementer: bare-mode vet check over the CAS-pinned agent spec")
+        let Some(spec) = read_spec(input, cas)? else {
+            return Ok(cannot_run("agent spec absent from CAS or unparseable"));
+        };
+        let bare = agent_table(&spec)
+            .and_then(|t| t.get("bare"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if bare {
+            Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            })
+        } else {
+            fail_evidence(
+                cas,
+                "bare-mode",
+                "governed spawn requires `bare = true` in the agent spec (DR-001)",
+            )
+        }
     }
+}
+
+/// Build a `fail` output whose evidence blob (in the CAS, ref-carried, I2)
+/// names the missing knob — the refusal is interrogable (I6).
+fn fail_evidence(cas: &Cas, kind: &str, msg: &str) -> Result<VerifierOutput, GateError> {
+    let ev = cas.put(msg.as_bytes(), "text/plain")?;
+    Ok(VerifierOutput {
+        verdict: Verdict::Fail,
+        evidence: vec![Evidence {
+            kind: kind.to_string(),
+            msg: msg.to_string(),
+            cas_ref: Some(format!("cas:blake3:{}", ev.hash)),
+        }],
+        cost_ms: 0,
+    })
 }
 
 /// Vet native: the agent spec must pin `harness_version` (risk register:
@@ -225,8 +524,26 @@ impl NativeVerifier for PinnedVersion {
         "pinned-version"
     }
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
-        let _ = (input, cas);
-        todo!("S4 implementer: pinned-version vet check over the CAS-pinned agent spec")
+        let Some(spec) = read_spec(input, cas)? else {
+            return Ok(cannot_run("agent spec absent from CAS or unparseable"));
+        };
+        let pinned = agent_table(&spec)
+            .and_then(|t| t.get("harness_version"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if pinned {
+            Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            })
+        } else {
+            fail_evidence(
+                cas,
+                "pinned-version",
+                "governed spawn requires a pinned `harness_version` (risk register: harness CLI churn)",
+            )
+        }
     }
 }
 
@@ -239,8 +556,26 @@ impl NativeVerifier for AllowedTools {
         "allowed-tools"
     }
     fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
-        let _ = (input, cas);
-        todo!("S4 implementer: allowed-tools vet check over the CAS-pinned agent spec")
+        let Some(spec) = read_spec(input, cas)? else {
+            return Ok(cannot_run("agent spec absent from CAS or unparseable"));
+        };
+        let has_explicit_list = agent_table(&spec)
+            .and_then(|t| t.get("allowed_tools"))
+            .and_then(toml::Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        if has_explicit_list {
+            Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            })
+        } else {
+            fail_evidence(
+                cas,
+                "allowed-tools",
+                "governed spawn requires an explicit non-empty `allowed_tools` list (DR-001)",
+            )
+        }
     }
 }
 
@@ -274,9 +609,82 @@ pub struct ExecVerifier {
 }
 
 impl ExecVerifier {
+    /// Run the argv program under the §8 contract. Infallible by design: a
+    /// verifier that cannot run or cannot decide yields an `inconclusive`
+    /// [`VerdictRecord`], never an error — the only honest mappings are the
+    /// three verdicts (I6).
     pub async fn run(&self, input: &VerifierInput) -> VerdictRecord {
-        let _ = input;
-        todo!("S4 implementer: exec runner — spawn argv, feed stdin, enforce timeout, never coerce")
+        let span = tracing::info_span!("adapter", kind = "exec-verifier", verifier = %self.name);
+        self.run_inner(input).instrument(span).await
+    }
+
+    async fn run_inner(&self, input: &VerifierInput) -> VerdictRecord {
+        use tokio::io::AsyncWriteExt;
+
+        let inconclusive = |reason: InconclusiveReason| VerdictRecord {
+            verifier: self.name.clone(),
+            verdict: Verdict::Inconclusive,
+            reason: Some(reason),
+            evidence: vec![],
+            cost_ms: 0,
+        };
+
+        let Some((program, args)) = self.argv.split_first() else {
+            // A verifier with no argv cannot run — malformed config.
+            return inconclusive(InconclusiveReason::MalformedOutput);
+        };
+
+        // §8 stdin document, serialized verbatim (what the log records).
+        let stdin_doc = match serde_json::to_vec(input) {
+            Ok(bytes) => bytes,
+            Err(_) => return inconclusive(InconclusiveReason::MalformedOutput),
+        };
+
+        // Scrubbed environment (doc §12): no ambient secret reaches the child.
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .env_clear()
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(_) => return inconclusive(InconclusiveReason::MalformedOutput),
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            // Write the stdin doc; a broken pipe (child exited early) is not a
+            // hard error — the exit-status branch decides the verdict.
+            let _ = stdin.write_all(&stdin_doc).await;
+            let _ = stdin.shutdown().await;
+        }
+
+        let timeout = Duration::from_millis(input.timeout_ms);
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            // Wall-clock overrun: the child is killed by kill_on_drop when the
+            // future is dropped here.
+            Err(_elapsed) => return inconclusive(InconclusiveReason::Timeout),
+            Ok(Err(_io)) => return inconclusive(InconclusiveReason::MalformedOutput),
+        };
+
+        // Nonzero exit ⇒ inconclusive, NEVER pass — even if stdout says pass.
+        if !output.status.success() {
+            return inconclusive(InconclusiveReason::NonzeroExit);
+        }
+
+        match parse_verifier_output(&output.stdout) {
+            Ok(doc) => VerdictRecord {
+                verifier: self.name.clone(),
+                verdict: doc.verdict,
+                reason: None,
+                evidence: doc.evidence,
+                cost_ms: doc.cost_ms,
+            },
+            Err(_) => inconclusive(InconclusiveReason::MalformedOutput),
+        }
     }
 }
 
@@ -317,6 +725,100 @@ pub struct ReplayReport {
 /// gate.failed / gate.inconclusive facts) from their recorded `inputs`
 /// against `cas`, per the v1 replay policy on [`ReplayedVerdict`].
 pub fn replay(events: &[Event], cas: &Cas) -> Result<ReplayReport, GateError> {
-    let _ = (events, cas);
-    todo!("S4 implementer: debrief replay — re-execute natives from log + CAS, alarm on divergence")
+    let natives = builtin_natives();
+    let is_native = |name: &str| natives.iter().any(|n| n.name() == name);
+
+    let mut verdicts = Vec::new();
+    let mut alarms = Vec::new();
+
+    for event in events {
+        let payload = event.payload();
+        let run = payload["run"].as_str().unwrap_or_default().to_string();
+        let gate = payload["gate"].as_str().unwrap_or_default().to_string();
+
+        // Collect (verifier, recorded verdict, recorded inputs) tuples for
+        // whichever gate.* fact this is.
+        let recorded: Vec<(String, Verdict, Value)> = match event.subject.as_str() {
+            "gate.failed" => vec![(
+                payload["verifier"].as_str().unwrap_or_default().to_string(),
+                Verdict::Fail,
+                payload["inputs"].clone(),
+            )],
+            "gate.inconclusive" => vec![(
+                payload["verifier"].as_str().unwrap_or_default().to_string(),
+                Verdict::Inconclusive,
+                payload["inputs"].clone(),
+            )],
+            "gate.passed" => payload["verifiers"]
+                .as_array()
+                .map(|records| {
+                    records
+                        .iter()
+                        .map(|r| {
+                            (
+                                r["verifier"].as_str().unwrap_or_default().to_string(),
+                                Verdict::Pass,
+                                r["inputs"].clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => continue,
+        };
+
+        for (verifier, recorded_verdict, inputs) in recorded {
+            // v1 replay policy: inconclusive is honest can't-decide (nothing
+            // deterministic to reproduce) → reported, never re-executed,
+            // never an alarm. Exec verifiers' argv is not on the v1 payload →
+            // reported (`replayed: None`). Only natives re-execute.
+            let replayed = if recorded_verdict == Verdict::Inconclusive || !is_native(&verifier) {
+                None
+            } else {
+                reexecute_native(&natives, &verifier, &inputs, cas)?
+            };
+
+            if let Some(replayed_verdict) = replayed
+                && replayed_verdict != recorded_verdict
+            {
+                alarms.push(IntegrityAlarm {
+                    run: run.clone(),
+                    gate: gate.clone(),
+                    verifier: verifier.clone(),
+                    recorded: recorded_verdict,
+                    replayed: replayed_verdict,
+                });
+            }
+
+            verdicts.push(ReplayedVerdict {
+                run: run.clone(),
+                gate: gate.clone(),
+                verifier,
+                recorded: recorded_verdict,
+                replayed,
+            });
+        }
+    }
+
+    Ok(ReplayReport { verdicts, alarms })
+}
+
+/// Re-execute a named native verifier against its recorded §8 inputs. The
+/// recorded `inputs` object deserializes to a [`VerifierInput`] verbatim (the
+/// determinism BINDING: content-hash-pinned inputs reproduce the verdict).
+/// Returns `None` when the inputs are unrecoverable — a can't-run, never a
+/// synthesized verdict.
+fn reexecute_native(
+    natives: &[Box<dyn NativeVerifier>],
+    name: &str,
+    inputs: &Value,
+    cas: &Cas,
+) -> Result<Option<Verdict>, GateError> {
+    let Some(native) = natives.iter().find(|n| n.name() == name) else {
+        return Ok(None);
+    };
+    let Ok(input) = serde_json::from_value::<VerifierInput>(inputs.clone()) else {
+        return Ok(None);
+    };
+    Ok(Some(native.verify(&input, cas)?.verdict))
 }

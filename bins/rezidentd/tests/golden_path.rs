@@ -23,8 +23,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use common::{
-    connect, make_gated_project, open_request, read_until, run_cli, seed_db_from_fixture,
-    send_line, start_daemon, start_daemon_prepared,
+    connect, make_gated_project, read_until, run_cli, seed_db_from_fixture, send_line,
+    start_daemon, start_daemon_prepared,
 };
 use serde_json::json;
 

@@ -17,6 +17,10 @@ rezidnt-types = { workspace = true }
 rezidnt-cas = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# toml: the vet natives (bare-mode / pinned-version / allowed-tools) parse the
+# CAS-pinned agent-spec TOML blob (doc §8: verifiers receive CAS refs).
+# Pre-flagged in the root manifest S4 notes; same version rezidnt-run carries.
+toml = "0.8"
 thiserror = { workspace = true }
 # process + time: the exec runner (spawn argv, feed stdin, enforce the
 # wall-clock timeout). io-util for piped stdio.

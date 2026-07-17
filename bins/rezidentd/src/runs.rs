@@ -7,21 +7,24 @@
 //! disconnect mid-run kills nothing but the socket.
 #![cfg(unix)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
+use rezidnt_gate::Verdict;
 use rezidnt_run::RunId;
 use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
 use rezidnt_run::badge::Badge;
 use rezidnt_run::capture::{DEFAULT_CHUNK_BYTES, DEFAULT_RING_BYTES, RingBuffer, chunk_into_cas};
 use rezidnt_run::spawner::SpawnPlan;
-use rezidnt_run::spec::{AgentSpec, ProjectSpec};
+use rezidnt_run::spec::{AgentSpec, GateSpec, ProjectSpec};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
 use serde_json::json;
+
+use crate::gates;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Instrument;
 use ulid::Ulid;
@@ -127,6 +130,9 @@ pub struct OpenedWorkspace {
     /// Repo root as the spec gave it (canonicalized again at use).
     pub root: PathBuf,
     pub agents: Vec<AgentSpec>,
+    /// `[gates.<name>]` verifier sets from the applied spec (S4). The vet /
+    /// pre_merge gates run these; empty for pre-S4 specs.
+    pub gates: BTreeMap<String, GateSpec>,
     /// §9 idempotency: key → the run it minted. A retried `spawn_agent` with
     /// a known key returns this run and spawns nothing new.
     pub spawn_keys: HashMap<String, Ulid>,
@@ -202,6 +208,7 @@ fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, O
                     OpenedWorkspace {
                         root: PathBuf::from(root),
                         agents: Vec::new(),
+                        gates: BTreeMap::new(),
                         spawn_keys: HashMap::new(),
                     },
                 );
@@ -219,7 +226,10 @@ fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, O
                     .and_then(|bytes| String::from_utf8(bytes).ok())
                     .and_then(|toml| ProjectSpec::from_toml_str(&toml).ok());
                 match spec {
-                    Some(spec) => entry.agents = spec.agents,
+                    Some(spec) => {
+                        entry.agents = spec.agents;
+                        entry.gates = spec.gates;
+                    }
                     // Degraded, never fatal: the workspace stays open with no
                     // spawnable agents; spawn answers agent.unknown.
                     None => tracing::warn!(
@@ -250,7 +260,7 @@ fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, O
 
 /// Publish one event off the async threads (SQLite append is blocking);
 /// returns the event id for causation chaining.
-async fn publish(fabric: &Arc<Fabric>, event: Event) -> anyhow::Result<Ulid> {
+pub async fn publish(fabric: &Arc<Fabric>, event: Event) -> anyhow::Result<Ulid> {
     let id = event.id;
     let fabric = Arc::clone(fabric);
     tokio::task::spawn_blocking(move || fabric.publish(event))
@@ -324,6 +334,7 @@ pub async fn begin_open(
         OpenedWorkspace {
             root: spec.repo.clone(),
             agents: spec.agents.clone(),
+            gates: spec.gates.clone(),
             spawn_keys: HashMap::new(),
         },
     );
@@ -372,14 +383,26 @@ async fn materialize_open(
     correlation: Ulid,
 ) {
     if let Err(e) = try_materialize_open(&daemon, spec, &spec_toml, workspace, correlation).await {
-        tracing::warn!(error = %e, "open materialization failed");
-        // Ghost-workspace closure (S3-T2): the entry was registered pre-ack,
-        // but `workspace.opened` never reached the log — evict it so
-        // `spawn_agent` answers `workspace.unknown` instead of minting
-        // `agent.spawned` facts for a workspace the log never opened (I3).
-        daemon.workspaces.lock().await.remove(&workspace.ulid());
-        warn_open_failed(&daemon, &format!("{e:#}")).await;
+        tracing::warn!(error = %e.source, "open materialization failed");
+        // EVICTION DISCIPLINE (S4 remediation, I3): evict ONLY the ghost case
+        // — `workspace.opened` never reached the log, so the workspace is not
+        // open and `spawn_agent` must answer `workspace.unknown`. A POST-FACT
+        // failure (a later agent could not launch) after `workspace.opened`
+        // published is NOT a ghost: the log OPENED the workspace, so it stays
+        // spawnable (fold(log) == live map). Evicting it was the over-reach
+        // that made the live daemon disagree with a restarted one.
+        if !e.opened {
+            daemon.workspaces.lock().await.remove(&workspace.ulid());
+        }
+        warn_open_failed(&daemon, &format!("{:#}", e.source)).await;
     }
+}
+
+/// A materialization failure that remembers whether `workspace.opened` reached
+/// the log — the eviction decision (ghost vs. post-fact failure) turns on it.
+struct MaterializeError {
+    opened: bool,
+    source: anyhow::Error,
 }
 
 /// Harnesses this daemon's S1 run substrate can drive. The AgentSubstrate
@@ -393,14 +416,24 @@ async fn try_materialize_open(
     spec_toml: &str,
     workspace: WorkspaceId,
     correlation: Ulid,
-) -> anyhow::Result<()> {
+) -> Result<(), MaterializeError> {
+    // Pre-opened phase: any failure here is a GHOST (workspace.opened never
+    // reached the log). `opened = false` → the caller evicts.
+    let ghost = |e: anyhow::Error| MaterializeError {
+        opened: false,
+        source: e,
+    };
+
     // Workspace root = the spec's repo path (relative paths resolve against
     // the daemon cwd in S1 — the spec arrived over the wire, not from a file).
     let root = tokio::fs::canonicalize(&spec.repo)
         .await
-        .with_context(|| format!("canonicalize workspace root {}", spec.repo.display()))?;
+        .with_context(|| format!("canonicalize workspace root {}", spec.repo.display()))
+        .map_err(ghost)?;
 
-    // 1. workspace.opened — the envelope workspace id is the entity key.
+    // 1. workspace.opened — the envelope workspace id is the entity key. Once
+    //    this reaches the log the workspace IS open; every later failure is
+    //    post-fact (opened = true → the caller keeps it spawnable, I3).
     let opened_id = publish(
         &daemon.fabric,
         Event::new(
@@ -411,9 +444,18 @@ async fn try_materialize_open(
             None,
             1,
             json!({"name": spec.name, "root": root.display().to_string()}),
-        )?,
+        )
+        .map_err(|e| ghost(e.into()))?,
     )
-    .await?;
+    .await
+    .map_err(ghost)?;
+
+    // From here on the workspace is on the log — post-fact failures never
+    // evict.
+    let post_fact = |e: anyhow::Error| MaterializeError {
+        opened: true,
+        source: e,
+    };
 
     // 2. workspace.spec.applied — the applied spec TOML persists to the CAS.
     let spec_ref = {
@@ -421,8 +463,10 @@ async fn try_materialize_open(
         let bytes = spec_toml.as_bytes().to_vec();
         tokio::task::spawn_blocking(move || cas.put(&bytes, "application/toml"))
             .await
-            .context("cas put task panicked")?
-            .context("store spec in cas")?
+            .context("cas put task panicked")
+            .map_err(post_fact)?
+            .context("store spec in cas")
+            .map_err(post_fact)?
     };
     let agent_names: Vec<&str> = spec.agents.iter().map(|a| a.name.as_str()).collect();
     let applied_id = publish(
@@ -435,27 +479,45 @@ async fn try_materialize_open(
             Some(opened_id),
             1,
             json!({"spec_ref": spec_ref, "agents": agent_names}),
-        )?,
+        )
+        .map_err(|e| post_fact(e.into()))?,
     )
-    .await?;
+    .await
+    .map_err(post_fact)?;
 
-    // 3–6. Per agent: allocate a worktree, spawn under capture, detach.
+    // 3–6. Per agent: vet (pre-spawn), allocate a worktree, spawn under
+    //       capture, detach. A single agent's launch failure is recorded as a
+    //       daemon.warning but does NOT roll back the (already-opened)
+    //       workspace: the log opened it, so it stays spawnable (I3; the S4
+    //       partial-failure remediation). The whole open only errors out of
+    //       here — and even then, with `opened = true` — if every agent fails
+    //       so a warning is warranted.
+    let mut launch_error: Option<anyhow::Error> = None;
     for agent in &spec.agents {
-        launch_agent(
+        if let Err(e) = launch_agent(
             daemon,
             agent,
             &root,
             workspace,
             correlation,
             Some(applied_id),
+            &spec.gates,
             // Spec-driven open-chain spawns are keyless (ontology: the key is
             // never synthesized).
             None,
         )
         .await
-        .with_context(|| format!("launch agent {:?}", agent.name))?;
+        {
+            tracing::warn!(agent = %agent.name, error = %e, "agent launch failed; workspace stays open");
+            launch_error.get_or_insert_with(|| e.context(format!("launch agent {:?}", agent.name)));
+        }
     }
-    Ok(())
+    match launch_error {
+        // A post-fact launch failure surfaces as daemon.warning (the caller),
+        // but never evicts — the workspace is on the log.
+        Some(e) => Err(post_fact(e)),
+        None => Ok(()),
+    }
 }
 
 /// Allocate a worktree and spawn one agent under capture; returns the minted
@@ -465,6 +527,7 @@ async fn try_materialize_open(
 /// `agent.spawned` payload so the key→run map is log-derivable (I3; ontology
 /// v1 additive field, ratified 2026-07-17) — `None` for keyless paths (socket
 /// `open` chain), never synthesized.
+#[allow(clippy::too_many_arguments)]
 pub async fn launch_agent(
     daemon: &Arc<Daemon>,
     agent: &AgentSpec,
@@ -472,9 +535,38 @@ pub async fn launch_agent(
     workspace: WorkspaceId,
     correlation: Ulid,
     causation: Option<Ulid>,
+    gate_defs: &BTreeMap<String, GateSpec>,
     idempotency_key: Option<&str>,
 ) -> anyhow::Result<RunId> {
     let run = RunId::new(Ulid::new());
+    let run_str = run.ulid().to_string();
+
+    // 0. vet — PRE-SPAWN enforcement (doc §8, S4). If the agent's `gates`
+    //    name `vet`, run it BEFORE anything materializes: a non-conforming
+    //    spec (no bare / no pinned version / no allowed_tools) is refused at
+    //    the gate — NO worktree, NO agent.spawned. The refusal is a
+    //    machine-readable fact (gate.failed), never a log-less error.
+    let mut vet_causation = causation;
+    if agent.gates.iter().any(|g| g == "vet") {
+        let spec_ref = gates::pin_agent_spec(daemon, agent).await?;
+        let refs = BTreeMap::from([("spec".to_string(), spec_ref)]);
+        let outcome = gates::run_gate(
+            daemon,
+            workspace,
+            correlation,
+            causation,
+            &run_str,
+            "vet",
+            refs,
+            &gates::vet_verifiers(),
+        )
+        .await?;
+        if outcome.verdict != Verdict::Pass {
+            // Pre-spawn refusal: the gate fact is the record. No spawn.
+            anyhow::bail!("vet gate refused agent {:?} (verdict not pass)", agent.name);
+        }
+        vet_causation = Some(outcome.verdict_id);
+    }
 
     // 3. worktree.allocated — minimal git-CLI allocation (S2 owns the full
     // RepoSubstrate adapter; S1 keeps this to allocate-and-emit).
@@ -486,7 +578,7 @@ pub async fn launch_agent(
             Some(workspace),
             Subject::new("worktree.allocated"),
             correlation,
-            causation,
+            vet_causation,
             1,
             json!({
                 "path": worktree.display().to_string(),
@@ -524,6 +616,21 @@ pub async fn launch_agent(
     if let (Some(key), Some(obj)) = (idempotency_key, spawned_payload.as_object_mut()) {
         obj.insert("idempotency_key".to_string(), json!(key));
     }
+    // Governed-spawn fields (S4, additive, DR-001: enforcement decisions
+    // recorded in events). A governed spawn is one that ran through the vet
+    // gate — the posture the gate checked is now log-derivable. Absent on
+    // ungoverned/legacy spawns (never synthesized to `false` — absence is
+    // honest, per the ontology).
+    let governed = agent.gates.iter().any(|g| g == "vet");
+    if governed && let Some(obj) = spawned_payload.as_object_mut() {
+        obj.insert("bare".to_string(), json!(agent.bare));
+        if let Some(v) = &agent.harness_version {
+            obj.insert("harness_version".to_string(), json!(v));
+        }
+        if !agent.allowed_tools.is_empty() {
+            obj.insert("allowed_tools".to_string(), json!(agent.allowed_tools));
+        }
+    }
 
     // Register BEFORE the fact hits the fabric: a client that sees
     // agent.spawned must be able to attach without racing the registry.
@@ -544,7 +651,18 @@ pub async fn launch_agent(
     )
     .await?;
 
-    // 5–6. The run task: daemon-owned, detached from every connection.
+    // 5–6. The run task: daemon-owned, detached from every connection. The
+    //       pre_merge plan (if the agent's gates name it) travels with the
+    //       run so the post-completion diff.ready → pre_merge → diff.merged
+    //       chain runs where the worktree state is known.
+    let pre_merge = if agent.gates.iter().any(|g| g == "pre_merge") {
+        Some(PreMergePlan {
+            repo: repo.to_path_buf(),
+            gate: gate_defs.get("pre_merge").cloned().unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let stdout = child.stdout.take().context("child stdout must be piped")?;
     let ctx = RunTaskContext {
         daemon: Arc::clone(daemon),
@@ -553,6 +671,8 @@ pub async fn launch_agent(
         correlation,
         spawned_id,
         capture,
+        worktree: worktree.clone(),
+        pre_merge,
     };
     let span = tracing::info_span!("run", run = %run.ulid(), agent = %agent.name);
     tokio::spawn(
@@ -624,6 +744,18 @@ struct RunTaskContext {
     correlation: Ulid,
     spawned_id: Ulid,
     capture: Arc<RunCapture>,
+    /// The agent's allocated worktree — the pre_merge chain summarizes and
+    /// merges it after the run completes.
+    worktree: PathBuf,
+    /// Present when the agent's gates include `pre_merge` (the golden path).
+    pre_merge: Option<PreMergePlan>,
+}
+
+/// What the run task needs to run the `pre_merge` gate and merge after the
+/// agent completes: the repo to merge into and the gate's verifier set.
+struct PreMergePlan {
+    repo: PathBuf,
+    gate: GateSpec,
 }
 
 /// Read the child's stream-json stdout to EOF: every byte into the capture
@@ -715,6 +847,19 @@ async fn drive_run(
         completed_id = Some(publish(&ctx.daemon.fabric, event).await?);
     }
 
+    // pre_merge — the golden-path verified-merge chain (S4). After the agent
+    // completes, summarize its worktree into the CAS (diff.ready, CAS-pinned),
+    // run the pre_merge gate against that ref, and on a VERIFIED pass merge
+    // the change into the repo (diff.merged). A gate refusal blocks the merge:
+    // the verdict fact is the record, the diff is not merged.
+    if let Some(plan) = &ctx.pre_merge
+        && let Err(e) = run_pre_merge(&ctx, plan, completed_id).await
+    {
+        // A pre_merge failure never kills the run task's teardown; it is
+        // traced and the run still chunks its capture below.
+        tracing::warn!(error = %e, "pre_merge chain failed");
+    }
+
     // Capture chunks into the CAS; manifest facts carry refs only (I2).
     let stream = ctx.capture.finish();
     let manifest = {
@@ -743,6 +888,68 @@ async fn drive_run(
             }),
         )?;
         publish(&ctx.daemon.fabric, event).await?;
+    }
+    Ok(())
+}
+
+/// The golden-path verified-merge chain: diff.ready (CAS-pinned) →
+/// pre_merge gate over the diff ref → on pass, git merge + diff.merged.
+async fn run_pre_merge(
+    ctx: &RunTaskContext,
+    plan: &PreMergePlan,
+    completed_id: Option<Ulid>,
+) -> anyhow::Result<()> {
+    let run_str = ctx.run.ulid().to_string();
+
+    // 1. Summarize the worktree's change into the CAS and emit diff.ready
+    //    (the S2 watcher fact, produced here at completion for the gated run).
+    let (diff_ref, cas_ref) = gates::summarize_worktree(&ctx.daemon, &ctx.worktree).await?;
+    let diff_ready_id = publish(
+        &ctx.daemon.fabric,
+        Event::new(
+            SourceId::new("rezidnt-adapter-git"),
+            Some(ctx.workspace),
+            Subject::new("diff.ready"),
+            ctx.correlation,
+            completed_id,
+            1,
+            json!({
+                "worktree": ctx.worktree.display().to_string(),
+                "diff": cas_ref,
+            }),
+        )?,
+    )
+    .await?;
+
+    // 2. pre_merge — verify the CAS-pinned diff. gate.entered follows
+    //    diff.ready (the test pins this order: the gate verifies the diff).
+    let refs = BTreeMap::from([("diff".to_string(), diff_ref)]);
+    let verifiers = gates::resolve_verifiers(&plan.gate);
+    let outcome = gates::run_gate(
+        &ctx.daemon,
+        ctx.workspace,
+        ctx.correlation,
+        Some(diff_ready_id),
+        &run_str,
+        "pre_merge",
+        refs,
+        &verifiers,
+    )
+    .await?;
+
+    // 3. Merge ONLY on a verified pass (the merge happens after the verdict).
+    if outcome.verdict == Verdict::Pass {
+        gates::merge_worktree(
+            &ctx.daemon,
+            ctx.workspace,
+            ctx.correlation,
+            Some(outcome.verdict_id),
+            &run_str,
+            &plan.repo,
+            &ctx.worktree,
+            &cas_ref,
+        )
+        .await?;
     }
     Ok(())
 }

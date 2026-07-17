@@ -2025,6 +2025,7 @@ dependencies = [
  "blake3",
  "rezidnt-cas",
  "rezidnt-fabric",
+ "rezidnt-gate",
  "rezidnt-mcp",
  "rezidnt-proto",
  "rezidnt-run",
@@ -2042,7 +2043,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "rezidnt-cas",
  "rezidnt-fabric",
+ "rezidnt-gate",
  "rezidnt-proto",
  "rezidnt-run",
  "rezidnt-state",
@@ -2112,6 +2115,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

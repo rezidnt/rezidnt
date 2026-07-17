@@ -112,6 +112,11 @@ proptest! {
     /// either fails or yields a document whose verdict came from the three
     /// canonical strings — and a `pass` requires the literal `"verdict":"pass"`
     /// member to be present in the input.
+    // Implementer note (S4): once `parse_verifier_output` returns (the
+    // skeleton `todo!()` panicked), clippy sees the nested `if let Ok` + `if`
+    // and flags `collapsible_if` under the gauntlet's `-D warnings`. The
+    // allow preserves the oracle's exact structure — no assertion is weakened.
+    #[allow(clippy::collapsible_if)]
     #[test]
     fn garbage_never_parses_to_pass(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
         if let Ok(out) = parse_verifier_output(&bytes) {

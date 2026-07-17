@@ -12,6 +12,9 @@ anyhow.workspace = true
 blake3.workspace = true
 rezidnt-cas.workspace = true
 rezidnt-fabric.workspace = true
+# rezidnt-gate (implementer, S4): the verifier engine (doc §8) — vet pre-spawn,
+# pre_merge on the golden path, and debrief replay (log + CAS, I3/I6).
+rezidnt-gate.workspace = true
 # rezidnt-mcp (implementer, S3): the MCP surface (doc §9, I5) — served over
 # loopback HTTP when REZIDNT_MCP_LOCKFILE requests it.
 rezidnt-mcp.workspace = true

@@ -8,6 +8,7 @@ members = [
     "crates/rezidnt-cas",
     "crates/rezidnt-run",
     "crates/rezidnt-adapters/git",
+    "crates/rezidnt-gate",
     "crates/rezidnt-mcp",
     "bins/rezidentd",
     "bins/rezidnt",
@@ -27,7 +28,20 @@ rezidnt-proto = { path = "crates/rezidnt-proto" }
 rezidnt-cas = { path = "crates/rezidnt-cas" }
 rezidnt-run = { path = "crates/rezidnt-run" }
 rezidnt-adapter-git = { path = "crates/rezidnt-adapters/git" }
+rezidnt-gate = { path = "crates/rezidnt-gate" }
 rezidnt-mcp = { path = "crates/rezidnt-mcp" }
+
+# dependency notes by the oracle (S4) — nothing NEW declared by the gate
+# skeleton: the engine needs only the approved set (tokio process/time for the
+# exec runner; blake3 arrives via rezidnt-cas). Two implementer-era additions
+# are pre-flagged so the auditor is not surprised:
+# - toml: the vet natives (bare-mode / pinned-version / allowed-tools) parse
+#   the CAS-pinned agent-spec TOML blob (doc §8: verifiers receive CAS refs).
+#   Same crate rezidnt-run already carries (auditor-flagged there at S1);
+#   lands in rezidnt-gate with the implementer.
+# - a glob matcher for diff-scope / forbidden-path params: hand-rolling the
+#   two-star subset the board pins (`src/checkout/**`, `.env`, `secrets/**`)
+#   is fine; taking `globset` instead requires a written note here.
 
 # dependency notes by the oracle (S3):
 # - schemars: doc §9 BINDING — every MCP tool's JSON Schema is generated from

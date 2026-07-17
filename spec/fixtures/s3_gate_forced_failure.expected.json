@@ -9,7 +9,17 @@
   "workspaces": {},
   "agent_runs": {
     "01S3GATEFA1DED000000000R01": {
-      "status": "spawning"
+      "status": "spawning",
+      "gates": {
+        "pre_merge": {
+          "verdict": "fail",
+          "verifier": "tests-pass",
+          "evidence": [
+            "a0fda6ff40cb5f91bd2d09cbfb839ae91b9b4c9aa0ccfc0981986c10d4d08246"
+          ],
+          "reason": null
+        }
+      }
     }
   }
 }

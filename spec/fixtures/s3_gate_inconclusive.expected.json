@@ -6,5 +6,19 @@
     "gate.inconclusive": 1
   },
   "workspaces": {},
-  "agent_runs": {}
+  "agent_runs": {
+    "01S3GATE1NC0NC000000000R02": {
+      "status": "",
+      "gates": {
+        "pre_merge": {
+          "verdict": "inconclusive",
+          "verifier": "tests-pass",
+          "evidence": [
+            "b63eaa2d08ce4809167acdd25b0b5d616219d17235be2dae12d24ae988dfbaa3"
+          ],
+          "reason": "timeout"
+        }
+      }
+    }
+  }
 }

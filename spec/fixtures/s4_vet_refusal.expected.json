@@ -1,0 +1,25 @@
+{
+  "events_folded": 2,
+  "last_event": "01S4VETREFVSD0000000000E02",
+  "counts_by_subject": {
+    "gate.entered": 1,
+    "gate.failed": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01S4VETREFVSD0000000000R01": {
+      "status": "",
+      "gates": {
+        "vet": {
+          "verdict": "fail",
+          "verifier": "bare-mode",
+          "evidence": [
+            "6e840eefd54f94a9aefe2ca3b0f76b7ea28a8b306300c83567ac6175c0e800ad"
+          ],
+          "reason": null
+        }
+      }
+    }
+  },
+  "worktrees": {}
+}

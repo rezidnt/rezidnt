@@ -29,6 +29,38 @@ pub enum WorkspaceStatus {
     Closed,
 }
 
+/// One gate's recorded verdict state on a run (S4 — the ORACLE SCAFFOLD:
+/// fields exist so the board is assert-red; the reducer arm is implementer
+/// work).
+///
+/// S4 reducer semantics (pinned by `tests/s4_gates.rs` and the
+/// `s4_verified_run` / `s4_vet_refusal` golden fixtures; keyed under
+/// `AgentRunState::gates` by the payload `gate` name, last write wins):
+/// - `gate.entered` `{run, gate}` → `verdict = "entered"`;
+/// - `gate.passed` `{run, gate, verifiers: [{verifier, cost_ms, evidence,
+///   inputs}]}` → `verdict = "pass"`, `verifier = None`, `evidence` = the
+///   verifiers' evidence hashes flattened in order;
+/// - `gate.failed` `{run, gate, verifier, evidence, inputs}` →
+///   `verdict = "fail"`, the FAILING verifier named, evidence hashes copied;
+/// - `gate.inconclusive` (failed shape + `reason`) →
+///   `verdict = "inconclusive"` plus `reason` — never coerced (I6).
+///
+/// Verdicts stay payload-strings (never an enum gate) for the same I3 reason
+/// as statuses: reducers fold every live payload version, they never choke.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GateState {
+    /// `"entered" | "pass" | "fail" | "inconclusive"` — recorded verbatim.
+    pub verdict: String,
+    /// The FAILING verifier's name (fail/inconclusive only).
+    pub verifier: Option<String>,
+    /// Evidence blob hashes (blake3 hex) — refs, never bytes (I2).
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// `gate.inconclusive` v1 `reason` (`timeout | nonzero_exit |
+    /// malformed_output`), recorded verbatim.
+    pub reason: Option<String>,
+}
+
 /// One agent run's derived state (S1: the dossier's accounting seed).
 ///
 /// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
@@ -48,6 +80,13 @@ pub struct AgentRunState {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub session_id: Option<String>,
+    /// S4: recorded gate verdicts, keyed by gate name (see [`GateState`]).
+    /// `#[serde(default)]` keeps every pre-S4 golden fixture parsing
+    /// unedited; a gate fact on a run the log never spawned still creates
+    /// the entry (default `status: ""`) — the log is truth (I3), and a
+    /// pre-spawn vet refusal is exactly such a run.
+    #[serde(default)]
+    pub gates: BTreeMap<String, GateState>,
 }
 
 /// One worktree's derived state (S2: the sole-allocator registry's shadow in
@@ -69,6 +108,13 @@ pub struct AgentRunState {
 ///   never allocated — the log is truth);
 /// - `diff.ready` `{worktree, diff: CasRef}` → `last_diff = Some(diff.hash)`
 ///   on the entry keyed by `worktree`.
+///
+/// S4 addition (pinned by `tests/s4_gates.rs` and the `s4_verified_run`
+/// fixture; payload shape PENDING warden ratification — `diff.merged` is a
+/// proposed subject, flagged in the S4 work order):
+/// - `diff.merged` `{run, worktree, diff: CasRef}` → `status = "merged"`,
+///   `last_diff = Some(diff.hash)` (inserted even if never allocated — the
+///   log is truth, I3).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeState {
     pub status: String,

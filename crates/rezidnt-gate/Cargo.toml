@@ -1,0 +1,31 @@
+# S4 gate engine (doc §8 — the differentiation layer): native verifier trait,
+# exec-verifier JSON contract, verdict recording, and debrief replay.
+#
+# ORACLE SKELETON (S3 precedent): types are real, behavior is `todo!()`-
+# stubbed so the S4 board is assert-red, not compile-red. Dependency notes:
+# everything below is the approved set; toml (vet natives parse the
+# CAS-pinned agent-spec blob) and any glob matcher land with the implementer,
+# with notes in the root manifest.
+[package]
+name = "rezidnt-gate"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rezidnt-types = { workspace = true }
+rezidnt-cas = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# process + time: the exec runner (spawn argv, feed stdin, enforce the
+# wall-clock timeout). io-util for piped stdio.
+tokio = { workspace = true, features = ["process", "time", "io-util", "macros", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# proptest: the "garbage never parses to pass" conformance property
+# (testing-oracles: verifier conformance suite).
+proptest = { workspace = true }

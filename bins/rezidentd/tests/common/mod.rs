@@ -342,6 +342,179 @@ pub fn tool_payload(result: &serde_json::Value) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("content[0].text must be JSON ({e}): {text}"))
 }
 
+// ---------------------------------------------------------------------------
+// S4 additions: gated projects (vet + pre_merge on the golden path), the CLI
+// binary locator (shared by the S4 verb boards; `cli_verbs.rs` predates this
+// and keeps its private copy), prepared-daemon startup for seeded log + CAS,
+// and MCP polling sugar (mcp_workspace_recovery.rs's local copies can migrate
+// here when touched).
+// ---------------------------------------------------------------------------
+
+/// Locate the `rezidnt` CLI as a sibling of the daemon binary (the
+/// documented seam in `cli_verbs.rs`: run `cargo test --workspace` or build
+/// the CLI first).
+pub fn cli_bin() -> PathBuf {
+    let path = Path::new(env!("CARGO_BIN_EXE_rezidentd")).with_file_name("rezidnt");
+    assert!(
+        path.exists(),
+        "rezidnt CLI not found at {} — build every workspace bin first \
+         (`cargo test --workspace` or `cargo build -p rezidnt`)",
+        path.display()
+    );
+    path
+}
+
+/// Run a CLI verb against the test daemon's socket/db env; capture output.
+pub fn run_cli(daemon: &DaemonGuard, args: &[&str]) -> std::process::Output {
+    Command::new(cli_bin())
+        .args(args)
+        .env("REZIDNT_SOCKET", &daemon.socket)
+        .env("REZIDNT_DB", &daemon.db)
+        .output()
+        .expect("run rezidnt CLI")
+}
+
+/// Start rezidentd after `prepare(dir)` has seeded the temp dir — the log at
+/// `dir/events.db` (via `rezidnt_fabric::EventLog`) and the CAS at
+/// `dir/cas` (the daemon's REZIDNT_DB-relative default) both count as
+/// pre-daemon truth (I3: log + CAS are the whole persistent state).
+pub fn start_daemon_prepared(prepare: impl FnOnce(&Path)) -> DaemonGuard {
+    let dir = tempfile::tempdir().expect("tempdir");
+    prepare(dir.path());
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let child = Command::new(env!("CARGO_BIN_EXE_rezidentd"))
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .spawn()
+        .expect("spawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    DaemonGuard {
+        child,
+        socket,
+        db,
+        _dir: dir,
+    }
+}
+
+/// Append every line of a committed golden fixture to the event db at
+/// `db` (chain-honest: goes through the real EventLog).
+pub fn seed_db_from_fixture(db: &Path, fixture: &str) {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/fixtures");
+    let text = std::fs::read_to_string(fixtures.join(fixture)).expect("fixture exists");
+    let mut log = rezidnt_fabric::EventLog::open(db).expect("open seed db");
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let event = rezidnt_types::Event::from_json_line(line).expect("fixture line parses");
+        log.append(&event).expect("seed append");
+    }
+}
+
+/// The stub harness for GATED runs: emits the S1 stream-json lines AND
+/// appends a marker line to `src/checkout/cart.rs` in its working directory
+/// (the daemon runs a harness in its allocated worktree), so the S2 watcher
+/// produces a real `diff.ready` for pre_merge to verify.
+pub fn gated_stub_harness(dir: &Path, gap_ms: u64) -> PathBuf {
+    let gap_s = gap_ms as f64 / 1000.0;
+    let script = dir.join("gated-harness.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo '{{"type":"system","subtype":"init","session_id":"fixture-session","claude_code_version":"2.1.191","tools":[]}}'
+printf 'oracle-change\n' >> src/checkout/cart.rs
+sleep {gap_s}
+echo '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}]}}}}'
+sleep {gap_s}
+echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.001,"usage":{{"input_tokens":1,"output_tokens":1}},"session_id":"fixture-session"}}'
+"#
+        ),
+    )
+    .expect("write gated harness stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// An exec verifier stub speaking the §8 contract: consumes stdin, answers
+/// `pass`. Stands in for the tests-pass runner on the golden path (the S4
+/// oracle's stated scoping: diff-scope + forbidden-path are REAL natives,
+/// the test-suite runner is exec-stubbed).
+pub fn exec_pass_verifier(dir: &Path) -> PathBuf {
+    let script = dir.join("verifier-pass.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncat > /dev/null\nprintf '{\"verdict\":\"pass\",\"evidence\":[],\"cost_ms\":7}\\n'\n",
+    )
+    .expect("write exec verifier stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// A temp GATED project: git repo with a committed `src/checkout/cart.rs`,
+/// the diff-writing stub harness, an exec pass-verifier, and a §13 spec
+/// wiring `gates = ["vet", "pre_merge"]` with the governed agent fields
+/// (bare / harness_version / allowed_tools) and a `[gates.pre_merge]`
+/// verifier set: two REAL natives + the exec stub named `tests-pass`.
+pub fn make_gated_project(gap_ms: u64) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src/checkout")).expect("mkdir repo/src/checkout");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "oracle@rezidnt.test"]);
+    git(&["config", "user.name", "rezidnt oracle"]);
+    std::fs::write(repo.join("src/checkout/cart.rs"), "// cart v0\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "s4 oracle seed"]);
+
+    let harness = gated_stub_harness(dir.path(), gap_ms);
+    let verifier = exec_pass_verifier(dir.path());
+
+    let spec = format!(
+        r#"[project]
+name = "s4-exit"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["vet", "pre_merge"]
+bare = true
+harness_version = "2.1.191"
+allowed_tools = ["Read", "Edit"]
+bin_override = "{harness}"
+
+[gates.pre_merge]
+verifiers = [
+  {{ native = "diff-scope", params = {{ allow = ["src/checkout/**"] }} }},
+  {{ native = "forbidden-path", params = {{ forbid = [".env", "secrets/**"] }} }},
+  {{ exec = "{verifier}", name = "tests-pass" }},
+]
+"#,
+        repo = repo.display(),
+        harness = harness.display(),
+        verifier = verifier.display(),
+    );
+    (dir, spec)
+}
+
 /// Read one reply line from a socket connection with a deadline; panics on
 /// timeout (the caller's message is the failure).
 pub fn read_reply_line(

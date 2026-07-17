@@ -2101,6 +2101,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rezidnt-gate"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "rezidnt-cas",
+ "rezidnt-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rezidnt-mcp"
 version = "0.0.1"
 dependencies = [

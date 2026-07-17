@@ -32,3 +32,9 @@ serde_json.workspace = true
 # I3) — seeding goes through the real EventLog so the chain column is honest.
 rezidnt-fabric.workspace = true
 rezidnt-types.workspace = true
+# S4 oracle board: the debrief-replay CLI tests seed the daemon's CAS
+# (db-relative `cas/` default) with the recorded verifier inputs BEFORE the
+# daemon starts - replay is log + CAS, nothing else (I3/I6).
+rezidnt-cas.workspace = true
+# ulid (dev): the seeded-verdict debrief tests mint correlation ids.
+ulid.workspace = true

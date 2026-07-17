@@ -43,6 +43,7 @@ pub const SUBJECTS_V0: &[&str] = &[
     "artifact.captured",
     // diff
     "diff.ready",
+    "diff.merged",
     // merge
     "merge.completed",
     "merge.rejected",

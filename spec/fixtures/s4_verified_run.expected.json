@@ -1,0 +1,46 @@
+{
+  "events_folded": 9,
+  "last_event": "01S4VER1F1ED00000000000E09",
+  "counts_by_subject": {
+    "agent.completed": 1,
+    "agent.spawned": 1,
+    "diff.merged": 1,
+    "diff.ready": 1,
+    "gate.entered": 2,
+    "gate.passed": 2,
+    "worktree.allocated": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01S4VER1F1ED00000000000R01": {
+      "status": "completed",
+      "total_usd": 0.001,
+      "input_tokens": 1,
+      "output_tokens": 1,
+      "session_id": "fixture-session",
+      "gates": {
+        "pre_merge": {
+          "verdict": "pass",
+          "verifier": null,
+          "evidence": [],
+          "reason": null
+        },
+        "vet": {
+          "verdict": "pass",
+          "verifier": null,
+          "evidence": [],
+          "reason": null
+        }
+      }
+    }
+  },
+  "worktrees": {
+    "/tmp/rezidnt-s4/impl": {
+      "status": "merged",
+      "branch": "rezidnt/impl",
+      "allocator": "rezidnt",
+      "conflicts": 0,
+      "last_diff": "1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e"
+    }
+  }
+}

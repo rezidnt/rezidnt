@@ -83,6 +83,25 @@ pub enum Request {
     Open { spec_toml: String },
     /// Replay a run's capture ring, then proxy live bytes (dtach model).
     Attach { run: ulid::Ulid },
+    /// Record replay-divergence integrity alarms on the log (DR-006). The CLI
+    /// computes the divergence(s) with its direct read, then routes the APPEND
+    /// through the daemon's single writer (I3): the daemon dedups by
+    /// (run, gate, verifier) against alarms already on the log and appends an
+    /// `integrity.alarm` fact through its Fabric for each new divergence.
+    RecordAlarms { alarms: Vec<AlarmRecord> },
+}
+
+/// One replay-divergence alarm the CLI asks the daemon to make durable
+/// (DR-006). Mirrors the `integrity.alarm` v1 payload
+/// (`{run, gate, verifier, recorded, replayed}`); verdicts are the concrete
+/// verdict strings (`pass | fail | inconclusive`), never coerced (I6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlarmRecord {
+    pub run: String,
+    pub gate: String,
+    pub verifier: String,
+    pub recorded: String,
+    pub replayed: String,
 }
 
 /// Encode a request as one JSONL frame (single line, no trailing newline).
@@ -104,6 +123,10 @@ pub mod codes {
     pub const RUN_UNKNOWN: &str = "run.unknown";
     /// `open` carried a spec that failed to parse/validate (§13).
     pub const SPEC_INVALID: &str = "spec.invalid";
+    /// A daemon-side failure while servicing the request (e.g. a log append
+    /// failed during `record_alarms`). The client maps this to its
+    /// substrate-fault exit class.
+    pub const INTERNAL: &str = "internal";
 }
 
 /// Request-scoped reply frame (S3 proto addition, parked from S2).
@@ -132,6 +155,13 @@ pub enum Reply {
         workspace: ulid::Ulid,
         correlation: ulid::Ulid,
     },
+    /// A `record_alarms` request completed (DR-006): the daemon has appended
+    /// every NEW `integrity.alarm` fact through its single writer and the log
+    /// is durable. `appended` counts the facts actually written (dedup skips
+    /// alarms already on the log, so a re-run acks `appended: 0`). Acking only
+    /// after the append lands is what makes the CLI's post-return log read
+    /// race-free.
+    AlarmsRecorded { appended: usize },
     /// The request failed. `code` is machine-readable ([`codes`]).
     Error {
         /// The request op this error answers (`"open"`, `"attach"`, …).

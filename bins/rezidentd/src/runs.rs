@@ -270,6 +270,82 @@ pub async fn publish(fabric: &Arc<Fabric>, event: Event) -> anyhow::Result<Ulid>
     Ok(id)
 }
 
+/// Record replay-divergence integrity alarms on the log through the daemon's
+/// SINGLE writer (DR-006, I3). For each requested alarm, dedup by
+/// (run, gate, verifier) against `integrity.alarm` facts ALREADY on the log
+/// (log-derived, no side table) — a re-run of `debrief` over an
+/// already-alarmed divergence appends nothing. Every new alarm is published
+/// as an `integrity.alarm` v1 fact through the Fabric, so it lands on the log
+/// AND broadcasts to live tail subscribers (proving legitimate-writer
+/// emission). Returns the count actually appended.
+///
+/// Emission is at-least-once on the wire (the ontology ratifies this): a crash
+/// between the log read and the append can still double a fact on the raw log;
+/// the fold dedups by (run, gate, verifier), so derived state stays honest.
+pub async fn record_alarms(
+    daemon: &Arc<Daemon>,
+    alarms: &[rezidnt_proto::AlarmRecord],
+) -> anyhow::Result<usize> {
+    // Read the existing (run, gate, verifier) alarm keys off the log once,
+    // on a blocking thread (SQLite read is blocking; no blocking in async).
+    let fabric = Arc::clone(&daemon.fabric);
+    let existing: std::collections::HashSet<(String, String, String)> =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let events = fabric
+                .replay_since(None)
+                .context("replay log for integrity.alarm dedup")?;
+            let keys = events
+                .into_iter()
+                .filter(|e| e.subject.as_str() == "integrity.alarm")
+                .filter_map(|e| {
+                    let p = e.payload();
+                    Some((
+                        p["run"].as_str()?.to_string(),
+                        p["gate"].as_str()?.to_string(),
+                        p["verifier"].as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            Ok(keys)
+        })
+        .await
+        .context("alarm dedup task panicked")??;
+
+    // Dedup within this batch too, so a request carrying the same divergence
+    // twice appends once (the fold would collapse it, but the log stays honest).
+    let mut seen = existing;
+    let mut appended = 0usize;
+    for alarm in alarms {
+        let key = (
+            alarm.run.clone(),
+            alarm.gate.clone(),
+            alarm.verifier.clone(),
+        );
+        if !seen.insert(key) {
+            continue; // already on the log (or already appended this batch)
+        }
+        let event = Event::new(
+            SourceId::new("rezidnt-gate"),
+            None,
+            Subject::new("integrity.alarm"),
+            Ulid::new(),
+            None,
+            1,
+            json!({
+                "run": alarm.run,
+                "gate": alarm.gate,
+                "verifier": alarm.verifier,
+                "recorded": alarm.recorded,
+                "replayed": alarm.replayed,
+            }),
+        )
+        .context("construct integrity.alarm")?;
+        publish(&daemon.fabric, event).await?;
+        appended += 1;
+    }
+    Ok(appended)
+}
+
 /// A refused `open`: the request never materialized anything. Answered as a
 /// machine-readable `spec.invalid` frame/refusal by the caller (S3 board).
 #[derive(Debug)]

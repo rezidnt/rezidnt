@@ -377,6 +377,44 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 };
             }
         }
+        // DR-006 replay-divergence alarm, folded onto the run's dossier. A
+        // payload without a `run` folds as counters-only (never guesses a key,
+        // I3). Deduped by (gate, verifier) within the run — the log is
+        // append-only and debrief is re-runnable, so duplicate facts collapse
+        // to one queryable record. Deterministic order (by (gate, verifier))
+        // keeps whole-graph equality stable.
+        "integrity.alarm" => {
+            if let Some(run) = payload_run(event)
+                && let Some(gate) = payload_gate(event)
+            {
+                let payload = event.payload();
+                if let Some(verifier) = payload["verifier"].as_str() {
+                    let alarms = &mut graph.agent_runs.entry(run).or_default().integrity_alarms;
+                    // Dedup by (gate, verifier); duplicate facts do not grow
+                    // the vec (the raw log still holds every fact).
+                    if !alarms
+                        .iter()
+                        .any(|a| a.gate == gate && a.verifier == verifier)
+                    {
+                        let record = IntegrityAlarmRecord {
+                            gate,
+                            verifier: verifier.to_string(),
+                            recorded: payload["recorded"].as_str().unwrap_or_default().to_string(),
+                            replayed: payload["replayed"].as_str().unwrap_or_default().to_string(),
+                        };
+                        // Insert in deterministic (gate, verifier) order so
+                        // whole-graph equality is interleaving-independent.
+                        let pos = alarms
+                            .binary_search_by(|a| {
+                                (a.gate.as_str(), a.verifier.as_str())
+                                    .cmp(&(record.gate.as_str(), record.verifier.as_str()))
+                            })
+                            .unwrap_or_else(|e| e);
+                        alarms.insert(pos, record);
+                    }
+                }
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
 }

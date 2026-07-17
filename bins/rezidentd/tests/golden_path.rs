@@ -570,3 +570,95 @@ fn dr006_rerunning_debrief_does_not_duplicate_the_alarm() {
         "two debriefs, ONE durable integrity.alarm on the log — dedup by (run, gate, verifier)"
     );
 }
+
+/// DR-006 DAEMON-DOWN COMPLEMENT (the gap the auditor FAILED the DR-006 diff
+/// on): when a divergence is found AND the durable append cannot complete
+/// (daemon unreachable, or the RecordAlarms op errors), the primary signal —
+/// the divergence VERDICT and its `report.alarms[]` — must survive, and the
+/// DR-004 exit class must stay 3.
+///
+/// The divergence verdict is computed from the CLI's OWN local log + CAS read
+/// (main.rs::debrief replays before it appends); the durable append (DR-006) is
+/// an ADDITIVE audit improvement. An additive improvement's failure must
+/// degrade LOUDLY — never destroy the finding it decorates. Concretely:
+///   1. the CLI STILL prints `report.alarms[]` on stdout (the finding is not
+///      suppressed by an append failure), and
+///   2. the CLI exits 3 — the SAME integrity-alarm/inconclusive class the
+///      daemon-UP path exits (DR-004; `cli_debrief_divergence_raises_integrity_alarm`
+///      pins exit 3 with the daemon up). NOT 1 (catch-all crash), NOT 4.
+///   3. (left to the implementer, unasserted here to avoid over-constraining
+///      the wording) the durability failure is surfaced LOUDLY on STDERR — a
+///      best-effort append that warns it could not durably record the alarm
+///      because the daemon was unreachable. The implementer adds the warning
+///      text; this test does not pin a substring so it does not dictate the
+///      exact phrasing.
+///
+/// RED TODAY: main.rs::debrief runs `record_alarms(&report.alarms)?` with a
+/// HARD `?` placed BEFORE the report print and before `std::process::exit(3)`.
+/// With no daemon listening, `connect_and_request` fails, the `?` propagates to
+/// `main()`, whose `Cmd::Debrief` failure class is 1 — so the CLI exits **1**,
+/// prints NO report on stdout, and records no durable fact. A real integrity
+/// divergence is misclassified as a crash and its report suppressed.
+///
+/// Setup mirrors `cli_debrief_divergence_raises_integrity_alarm` (same fixture,
+/// same run ULID, same CAS preimage via `seed_divergence`), but runs the CLI
+/// with NO daemon started and `REZIDNT_SOCKET` pointed at a dead path, so the
+/// append attempt fails. Does NOT touch the daemon-UP pins.
+#[test]
+fn dr006_divergence_debrief_with_daemon_down_still_reports_and_exits_3() {
+    // Seed the divergence scenario (CAS preimage + fixture) into a temp dir,
+    // exactly as the daemon-UP divergence pins do — but never start a daemon.
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_divergence(dir.path());
+
+    // A socket path that will never be listened on: the daemon append MUST
+    // fail. (The dir has no `rezidnt.sock` because no daemon ran here.)
+    let dead_socket = dir.path().join("no-daemon.sock");
+    assert!(
+        !dead_socket.exists(),
+        "the daemon-down setup requires an unbound socket path"
+    );
+
+    let out = Command::new(common::cli_bin())
+        .args(["debrief", DIVERGE_RUN, "--json"])
+        .env("REZIDNT_SOCKET", &dead_socket)
+        .env("REZIDNT_DB", dir.path().join("events.db"))
+        .output()
+        .expect("run rezidnt CLI");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // (2) The DR-004 exit class is unchanged by an append failure: still 3.
+    // RED today: the propagated `?` makes main() exit 1 (Debrief failure class).
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a divergence is exit 3 whether or not the durable append lands (DR-004); \
+         a daemon-down append failure must NOT become a catch-all crash (1). \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // (1) The finding is computed locally and must not be suppressed: the
+    // machine-readable report still carries the diverging verifier + both
+    // verdicts. RED today: stdout is EMPTY (main() exited before the print).
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json debrief must still print its report on a daemon-down append failure ({e}); stdout: {stdout:?}\nstderr: {stderr}")
+    });
+    let alarms = report["alarms"]
+        .as_array()
+        .expect("report carries alarms[] even when the durable append could not complete");
+    assert_eq!(
+        alarms.len(),
+        1,
+        "the locally-computed divergence finding survives the append failure"
+    );
+    assert_eq!(alarms[0]["verifier"], "diff-scope");
+    assert_eq!(alarms[0]["recorded"], "fail");
+    assert_eq!(alarms[0]["replayed"], "pass");
+    // NOTE (work order): (3) the implementer must ALSO surface the durability
+    // failure loudly on stderr (a warning that the integrity alarm could not be
+    // durably recorded because the daemon was unreachable). Left unasserted here
+    // to avoid pinning the exact wording; the auditor should confirm a loud,
+    // non-silent stderr warning exists in the remediation.
+}

@@ -285,6 +285,7 @@ fn open(name: &str, spec_toml: String) -> anyhow::Result<()> {
                 eprintln!("rezidnt: open refused ({code}): {message}");
                 std::process::exit(3);
             }
+            other => anyhow::bail!("unexpected reply to open: {other:?}"),
         };
 
     let mut line = String::new();
@@ -343,6 +344,65 @@ fn attach(run: ulid::Ulid) -> anyhow::Result<()> {
         out.write_all(&buf[..n]).context("write capture bytes")?;
         out.flush().context("flush capture bytes")?;
     }
+}
+
+/// Route the computed replay-divergence alarms to the daemon's single writer
+/// (DR-006, I3): connect, send `record_alarms`, and BLOCK on the ack. The
+/// daemon appends each new `integrity.alarm` fact through its Fabric (dedup by
+/// (run, gate, verifier) off the log) and acks only once the append is
+/// durable — so the caller's report/exit stay correct and the fact is on the
+/// log by the time this returns. A daemon-side failure surfaces as a
+/// machine-readable error frame.
+#[cfg(unix)]
+fn record_alarms(alarms: &[rezidnt_gate::IntegrityAlarm]) -> anyhow::Result<()> {
+    use std::io::BufRead;
+
+    let records: Vec<rezidnt_proto::AlarmRecord> = alarms
+        .iter()
+        .map(|a| rezidnt_proto::AlarmRecord {
+            run: a.run.clone(),
+            gate: a.gate.clone(),
+            verifier: a.verifier.clone(),
+            recorded: verdict_str(a.recorded).to_string(),
+            replayed: verdict_str(a.replayed).to_string(),
+        })
+        .collect();
+
+    let mut reader =
+        connect_and_request(&rezidnt_proto::Request::RecordAlarms { alarms: records })?;
+
+    // The daemon's FIRST frame after the hello answers this request: the
+    // AlarmsRecorded ack (append durable) or a machine-readable error.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .context("read record-alarms ack")?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the stream before acking record_alarms");
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        return match rezidnt_proto::decode_reply(line.trim_end())
+            .context("decode record-alarms ack")?
+        {
+            rezidnt_proto::Reply::AlarmsRecorded { .. } => Ok(()),
+            rezidnt_proto::Reply::Error { code, message, .. } => {
+                anyhow::bail!("daemon refused record_alarms ({code}): {message}")
+            }
+            other => anyhow::bail!("unexpected reply to record_alarms: {other:?}"),
+        };
+    }
+}
+
+#[cfg(not(unix))]
+fn record_alarms(_alarms: &[rezidnt_gate::IntegrityAlarm]) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "recording integrity alarms speaks a Unix domain socket only; the Windows \
+         named pipe (\\\\.\\pipe\\rezidnt, doc §9) is designed but not yet implemented"
+    )
 }
 
 /// `REZIDNT_DB` override, else `~/.local/state/rezidnt/events.db` (mirrors the
@@ -520,6 +580,12 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
         })
         .collect();
 
+    // The divergence VERDICT is computed above from the CLI's own local log +
+    // CAS read; it is the primary signal and is printed FIRST, before any
+    // durable-append attempt. Printing before appending is what keeps the
+    // finding alive when the daemon is unreachable (DR-006 daemon-down
+    // complement): the additive audit improvement must never destroy the
+    // finding it decorates.
     if as_json {
         let out = serde_json::json!({
             "run": run,
@@ -531,6 +597,30 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
     } else {
         println!("debrief {run}: {} alarm(s)", alarms.len());
     }
+
+    // DR-006: a divergence must land a DURABLE `integrity.alarm` fact on the
+    // log. The CLI keeps its direct READ (the report above) but routes the
+    // APPEND through the daemon's single writer (I3) — never a second writer
+    // racing the append-only log. The daemon dedups by (run, gate, verifier)
+    // off the log, so re-running debrief appends nothing new.
+    //
+    // The append is BEST-EFFORT (DR-006 daemon-down complement, auditor FAIL
+    // remediation): it decorates the already-printed finding with durability,
+    // so its failure degrades LOUDLY on stderr but does NOT propagate — the
+    // exit class stays the DR-004 divergence code (3, computed above) whether
+    // or not the daemon was reachable. A hard `?` here would misclassify a real
+    // divergence as a catch-all crash (main()'s Debrief failure class is 1) and
+    // suppress the report. When the daemon IS up the append lands durably and
+    // the fact is on the log before this returns; only the warning differs.
+    if !report.alarms.is_empty()
+        && let Err(e) = record_alarms(&report.alarms)
+    {
+        eprintln!(
+            "rezidnt: WARNING: integrity alarm(s) found but NOT durably recorded — \
+             the daemon was unreachable (append via the single log writer failed): {e:#}"
+        );
+    }
+
     std::process::exit(code);
 }
 

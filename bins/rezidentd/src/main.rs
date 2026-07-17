@@ -63,7 +63,9 @@ mod unix_daemon {
     use tokio::net::{UnixListener, UnixStream};
     use tracing::Instrument;
 
-    use crate::runs::{Daemon, RunRegistry, begin_open, rebuild_workspaces, serve_attach};
+    use crate::runs::{
+        Daemon, RunRegistry, begin_open, rebuild_workspaces, record_alarms, serve_attach,
+    };
 
     /// Broadcast ring size (DEFAULT). Sized for control-plane volume (doc §5:
     /// facts and refs only); an overflowing subscriber takes the BINDING
@@ -325,6 +327,29 @@ mod unix_daemon {
                     return Ok(());
                 }
                 serve_attach(&daemon, run, &mut write_half).await
+            }
+            Request::RecordAlarms { alarms } => {
+                // DR-006: the CLI computed the divergence(s) with its direct
+                // read; the daemon (single writer, I3) dedups against the log
+                // and appends each new integrity.alarm through its Fabric.
+                // Ack AFTER the append lands so the CLI's subsequent log read
+                // is race-free.
+                match record_alarms(&daemon, &alarms).await {
+                    Ok(appended) => {
+                        write_reply(&mut write_half, &Reply::AlarmsRecorded { appended }).await?;
+                        Ok(()) // orderly close after the ack
+                    }
+                    Err(e) => {
+                        let error = Reply::Error {
+                            op: "record_alarms".to_string(),
+                            code: rezidnt_proto::codes::INTERNAL.to_string(),
+                            message: format!("{e:#}"),
+                            run: None,
+                        };
+                        write_reply(&mut write_half, &error).await?;
+                        Ok(())
+                    }
+                }
             }
         }
     }

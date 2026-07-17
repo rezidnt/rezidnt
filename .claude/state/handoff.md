@@ -1,33 +1,33 @@
-# Handoff — 2026-07-17 (session 4 close, part 3: S4 DONE — golden path completes)
+# Handoff — 2026-07-17 (session 4 close, part 4: /dr + warden + hardening cleanup DONE)
 
 ## State of play
-**Current slice: S5** (ratatui read-only fleet board) — not started. **S4 CLOSED: the golden path completes.** Full loop on record: `/oracle gate` (37-test board + new rezidnt-gate crate) → warden ratified `gate.passed` v1 / new `diff.merged` v1 / `agent.spawned` governed fields → implementer built the verifier engine to green → **independent vet caught 1 flake the implementer missed** (see below) → re-vet green host + WSL → `/debrief` **PASS**. The S4 exit test (`golden_path_verified_merged_diff_with_replayable_debrief_and_cost`) runs end-to-end: gated open → vet pre-spawn → real worktree change → diff.ready → pre_merge verifiers → gate.passed → REAL git merge (verified in HEAD) → diff.merged → replayable debrief exit 0, cost 0.001, alarms []. Slice pointer advanced S4→S5.
+**Current slice: S5** (ratatui read-only fleet board) — STILL not started; this was a cleanup pass, no S5 work. The golden path (S4) remains complete. This part cleared the accumulated /dr + warden + hardening debt in three loops, each vet+debrief'd:
+1. **DRs 005/006/007 owner-ratified** (badge model Option A; replay-divergence→durable fact; RepoSubstrate release_worktree as-built). DR-005/007 doc-only; DR-006 became real work.
+2. **Hardening batch** (6 low debt items) + 4 ontology cleanups — vet+debrief PASS.
+3. **DR-006 integrity.alarm** — oracle→warden /subject→impl→**first debrief FAILED** (daemon-unreachable path)→oracle-first remediation→**re-debrief PASS**.
 
-## Session log (part 3)
-`1f3e25e` S4 board + ratification (incl. SUBJECTS_V0 diff.merged companion, taxonomy_drift kept green) → `0dbde68` S4 impl (vet+debrief pass). LOCAL — `origin/main` at `bc9fc61` (pushed through S3 close only). **UNPUSHED: fbb7f4b, a3620ce, 66aa5a5, 20610cd, 1f3e25e, 0dbde68 (6 commits) — push on owner order.**
-
-## Process note (important)
-The implementer reported "all 37 green" but my independent WSL vet found `exec_contract.rs::nonzero_exit_...` RED once. Root cause: my first WSL run was concurrent with the host gauntlet (two cargo instances saturating the cores); under that fork pressure `cmd.spawn()` of /bin/sh hits EAGAIN and the runner maps it to Inconclusive{MalformedOutput} instead of {NonzeroExit}. Verdict stays Inconclusive on every failure branch — never a false pass (I6 core holds). Re-runs green: 3/3 isolated, 5/5 in-binary, 2/2 full-workspace. Auditor adjudicated: LOW tracked, not a blocker. **Lesson: do not run host vet.sh and WSL workspace concurrently — they fight for cores and induce spawn flakes.**
+## Session log (part 4)
+`6ab33fa` DR-005/006/007 → `9799689` hardening board+ontology cleanup → `313515c` hardening impl → `07a4aa3` gitignore junk guard → `65db6cc` DR-006 board+subject → `28fd41c` DR-006 impl. **PUSHED through 9b24ed6 earlier; parts-4 commits (6ab33fa..28fd41c, 6 commits) are LOCAL — push on owner order** (owner said "push. then spend a session on..." — the push covered through S4 close; these cleanup commits are unpushed).
 
 ## Next action
-**S5 planning, then `/oracle tui` (or `/slice` first).** S5 = ratatui read-only fleet board consuming ONLY watch channels — the proof that I1 (zero pixels in core) held: the board is a pure client of the socket/watch surface, no daemon change. Primary visibility surface beyond the CLI. NOTE slice-discipline says S5 "may precede Phase 3" and is demand-flexible; confirm with owner whether S5 is next or whether to bank Phase-2 hardening / the deferred /dr + warden queue first (the golden path is DONE, so pressure is off).
+**Push the 6 cleanup commits, then S5 planning → `/oracle tui`.** S5 = ratatui read-only fleet board consuming ONLY watch channels (proof I1 held; pure client, no daemon change). Confirm with owner S5-vs-bank-more-hardening (golden path is done, pressure off). NOTE `/slice` first to re-read S5 criteria.
 
-## Open /debrief findings (S4, all in-latitude, verdict PASS)
-- **LOW:** exec spawn/wait-io failures collapse to `MalformedOutput` reason (the flake). Direction: add a `could_not_run` reason, map spawn/io errors to it — additive (ontology reason vocab is additive strings). `rezidnt-gate/src/lib.rs:621-688`.
-- **LOW:** `environment_is_scrubbed` uses process-global `std::env::set_var` (test-isolation smell; env_clear makes the scrub structural so it can't cause a false pass). Oracle: per-test isolated env in a future pass. `exec_contract.rs:196`.
-- **LOW (seam debt, I4):** daemon `git_diff_summary` (gates.rs:390) duplicates the S2 git-adapter diff-summary parser — divergence risk if S2's format evolves. Direction: route the run-task summary through the RepoSubstrate seam when wired. `bins/rezidentd/src/gates.rs:390`.
-- **LOW:** CLI `agent_spec_toml` (bins/rezidnt/main.rs:660) and daemon copy (gates.rs:44) must stay byte-identical to vet the same preimage; today they agree. De-dup opportunity.
-- **BOUNDARY (S0, not S4):** replay tamper-detection is bounded by CAS content-addressing + log-chain integrity; a self-consistent tamper (blob+ref+chain) is the S0 chain-verify guarantee's job, not the gate layer's. Honest boundary.
-- **NOTE:** `run_native` cost floor `.max(1)` is not replay-stable across machines, but replay compares verdicts only (not cost) — no alarm risk. Guard if replay ever widens to cost.
+## What got fixed/ratified this part (off the queue now)
+- **DR-005 badge model:** §12 rule narrowed to "state-mutating call"; gate_explain/tail read-class; badge.issued/revoked annotated no-emitter; operator badge = daemon-lifetime class. Zero code.
+- **DR-006 integrity.alarm:** new subject + reducer (agent_runs[run].integrity_alarms, dedup (run,gate,verifier)) + daemon-routed append via new RecordAlarms socket op (CLI reads locally, daemon owns the write — I3). Divergence debrief now lands a durable, rebuild-visible fact. Daemon-down degrades loudly (report + exit 3 + stderr warning), never exit 1.
+- **DR-007:** RepoSubstrate 3-method trait (incl release_worktree) ratified BINDING as-built.
+- **Hardening:** HTTP 64KiB body cap; lockfile create_new/O_EXCL (0600 always); daemon.warning carries open correlation; InconclusiveReason::CouldNotRun (spawn/io-fail, distinct from MalformedOutput); agent_spec_toml extracted to rezidnt-run (byte-identical, dedup); environment_is_scrubbed rewritten (no process-global set_var); git-adapter doc aligned to at-least-once.
+- **Ontology:** could_not_run reason, badge no-emitter, daemon.warning v1 {what,error}, worktree.conflict honest at-least-once. integrity.alarm v1 minted (35 subjects; SUBJECTS_V0 companion landed).
+- **Infra:** cleaned a junk `C:Usersdakot/.cache` dir that a stray `git add -A` swept in (agent ran host cargo with the WSL CARGO_TARGET_DIR idiom; Git-Bash $HOME=C:\Users\...); added .gitignore guard `/C*Usersdakot*` + `.cache/`. [[vet-concurrency-flake]] memory also saved.
 
-## Carried S3 findings (still open)
-- T1/T2 CLOSED this session (eviction fix landed). T3 (gate_explain unbadged) → badge bundle below. T4–T7 lows (at-least-once alloc, unbounded HTTP body cap, daemon.warning correlation, lockfile create_new). T8 silent DEFAULTs for scribe.
+## Open /debrief residues (all in-latitude, tracked)
+- **DR-006 (this part):** daemon-down test pins exit 3 + report but NOT the stderr-warning substring — loud-degradation guarded by inspection only; a future edit could drop the eprintln and stay green. Add a substring-tolerant stderr assert. (auditor-recommended, low)
+- **Hardening:** HTTP cap can overshoot ~4KiB (one read) before the 413 (bounded, not unbounded); daemon.warning ontology note phrasing slightly understated now that failed opens deliberately share correlation.
+- **S4 carried:** exec spawn EAGAIN now surfaces as CouldNotRun under load (the flake, now honestly labeled); daemon diff-summary still duplicates the S2 adapter parser (route through RepoSubstrate when wired — ties to DR-007's deferred GitError item); run_native cost floor .max(1) not replay-stable (replay compares verdicts only, no risk).
 
-## /dr and warden queue
-- **Divergence-as-log-fact (`/dr`, NEW):** whether debrief replay divergence lands a durable integrity-alarm FACT on the log (daemon.error? new `integrity.alarm`/`gate.diverged`?) or stays CLI-report-only (today: report + exit 3, emits nothing). Additive; touches §14 self-observation. Owner/`/dr` call.
-- **Badge bundle (one session):** `badge.issued` emit-or-drop + operator-badge daemon-lifetime scope + `badge_id` on other mutation facts + S3-T3 unbadged `gate.explained`.
-- **Carried:** `release_worktree` BINDING extension `/dr` (twice-tracked, now thrice); warden conflict at-least-once wording; capture-chunk `/dr` flag; scribe: hand-rolled-over-rmcp DEFAULT + T8 DEFAULTs + `could_not_run` reason note; RepoSubstrate/GitError seam (I4); S1 hardening list; `daemon.warning` payload ratification; fixture housekeeping; root README; crates.io placeholder (owner `cargo login`); `rezident` fallback doc note; S2-T4 ingest helper + S2 T5 prune verb (pairs with S5/CLI work); S2 T1 → Phase-2 hardening.
-- Demo recording (S3) location still not noted in-repo (docs/demo/?).
+## /dr and warden queue (REMAINING)
+- **Deferred (not blocking, no owner decision pending):** DR-007's GitError→associated-type I4 fix (when a 2nd RepoSubstrate impl lands); badge_id on other mutation facts + badge.issued emitter (if a delegation use case appears) — both DEFAULT-deferred by DR-005, foreclose nothing.
+- **Carried non-slice:** capture-chunk subject (Phase-3 demand-gated, scribe assessed "premature" — leave tracked); scribe note hand-rolled-over-rmcp DEFAULT + the T8 silent DEFAULTs (protocol version, tail limit, 202, dedicated runtime, schemars runtime dep); S1 hardening list; root README; crates.io placeholder (owner `cargo login`); `rezident` fallback doc note; S2-T4 ingest helper (next git-adapter touch); S2-T5 prune verb + T1 (Phase-2/S5 hardening); demo recording (S3) location not noted in-repo (docs/demo/?).
 
 ## Environment
-WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`. Vet hook host-side; daemon/gate/exec tests WSL. **Do NOT run host vet.sh + WSL workspace concurrently (spawn-flake under core contention).** Fable 5 hit its weekly credit limit mid-session — all agents now run on Opus 4.8 (owner switched default). Demo daemon may still be running (port 40173, `~/rezidnt-demo`). WSL `claude` = Windows npm shim via interop.
+WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target` **(WSL-ONLY — never export on host/Git-Bash cargo: creates the junk dir)**. Vet hook host-side; daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never concurrent (spawn flake).** `cargo test -p rezidentd` alone doesn't rebuild the sibling `rezidnt` bin — use `--workspace` or `cargo build -p rezidnt` first for daemon tests that shell the CLI. Fable 5 hit its weekly credit limit — all agents ran on Opus 4.8 this part (owner switched default). Demo daemon may still be up (port 40173, ~/rezidnt-demo).

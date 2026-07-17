@@ -61,6 +61,32 @@ pub struct GateState {
     pub reason: Option<String>,
 }
 
+/// One replay-divergence alarm folded onto a run's dossier (DR-006 — the
+/// ORACLE SCAFFOLD: the type + field exist so `tests/dr006_integrity_alarms.rs`
+/// is assert-red, mirroring the S4 `GateState` scaffold; the reducer arm for
+/// `integrity.alarm` is implementer work).
+///
+/// DR-006 reducer semantics (pinned by `tests/dr006_integrity_alarms.rs`):
+/// `integrity.alarm` `{run, gate, verifier, recorded, replayed}` folds onto
+/// `AgentRunState::integrity_alarms`, DEDUPED by (gate, verifier) — the log is
+/// append-only and debrief is re-runnable, so duplicate facts collapse to one
+/// queryable record. Deterministic order (by (gate, verifier)) keeps
+/// whole-graph equality stable. Payload shape is an ORACLE PROPOSAL pending
+/// the warden `/subject` for `integrity.alarm` (flagged in the work order);
+/// verdicts stay payload-strings (never an enum gate) for the same I3 reason
+/// as gate verdicts — reducers fold every live payload version.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IntegrityAlarmRecord {
+    /// The gate the diverging verifier ran under (`vet` | `pre_merge` | …).
+    pub gate: String,
+    /// The diverging verifier's name.
+    pub verifier: String,
+    /// Recorded verdict, verbatim (`pass` | `fail` | `inconclusive`).
+    pub recorded: String,
+    /// Replayed verdict, verbatim — divergence means `recorded != replayed`.
+    pub replayed: String,
+}
+
 /// One agent run's derived state (S1: the dossier's accounting seed).
 ///
 /// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
@@ -87,6 +113,14 @@ pub struct AgentRunState {
     /// pre-spawn vet refusal is exactly such a run.
     #[serde(default)]
     pub gates: BTreeMap<String, GateState>,
+    /// DR-006: replay-divergence alarms on this run (see
+    /// [`IntegrityAlarmRecord`]). ORACLE SCAFFOLD — field present so the
+    /// DR-006 board is assert-red; the `integrity.alarm` reducer arm is
+    /// implementer work. `#[serde(default)]` keeps every pre-DR-006 golden
+    /// fixture parsing (and comparing equal) unedited. Deduped by
+    /// (gate, verifier), deterministic order.
+    #[serde(default)]
+    pub integrity_alarms: Vec<IntegrityAlarmRecord>,
 }
 
 /// One worktree's derived state (S2: the sole-allocator registry's shadow in

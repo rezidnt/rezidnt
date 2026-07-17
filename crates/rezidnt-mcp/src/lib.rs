@@ -733,10 +733,11 @@ async fn serve_http_conn(
         return respond_body_too_large(&mut stream).await;
     }
     while raw.len() < body_start + content_length {
-        if raw.len().saturating_sub(body_start) > BODY_CAP_BYTES {
-            return respond_body_too_large(&mut stream).await;
-        }
-        let n = stream.read(&mut buf).await?;
+        let k = match next_read_len(raw.len() - body_start, BODY_CAP_BYTES, buf.len()) {
+            None => return respond_body_too_large(&mut stream).await,
+            Some(k) => k,
+        };
+        let n = stream.read(&mut buf[..k]).await?;
         if n == 0 {
             return Ok(()); // truncated body: nothing to answer
         }
@@ -778,4 +779,78 @@ async fn respond_body_too_large(stream: &mut tokio::net::TcpStream) -> Result<()
 /// Position of the `\r\n\r\n` head/body split, if complete.
 fn find_head_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Body-cap read seam (pure): given how many body bytes are already
+/// accumulated, the cap, and the size of the next read buffer, decide how many
+/// bytes the next read is allowed to append.
+///
+/// - `None`  => reject now (413-class); the accumulated body has reached the cap
+///   and the request is still not complete, so no further bytes are read.
+/// - `Some(k)` => read at most `k` bytes; `k` is clamped so the accumulated body
+///   NEVER exceeds `cap`. This is the tight bound: `raw`'s body portion is held
+///   at `<= cap` at all times, not `cap + one_buffer`.
+///
+/// Extracting this makes the bound unit-testable off the wire, where the
+/// 4096-byte read granularity is otherwise unobservable from a client.
+fn next_read_len(accumulated_body: usize, cap: usize, buf_len: usize) -> Option<usize> {
+    if accumulated_body >= cap {
+        return None;
+    }
+    Some(buf_len.min(cap - accumulated_body))
+}
+
+#[cfg(test)]
+mod body_cap_tests {
+    use super::{BODY_CAP_BYTES, next_read_len};
+
+    // THE PIN (red-before-fix): the read clamp must never permit the accumulated
+    // body to exceed `cap`. Faithful current behavior returns `Some(buf_len)`
+    // whenever `accumulated <= cap`, which lets the body reach `cap + buf_len`
+    // (one buffer past the cap). The tight contract clamps the final read so the
+    // total never crosses `cap`.
+    #[test]
+    fn read_is_clamped_so_body_never_exceeds_cap() {
+        let cap = BODY_CAP_BYTES;
+        let buf_len = 4096;
+
+        // Just under the cap: only `remaining` bytes may be read, not a full
+        // buffer, or the body would overshoot to `cap + (buf_len - remaining)`.
+        let remaining = 100usize;
+        let accumulated = cap - remaining;
+        match next_read_len(accumulated, cap, buf_len) {
+            None => {
+                panic!("must still read the final {remaining} bytes at accumulated={accumulated}")
+            }
+            Some(k) => assert!(
+                accumulated + k <= cap,
+                "read clamp overshoots the cap: accumulated({accumulated}) + read({k}) = {} > cap({cap}); \
+                 the body must never accumulate more than the cap before rejecting",
+                accumulated + k
+            ),
+        }
+    }
+
+    // Exactly at the cap with the request still incomplete: reject, do not read.
+    #[test]
+    fn at_cap_and_still_short_rejects() {
+        let cap = BODY_CAP_BYTES;
+        assert_eq!(
+            next_read_len(cap, cap, 4096),
+            None,
+            "at the cap and still short, the transport must reject (413), not read more"
+        );
+    }
+
+    // Well under the cap with lots of headroom: a full buffer read is fine.
+    #[test]
+    fn under_cap_reads_full_buffer() {
+        let cap = BODY_CAP_BYTES;
+        let buf_len = 4096;
+        assert_eq!(
+            next_read_len(0, cap, buf_len),
+            Some(buf_len),
+            "with a full buffer of headroom the read need not be clamped"
+        );
+    }
 }

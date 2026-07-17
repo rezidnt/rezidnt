@@ -656,9 +656,25 @@ fn dr006_divergence_debrief_with_daemon_down_still_reports_and_exits_3() {
     assert_eq!(alarms[0]["verifier"], "diff-scope");
     assert_eq!(alarms[0]["recorded"], "fail");
     assert_eq!(alarms[0]["replayed"], "pass");
-    // NOTE (work order): (3) the implementer must ALSO surface the durability
-    // failure loudly on stderr (a warning that the integrity alarm could not be
-    // durably recorded because the daemon was unreachable). Left unasserted here
-    // to avoid pinning the exact wording; the auditor should confirm a loud,
-    // non-silent stderr warning exists in the remediation.
+    // (3) LOUD-DEGRADATION GUARD (regression guard, green against current code):
+    // when the durable append fails, the failure must degrade LOUDLY on stderr,
+    // not silently. Substring-tolerant on purpose — we pin the *meaning* (the
+    // alarm was NOT durably recorded because the daemon was unreachable), never
+    // the exact wording, so a benign reword survives but DROPPING the eprintln!
+    // (main.rs `record_alarms` warning) turns this RED. This is the guard the
+    // auditor flagged left open; it is a guard, not an assert-red oracle.
+    assert!(
+        !stderr.trim().is_empty(),
+        "a daemon-down durability failure must degrade loudly on stderr, not silently; \
+         stderr was empty. stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("NOT durably recorded"),
+        "stderr must state the integrity alarm was NOT durably recorded; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unreachable"),
+        "stderr must attribute the durability failure to the daemon being unreachable; \
+         got stderr: {stderr}"
+    );
 }

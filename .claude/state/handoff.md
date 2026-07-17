@@ -1,28 +1,27 @@
-# Handoff — 2026-07-17 (session 4 close: S3 CLOSED, Phase 1 EXITED)
+# Handoff — 2026-07-17 (session 4 close, part 2: pre-S4 batch done)
 
 ## State of play
-**Current slice: S4** (verifier engine v1 — Phase 2) — not started. S3 closed this session with the full loop on record: triage → `/oracle mcp` (27-test board, 2 gate fixture pairs) → warden ratified `gate.entered/failed/inconclusive/explained` v1 → implementer built **hand-rolled JSON-RPC** (chosen over rmcp 2.2.0: board pins raw shapes + schemars byte-equality; I7) → all green → `/vet` pass independently (host `{"verdict":"pass","evidence":[]}` twice + WSL workspace green) → `/debrief` **PASS** (six tracked items) → **Phase-1 exit demo RECORDED by owner** (run-sheet at `docs/s3-demo-runsheet.md`; live daemon on port 40173 during the take; recording location owner-side, not yet noted in-repo). Slice pointer advanced S3→S4.
+**Current slice: S4** (verifier engine v1, Phase 2) — pre-work COMPLETE, engine not started. Earlier today: S3 closed + Phase 1 exited (demo recorded, see prior handoff content in git history at `bc9fc61`). Then the owner ordered the full pre-S4 batch; all three items landed:
+1. **DR-004 RATIFIED (owner, option C)** — exit-code table widened: 0 ok · 1 unexpected · 2 local input/usage (clap-aligned) · 3 substrate-fault incl. refusals · 4 daemon-unreachable · **5 gate-fail** (`inconclusive` is 3, never coerced, I6). Zero migration; collision flags retired. **S4 oracle board MUST pin exit 5 for gate-fail and 3 for inconclusive.**
+2. **S3-T1/T2 fixed** — eager `rebuild_workspaces` (pure log+CAS fold) before any transport; `idempotency_key` additive on `agent.spawned` (warden-ratified, dedup scope = envelope workspace + key); keyed retry survives SIGKILL; ghost window closed by evict-on-failure.
+3. **S2-T3 fixed** — WorktreeId marker in the private gitdir, written before the `allocated` fact; scan compares marker vs registry id. Branch switch ≠ takeover; foreign re-add detected exactly once.
+Loop on record for 2+3: oracle 5-test red board → warden ratification → impl → independent vet (host `{"verdict":"pass"}` + WSL workspace green) → debrief **PASS**.
 
-## Session log
-`c19c267` S3 board+ratification → `1df0fa8` S3 impl (vet+debrief pass) → `cb0d0da` handoff → `8768d14` demo tooling (run-sheet + `seed_fixture` example) → this close commit. ALL LOCAL — `origin/main` is at `92efd44`; push is on owner order.
+## Session log (this part)
+`fbb7f4b` DR-004 → `a3620ce` remediation board + ratification → `66aa5a5` remediation impl (vet+debrief pass) → this handoff. LOCAL — `origin/main` at `bc9fc61`; push on owner order.
 
 ## Next action
-**S4 planning: triage, then `/oracle gate`.** S4 = verifier engine v1 (native pack + exec contract per §8); `vet` enforces bare-mode/pinned-version/allowedTools pre-spawn; `pre_merge` + `debrief` on the golden path. S4 exit: an agent spawned under rezidnt gates produces a VERIFIED merged diff with replayable `debrief` and recorded cost. Golden path completes at S4.
-**BLOCKER-CLASS before Phase 2 work starts (owner/session decisions):**
-1. `/dr` exit-code collision (local-input exit 2 vs §9 gate-fail=2; daemon-refusal exit 3) — REQUIRED before Phase 2, twice-carried.
-2. Pre-S4 fixes from the S3 debrief: **T1** (workspace/spawn-key maps process-lifetime, rebuild from log on start — I3) and **T2** (ghost-workspace window: registry entry precedes materialization, never evicted). Route to implementer, oracle-first, before the gate engine builds on `spawn_agent`.
-3. S2 T3 worktree identity strengthening (marker file / HEAD oid) — "before Phase 2 leans on it," its own stated boundary.
+**`/oracle gate` — the S4 board.** S4 = verifier engine v1: native pack (diff-scope, test-suite, forbidden-path, secret-leak, build-passes) + exec contract (§8 JSON stdin/stdout, CAS-pinned inputs, no-network default, 120s timeout, malformed/nonzero → inconclusive); `vet` enforces bare-mode/pinned-version/allowedTools pre-spawn; `pre_merge` + `debrief` on the golden path. Exit: agent spawned under gates produces a VERIFIED merged diff with replayable `debrief` and recorded cost. Board obligations: exit-code pins per DR-004; `gate.passed` v1 needs warden ratification (deferred until an emitter exists — that's now); replay-divergence integrity alarm (§8).
 
-## Open /debrief findings (S3, tracked, verdict pass)
-- **T1/T2 (med, I3):** see blocker-class above.
-- **T3 (med, warden/scribe):** `gate_explain` writes `gate.explained` unbadged — ratified surface but §12 tension; badge it or record interrogations as read-class. Belongs in the badge `/dr` bundle.
-- **T4–T7 (low):** at-least-once `worktree.allocated` on retry-after-failed-launch + daemon-wide lock across spawn (liveness); unbounded HTTP body (cap it); `daemon.warning` open-failed fresh correlation (thread the open's); lockfile tmp `create(true)`→`create_new`.
-- **T8 (scribe):** silent DEFAULTs — protocol version `2025-06-18` no negotiation; tail limit 1024 oldest-first; 202 notifications; dedicated HTTP runtime; schemars runtime dep.
+## Open /debrief findings (tracked)
+- **NEW medium (this debrief, wants an oracle pin early in S4):** T2 eviction over-reaches — fires on ANY materialization failure, but `workspace.opened` publishes at step 1; a post-fact failure (e.g. agent 2 of 2 launch) evicts what the log opened and restart resurrects it. Refusal divergence, not false facts. Direction: evict only when `opened_id` was never published. `runs.rs:374-457`.
+- **NEW low:** legacy id-less registry entries keep branch-as-identity (self-extinguishing migration fallback); marker-write vs registry-persist crash window joins the T4 provenance family; boot-time full-log scan is a flagged DEFAULT (wants index/snapshot when logs grow).
+- **Carried S3 lows:** T4 at-least-once `worktree.allocated` on retry + daemon-wide spawn lock (liveness); unbounded HTTP body (cap it); `daemon.warning` open-failed fresh correlation; lockfile tmp `create(true)`→`create_new`; T8 silent DEFAULTs for scribe (protocol version, tail limit, 202, dedicated runtime, schemars runtime dep).
 
 ## /dr and warden queue
-- **Badge bundle (one session):** `badge.issued` emit-or-drop + daemon-lifetime operator-badge scope (beyond §12 per-AgentRun framing) + `badge_id` additive vs correlation-only + S3-T3 unbadged interrogation. `gate.passed` v1 lands naturally with the S4 oracle board (emitter exists then).
-- **Carried:** `/dr` or §7 note for `release_worktree` extending BINDING RepoSubstrate (twice-tracked); warden conflict at-least-once wording; capture-chunk subject `/dr` flag; scribe note hand-rolled-over-rmcp as formal DEFAULT; RepoSubstrate/GitError seam (I4); S1 hardening list; `daemon.warning` payload ratification; fixture housekeeping (tool_use transcript PROVISIONAL, s0_rebuild_equality line 3); root README; crates.io placeholder (needs `cargo login`); `rezident` fallback-string doc note; S2 T4 ingest helper → next git-adapter touch; S2 T1/T5 → Phase-2 hardening.
-- Owner may want the demo recording path noted in-repo (docs/demo/) — ask next session.
+- **Badge bundle (one session):** `badge.issued` emit-or-drop + operator-badge daemon-lifetime scope + `badge_id` on other mutation facts + S3-T3 unbadged `gate.explained`. `gate.passed` v1 → fold into S4 oracle/warden pass.
+- **Carried:** `release_worktree` BINDING extension `/dr` (twice-tracked); warden conflict at-least-once wording; capture-chunk `/dr` flag; scribe note: hand-rolled-over-rmcp as formal DEFAULT; RepoSubstrate/GitError seam (I4); S1 hardening list; `daemon.warning` payload ratification; fixture housekeeping; root README; crates.io placeholder (owner `cargo login`); `rezident` fallback doc note; S2-T4 ingest helper → next git-adapter touch; S2 T1/T5 → Phase-2 hardening (T5 prune verb pairs naturally with S4 CLI work).
+- Demo recording location not yet noted in-repo (docs/demo/?) — ask owner.
 
 ## Environment
-WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`. Vet hook host-side; daemon tests WSL. Demo daemon may still be running WSL-side (port 40173, `~/rezidnt-demo`) — harmless, kill at leisure. In WSL, `claude` resolves to the Windows npm shim via interop — worked for the demo take, but native WSL install is the robust path if S4 tests spawn real harnesses.
+WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`. Vet hook host-side; daemon tests WSL. Demo daemon may still be running (port 40173, `~/rezidnt-demo`). WSL `claude` resolves to the Windows npm shim via interop — native install advised if S4 spawns real harnesses in tests.

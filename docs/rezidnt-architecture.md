@@ -502,3 +502,83 @@ Forcing fact: **clap emits exit 2 for usage errors** (unknown subcommand, bad fl
 - No test or criterion is weakened; this tightens the table before anyone depends on the broken one.
 
 *Amendments to this record require DR-005.*
+
+---
+
+# Decision Record DR-005 — Badge model consolidation (the badge bundle)
+
+**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §12 (badges: scope, mutating-call rule) and the `spec/ontology.md` badge section (`badge.issued` semantics). No invariant text touched; I3/I6 unaffected. The one BINDING clarification: the §12 "badge on every mutating MCP call" rule is narrowed to "every *state-mutating* call."
+
+## Context
+
+Four coupled threads, verified in code. (a) `badge.issued`/`badge.revoked` are reserved subjects with **no emitter**; issuance is already attributable via `agent.spawned.badge_id` (`bins/rezidentd/src/runs.rs:593,611`). (b) The daemon mints one **daemon-lifetime operator badge** for local human clients, announced in the 0600 lockfile (`bins/rezidentd/src/main.rs:192`) — it has no run, workspace scope, or short expiry, so it does not fit §12's per-`AgentRun` `{workspace, verb set, expiry}` shape. (c) `badge_id` rides `agent.spawned` only; `check_badge` computes but discards a loggable id for `open_project`/`spawn_agent` (`crates/rezidnt-mcp/src/lib.rs:284,313`). (d) `gate_explain` appends `gate.explained` **unbadged** (lib.rs:346), as does `tail_events` — while §12 says "badge on every *mutating* call." Dissent recorded: a strict reading of §12 treats any log-append as a mutation, so leaving interrogation unbadged is a de-facto narrowing.
+
+## Decision (Option A)
+
+- **§12 rule clarified (BINDING):** a badge is required on every **state-mutating** call — spawn, open, merge — i.e. calls that change fleet/workspace/repo state. Interrogation (`gate_explain`, `gate why`) and `tail_events` are **read-class**: they leave audit breadcrumbs but are not badged. This preserves the I6 property that a blocked agent can always read *why* it was blocked, badge or not.
+- **`badge.issued`: drop the emitter (DEFAULT).** `agent.spawned.badge_id` is the issuance record. The subject stays reserved (never renamed), annotated "no emitter; attribution rides `agent.spawned`." Cheap to revisit if a run-independent delegation use case appears.
+- **Operator badge: blessed as a distinct daemon-lifetime badge class (DEFAULT).** §12's per-`AgentRun` shape is the *agent* badge; the operator badge is the *local-human* badge (possession of the 0600 lockfile = capability). Macaroon attenuation stays PROVISIONAL.
+- **`badge_id` on other mutation facts: deferred, not foreclosed (DEFAULT)** — no folding reducer consumes it today.
+
+## Consequences
+
+- **Zero code change**; matches the system as built and debriefed. The change narrows the §12 sentence for `gate_explain`/`tail_events` — a real (intended-all-along) relaxation, recorded here so it is explicit.
+- Retires the S3-T3 carried finding and the badge-bundle `/dr` item. Follow-on: a warden `/subject` pass updates `spec/ontology.md` `badge.issued` to "reserved, no emitter" (ontology edit, gated).
+
+*Amendments to this record require DR-008.*
+
+---
+
+# Decision Record DR-006 — Replay-divergence integrity signal
+
+**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §8 (replay/integrity alarm), §14 (self-observation). Mints a new subject (warden follow-on). I3 is the axis.
+
+## Context
+
+`rezidnt debrief <run>` replays recorded verdicts (`crates/rezidnt-gate/src/lib.rs:727`); recorded≠replayed raises an `IntegrityAlarm` (lib.rs:709). Today this is **CLI-report-only**: `debrief` runs in `bins/rezidnt` (main.rs:483), reads the SQLite log + CAS directly, prints `report.alarms[]`, and exits 3 — it **emits nothing to the log**. I3 says the log is truth, so an integrity check that fires but leaves no trace is invisible to `rebuild` and to any auditor querying the log — and log tampering is precisely the signal I3 most needs durable. Load-bearing constraint: `debrief` is a standalone CLI read with **no fabric writer handle**, so emitting a fact requires either routing debrief through the daemon or standing up a second log writer — a real architecture decision, not a one-liner.
+
+## Decision (durability now, dedicated subject)
+
+Divergence **lands a durable fact on the log** via a new dedicated subject, chosen over reusing the broad `daemon.error` bucket so the integrity signal is precisely queryable and the gate vocabulary stays clean (integrity-of-log ≠ gate verdict). Two-part follow-on, both required:
+
+1. **Resolve the writer path.** `debrief` becomes daemon-routed for the append (the daemon owns the single writer); the CLI keeps its direct read for the report. The replay itself stays a deterministic read over log+CAS.
+2. **Warden `/subject` mints `integrity.alarm`** with a **folding reducer** (no consumer-less subject). Payload carries the run, the diverging verifier, and both verdicts (recorded vs replayed). The `SUBJECTS_V0` companion edit lands same-commit (taxonomy-drift precedent).
+
+## Consequences
+
+- The S4 pin `golden_path.rs::cli_debrief_divergence_raises_integrity_alarm` (CLI report + exit 3) stays correct; the durable fact is strictly additive to it.
+- New work stream: an oracle board for the daemon-routed append + the reducer, a warden `/subject` for `integrity.alarm`, then implementation. Retires the divergence `/dr` item.
+- Risk delta: adds the daemon-routed-debrief path to the architecture surface; closes the I3 gap for the one event class (possible tampering) where invisibility was least acceptable.
+
+*Amendments to this record require DR-008.*
+
+---
+
+# Decision Record DR-007 — RepoSubstrate BINDING extension: ratify `release_worktree` as-built
+
+**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §7 RepoSubstrate trait sketch (BINDING shape). Retroactive: blesses code that shipped and passed S2 debrief. I4 is the axis.
+
+## Context
+
+`release_worktree` extended the BINDING §7 RepoSubstrate sketch with no DR (flagged three times). The sketch listed only `alloc_worktree` and `diff_summary`; the trait as built (`crates/rezidnt-adapters/git/src/lib.rs:165-177`) adds `release_worktree` (the allocate→use→release lifecycle the S2 slice pins) and hard-binds `Result<_, GitError>` into every method. Adding a *method* touches the BINDING *shape*, not just a DEFAULT signature — hence the flags.
+
+## Decision (Option A)
+
+Ratify the three-method trait exactly as built as the §7 RepoSubstrate seam, superseding the two-method sketch:
+
+```rust
+pub trait RepoSubstrate: Send + Sync {
+    async fn alloc_worktree(&self, req: WorktreeReq) -> Result<Worktree, GitError>;
+    async fn diff_summary(&self, wt: &WorktreeId) -> Result<CasRef, GitError>;
+    async fn release_worktree(&self, wt: &WorktreeId) -> Result<(), GitError>;
+}
+```
+
+`release_worktree` is now BINDING; signatures remain DEFAULT ("shape BINDING, signatures DEFAULT" per §7), so the method *set* is fixed but signature tweaks stay note-only. **Deferred (tracked I4 debt):** the trait hard-binds the concrete `GitError`; a future non-git impl would be forced to speak it. The clean shape is an associated `type Error` / shared `RepoError`. With exactly one impl today the abstraction pressure is theoretical, so the fix is deferred to when a second RepoSubstrate impl (or the Phase-3 substrate seam) lands — recorded so it is not dropped a fourth time.
+
+## Consequences
+
+- §7's RepoSubstrate block is replaced with the three-method form above. **No test or behavior changes** — this ratifies passing code.
+- Risk-register / I4 delta: one tracked line — "RepoSubstrate hard-binds `GitError`; introduce associated `type Error`/`RepoError` at the second impl." Retires the thrice-carried `release_worktree` `/dr` item.
+
+*Amendments to this record require DR-008.*

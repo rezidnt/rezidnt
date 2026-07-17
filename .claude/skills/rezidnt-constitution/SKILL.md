@@ -11,7 +11,7 @@ version: 0.2.0
 
 # rezidnt constitution
 
-Canonical source: `docs/rezidnt-architecture.md` (v0.2 + DR-001 + DR-002). This skill is the always-loaded distillation; when they disagree, the doc wins and the skill is stale.
+Canonical source: `docs/rezidnt-architecture.md` (the plan) plus the decision records in `docs/decisions/` (DR-001..007), indexed in the plan's §20. This skill is the always-loaded distillation; when they disagree, the doc wins and the skill is stale — and where a plan section is marked "amended by DR-00N", the cited record wins over the plan body.
 
 ## Decision-status labels
 - **BINDING** — changing it requires a decision record (`/dr`). The eight invariants and the trait seams are BINDING.

@@ -97,7 +97,9 @@ rezidnt/
     ontology.md            subject taxonomy — the IP, versioned like code
     fixtures/              golden event-log replay fixtures
   docs/
-    rezidnt-architecture.md   canonical design (v0.2 + DR-001..007)
+    rezidnt-architecture.md   canonical design plan (§20 indexes the decisions)
+    decisions/                one file per decision record (DR-001..007)
+    s3-demo-runsheet.md       Phase-1 exit demo run-sheet
   .claude/                 the build harness (see rezidnt-harness-README.md)
 ```
 
@@ -166,8 +168,10 @@ Sequencing law: **fabric → gates → terminal.** Any pressure to reorder gets 
 
 ## Documentation
 
-- **[docs/rezidnt-architecture.md](docs/rezidnt-architecture.md)** — the canonical design: invariants, topology, the fabric and gate engine, the phased roadmap, and decision records DR-001..007. Everything else is its distillation.
+- **[docs/rezidnt-architecture.md](docs/rezidnt-architecture.md)** — the canonical design plan: invariants, topology, the fabric and gate engine, the phased roadmap, and (§20) the index to the decision records. Everything else is its distillation.
+- **[docs/decisions/](docs/decisions/)** — the decision records (DR-001..007), one per file: the dated, append-only amendments to the plan. A plan section marked "amended by DR-00N" defers to its record.
 - **[spec/ontology.md](spec/ontology.md)** — the subject taxonomy; treated as the crown-jewel IP and versioned like code.
+- **[docs/s3-demo-runsheet.md](docs/s3-demo-runsheet.md)** — the Phase-1 exit demo run-sheet (one-take recorded golden-path walkthrough).
 - **[rezidnt-harness-README.md](rezidnt-harness-README.md)** — building rezidnt with the Claude Code agent-team harness (agents, skills, hooks, the maker–checker loop).
 
 ## Licensing

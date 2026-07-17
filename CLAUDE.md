@@ -1,7 +1,7 @@
 # rezidnt — project memory
 
 Rust workspace implementing the rezidnt daemon: event fabric, run substrate, gate engine, MCP surface.
-Canonical design: `docs/rezidnt-architecture.md` (v0.2 + DR-001 + DR-002). BINDING items change only via `/dr`.
+Canonical design: `docs/rezidnt-architecture.md` (the plan; §20 indexes the decision records). Decision records live one-per-file in `docs/decisions/` (DR-001..007). BINDING items change only via `/dr`.
 
 ## Non-negotiable invariants (full text: rezidnt-constitution skill)
 I1 zero pixels in core · I2 control/data plane never mix (payload ≤32KiB, bytes→CAS) · I3 log is truth, state derived ·

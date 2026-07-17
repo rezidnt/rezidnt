@@ -33,9 +33,13 @@ Positioning, compressed from the strategy record: Omnigent governs what agents *
 
 **I7 — One static binary, no runtime dependencies, no telemetry.** Install is `curl | sh` or `cargo install`. The daemon phones home to no one; this is a product stance, not a config default.
 
+> **I8 was rewritten by [DR-001](decisions/DR-001-native-substrates.md#invariant-i8-rewritten-binding).** The AGPL-firewall wording below is superseded v0.1 text; the current invariant is the clean-room rule in the DR.
+
 **I8 — AGPL firewall.** herdr is consumed strictly as a separate process over its socket/CLI. No linking, no vendoring, no source consultation for implementation. CI enforces a denylist (no `herdr` source in-tree). Omnigent (Apache-2.0) may be *ported* with NOTICE preservation; herdr may not.
 
 ## 3. System topology
+
+> **Amended by [DR-001](decisions/DR-001-native-substrates.md).** The native run substrate replaces the herdr-integrated topology described below.
 
 ```
 ┌────────────────────────── clients ──────────────────────────┐
@@ -61,6 +65,8 @@ Positioning, compressed from the strategy record: Omnigent governs what agents *
 Process model: one `rezidentd` per user session, auto-started by the CLI on first use (`rezidnt` connects, spawns the daemon if absent, waits for the hello). Trust boundary is the local user account (§12). Multi-machine is out of scope until Phase 3+; the seam is that clients already speak a socket protocol, so a remote bridge is additive.
 
 ## 4. Crate workspace layout
+
+> **Amended by [DR-001](decisions/DR-001-native-substrates.md).** `rezidnt-run` replaces `rezidnt-adapters/herdr`; the current crate set is the [repository map](../README.md#repository-map).
 
 Cargo workspace, one repository. Library crates dual-licensed `MIT OR Apache-2.0` (Rust convention, maximizes reuse); binaries Apache-2.0.
 
@@ -155,6 +161,8 @@ Snapshots: periodic (every 5,000 events or 15 min, DEFAULT) into a `snapshots` t
 
 ## 7. Substrate adapter layer
 
+> **Amended by [DR-001](decisions/DR-001-native-substrates.md) and [DR-007](decisions/DR-007-release-worktree.md).** `TerminalSubstrate` is deferred to Phase 3, `AgentSubstrate` absorbs spawn-with-PTY, and `RepoSubstrate` is the three-method form in DR-007 — not the sketch below. The herdr and Omnigent adapters below are superseded by the native substrates.
+
 **Runtime model:** each adapter is a supervised tokio task owning its connection, receiving commands over `mpsc`, emitting events into the fabric. Supervision policy (DEFAULT): exponential backoff with jitter, base 500 ms, cap 60 s; a crash-loop breaker trips after 5 restarts/5 min and parks the adapter in `Faulted` — visible as `adapter.health.changed`, never a silent retry storm. Health states: `Starting → Healthy → Degraded → Faulted`, all on the bus, because an invisible supervisor is a failed supervisor.
 
 **Trait seams (shape BINDING, signatures DEFAULT):**
@@ -191,6 +199,8 @@ pub trait RepoSubstrate: Send + Sync {
 **Arranger adapter (optional, feature-flagged).** Windows window placement delegates to komorebi over its IPC/CLI (high confidence it exists; moderate on current IPC details — verify at implementation). Never hand-roll `SetWindowPos` choreography. Absent komorebi, the adapter is a no-op that still emits layout-intent events for future clients.
 
 ## 8. Gate and verifier engine
+
+> **Amended by [DR-006](decisions/DR-006-replay-divergence-signal.md).** Replay divergence now lands a durable `integrity.alarm` fact on the log, not a CLI-only report.
 
 This is the differentiation layer; over-invest here, under-invest everywhere else.
 
@@ -237,6 +247,8 @@ Linux and macOS are native and boring. Windows is the wedge and gets explicit tr
 
 ## 12. Security and audit posture
 
+> **Amended by [DR-005](decisions/DR-005-badge-consolidation.md).** The badge requirement is narrowed to *state-mutating* calls; interrogation (`gate_explain`) and `tail_events` are read-class and unbadged.
+
 Trust boundary: one user on one machine. Socket at mode 0600; named pipe ACL'd to the current user. **Badges** (the one lore term in the security model): per-`AgentRun` capability tokens — 256-bit random, scoped to `{workspace, verb set, expiry}` — required on every mutating socket/MCP call. DEFAULT is opaque bearer checked by the daemon; macaroon-style attenuation is PROVISIONAL and waits for a real delegation use case. The point in Phase 1 is not cryptographic ceremony; it is that *an agent's writes are attributable to that agent* in the log, which is what makes the dossier meaningful.
 
 Secret hygiene: fabric ingress runs a redaction pass (denylist patterns: cloud keys, PATs, connection strings) before append; exec verifiers run with a scrubbed environment. Log integrity: the `chain` column (blake3 over previous chain + id + payload) makes the log tamper-evident at near-zero cost; `doctor` re-walks it. DEFAULT on. No telemetry (I7). Threats explicitly out of scope for now, documented so nobody pretends otherwise: hostile local root, malicious verifier binaries installed by the operator themselves, and multi-tenant isolation.
@@ -271,6 +283,8 @@ verifiers = [
 
 ## 14. Observability
 
+> **Amended by [DR-006](decisions/DR-006-replay-divergence-signal.md).** Integrity divergence at replay is mirrored onto the fabric as a durable fact.
+
 `tracing` + `tracing-subscriber` throughout; WARN and above are mirrored onto the fabric as `daemon.*` events so the system's own misbehavior is queryable with the same tools as everything else. `rezidnt doctor` checks: socket reachability, SQLite `integrity_check` + WAL state, chain verification, adapter health, substrate versions against tested ranges, CAS disk headroom. A `--smoke` self-benchmark (spawn a null agent through a null gate, assert end-to-end latency) is PROVISIONAL.
 
 ## 15. Testing, oracles, and the benchmark seam
@@ -280,6 +294,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 **Reducer determinism (Phase 1's oracle):** property tests assert `fold(log) == snapshot` under arbitrary event interleavings and that rebuild equals live state; golden log fixtures live in-repo and every release replays them. **Adapter contracts:** herdr and Omnigent adapters are tested against *recorded* socket/WebSocket transcripts (record/replay harness in `rezidnt-supervise` test utils); a substrate version bump that breaks the recording blocks the adapter, not the daemon. **Verifier conformance:** a suite that feeds exec verifiers malformed input, timeouts, and nondeterminism traps, asserting `inconclusive`-not-`pass` behavior. **Phase 3 oracles:** vttest/esctest conformance plus grid-snapshot comparison against a reference emulator, per the phase plan. **The benchmark (GTM-grade testing):** the harness is public in `bench/harness`; the held-out case set is private, full stop — you know exactly what contamination does to a measuring stick. Metrics locked now so the category argument is ours: orchestrated task completion rate, gate precision/recall against labeled defects, worktree merge success rate, cost per merged verified diff.
 
 ## 16. Phased roadmap and slice acceptance criteria
+
+> **Superseded by [DR-001](decisions/DR-001-native-substrates.md#roadmap-supersedes-16).** The current roadmap lives in the DR; the slices below are the pre-DR-001 (herdr-integrated) plan, kept for provenance.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -296,6 +312,8 @@ Estimates are mine, part-time-founder calibrated, moderate confidence, wide inte
 Sequencing law, restated because it is the project's most-violated invariant in the wild: **fabric → harness → terminal.** Any pressure to reorder is scope gravity and gets the phase-exit-demo test applied to it.
 
 ## 17. Repository, licensing, and the commercial seam
+
+> **Amended by [DR-003](decisions/DR-003-retire-ip-memo-gate.md).** The employer-IP-memo gate is retired. Per [DR-001](decisions/DR-001-native-substrates.md), no third-party code is ported, so the NOTICE obligation described below does not arise.
 
 Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apache-2.0` on `crates/*` libs, DCO enforced, NOTICE carrying Omnigent attributions for ported code, TRADEMARKS.md (mark owned by TwofoldTech LLC), SECURITY.md, CONTRIBUTING.md. Excluded from this repo permanently: `rezidnt-enterprise` (RBAC/SSO/audit-export, hosted control plane if ever), domain verifier judgment packs, and the benchmark held-out set. The seam is structural — separate repos, separate crates — so a future dual-license or paid tier requires zero untangling, exercised or not.
 
@@ -315,6 +333,22 @@ Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apach
 ## 19. Open decisions register
 
 `rmcp` maturity (verify at S3; fallback: thin hand-rolled JSON-RPC). SQLite write amplification (revisit only past 10⁴ events/min). WASM verifiers as a third kind (post-Phase 2; exec contract already covers polyglot). Macaroon-attenuated badges (needs a real delegation use case). Komorebi IPC depth (verify at arranger implementation). First graphical client: ratatui board is S5; Tauri dashboard is demand-gated. Hash-chain externalization (periodic chain-head publication for third-party timestamping) — PROVISIONAL, compliance-driven.
+
+## 20. Decision records
+
+BINDING items change only through a dated decision record. Records live one per file under [`docs/decisions/`](decisions/), numbered sequentially; each closes by naming the number its own future amendment must take. This catalog is the index — **where a section above is marked "amended by DR-00N", the plan's text is no longer the whole truth until you have read that record.**
+
+| DR | Title | Status | Amends |
+|---|---|---|---|
+| [DR-001](decisions/DR-001-native-substrates.md) | Native substrates from day one | ACCEPTED | §1, §3, §4, §7, I8, §16, §18 |
+| [DR-002](decisions/DR-002-prior-art-protocol.md) | Prior-art protocol for competitor sources | ACCEPTED | DR-001 (tightens) |
+| [DR-003](decisions/DR-003-retire-ip-memo-gate.md) | Retire the employer IP memo standing gate | ACCEPTED | preamble, §17 |
+| [DR-004](decisions/DR-004-exit-code-table.md) | Stable exit-code table | ACCEPTED | §9 |
+| [DR-005](decisions/DR-005-badge-consolidation.md) | Badge model consolidation | ACCEPTED | §12 |
+| [DR-006](decisions/DR-006-replay-divergence-signal.md) | Replay-divergence integrity signal | ACCEPTED | §8, §14 |
+| [DR-007](decisions/DR-007-release-worktree.md) | RepoSubstrate `release_worktree` as-built | ACCEPTED | §7 |
+
+*The next record is DR-008.*
 
 ---
 
@@ -352,233 +386,4 @@ adapter.health.changed | daemon.started | daemon.warning | daemon.error
 badge.issued | badge.revoked
 ```
 
-*End of v0.1. Amendments to BINDING items require a dated decision record appended below this line.*
-
----
-
-# Decision Record DR-001 — Native substrates from day one
-
-**Date:** 2026-07-04 · **Status:** ACCEPTED · **Doc version:** 0.1 → 0.2
-**Amends:** §1 (non-goals), §3 (topology), §4 (crates), §7 (adapters), Invariant I8, §16 (roadmap), §18 (risks). **Supersedes:** the herdr integration path and the Omnigent runtime adapter/donor port.
-
-## Decision
-
-rezidnt ships with **zero external substrate dependencies**. herdr is not integrated at any phase. Omnigent code is neither executed nor ported. All substrates are native, built in-repo, from first principles.
-
-## Basis
-
-The v0.1 Phase 1 inherited herdr's *frame*: it assumed agents live inside terminal sessions because the incumbent tool is a terminal multiplexer. At the root, **agents are processes, not terminal sessions.** The golden path requires process supervision, output capture, lifecycle facts, worktree isolation, and gates — none of which require VT emulation, pane multiplexing, or screen re-rendering. Decomposing what herdr actually bundles:
-
-| herdr capability | rezidnt need | native answer |
-|---|---|---|
-| PTY allocation + process persistence | **required** | `portable-pty` + daemon-owned PTY masters |
-| VT emulation / screen re-render | **not required** (Phase 1–2) | raw byte capture; client's own terminal emulates on attach (dtach model) |
-| Multiplexed pane UI | **never in core** (I1) | fleet board is a state view, not a terminal grid |
-| Socket control API | already ours | §9 unchanged |
-
-The decisive upgrade nobody gets from a multiplexer: harness CLIs now expose **structured telemetry natively**. Claude Code's headless mode (`claude -p`) emits newline-delimited JSON events — assistant messages, tool calls, tool results, session ids — and its JSON envelope reports `total_cost_usd` with a per-model breakdown (high confidence; verified against official headless docs). Terminal-scraping status heuristics were always a downgrade we were about to inherit. Native integration is not merely independent; it is *higher fidelity*.
-
-## New component: `rezidnt-run` (the ProcessSubstrate)
-
-Replaces `rezidnt-adapters/herdr` in the workspace. Four parts:
-
-**Spawner.** `tokio::process` for headless children; `portable-pty` when a child demands a TTY (ConPTY on Windows arrives in Phase 1 as a consequence — aligned with the Windows wedge, WSL2-first topology unchanged). Environment scrubbing and badge injection at spawn.
-
-**Capture.** Per-run ring buffer (256 KiB DEFAULT) for live tail; full stream chunked into the CAS with manifest events carrying refs only (I2 holds — bytes never touch the fabric).
-
-**Persistence.** The daemon owns the PTY master; client disconnects never kill runs. `rezidnt attach <run>` is a raw byte proxy over the socket — the dtach model: no scrollback re-render, resize is SIGWINCH passthrough, redraw is the child's job. Documented limitation, and the explicit trigger metric for Phase 3.
-
-**Reaper.** Exit status, signal escalation (TERM→KILL with grace), orphan cleanup on daemon restart via pidfile reconciliation.
-
-## Trait changes
-
-`AgentSubstrate` absorbs spawn-with-PTY. `TerminalSubstrate` is **removed from Phases 1–2** and reserved as the Phase 3 seam. `RepoSubstrate` unchanged. The worktree registry simplifies: rezidnt is now the **sole allocator**; `worktree.observed`/`worktree.conflict` are retained only to guard against out-of-band human git activity — the two-allocator reconciliation problem is deleted, not solved.
-
-## Native harness adapters (`AgentSubstrate` impls)
-
-**claude-code (S1).** Invocation: `claude -p --output-format stream-json --verbose`, with `--include-partial-messages` where token-level streaming matters. Governed runs add `--bare` — skips ambient hooks, skills, MCP servers, and CLAUDE.md discovery, requiring explicit credentials — which makes it the **determinism knob a `vet` gate can require**: same result on every machine, no inherited ambient config (high confidence; per official docs, `--bare` is recommended for scripted calls and slated to become the `-p` default). Telemetry mapping: stream-json events → `agent.tool.invoked`, `agent.message`, `agent.status.changed`; cost fields → dossier accounting, which makes the benchmark metric *cost per merged verified diff* free. Steering: `--input-format stream-json` (+ `--replay-user-messages`) is the bidirectional channel; its wire contract is thinly documented upstream (open docs issue; third parties have reverse-engineered it) — **moderate confidence in stability**, so it lives behind the trait with recorded-transcript contract tests. Permission composition: `--allowedTools`/permission modes constrain the harness per AgentSpec; badges attribute the writes; both recorded in events. Session resume (`--resume <session_id>`) maps to run checkpointing.
-
-**codex (S4-era).** `codex exec` non-interactive path; moderate confidence on current flag surface — verify at implementation, same recorded-transcript discipline.
-
-## Invariant I8 rewritten (BINDING)
-
-*Old:* AGPL firewall around a herdr runtime dependency. *New — the clean-room rule:* copyleft sources (herdr, any AGPL) are **never read** for implementation purposes. Permissive sources (Omnigent, Apache-2.0) **may be read as prior art** but nothing is ported or vendored — so NOTICE obligations never arise and the tree stays provenance-clean. First principles means no inherited frames and no inherited code; it does not mean ignorance of prior art, and it does not license NIH at the component level: `portable-pty`, `tokio`, `rusqlite`, and (Phase 3) a permissive VT kernel remain mandatory boring parts. "Build our own system" is a claim about the *system*, not about syscall wrappers.
-
-## Roadmap (supersedes §16)
-
-**Phase 1 — fabric + run substrate. Estimate: 5–9 weeks part-time (moderate confidence; my numbers, not anchored).**
-*S0 unchanged* (ontology, log, broadcast, `tail`; same acceptance).
-*S1 — native run:* `rezidnt open` → worktree allocated → claude-code spawned headless under capture, lifecycle + stream-json telemetry on the fabric. Accept: golden path *minus gates* on a clean VM ≤ 5 min; kill the client mid-run and the run survives; `attach` replays the tail; every step visible in `tail`.
-*S2 — git adapter:* unchanged, minus two-allocator machinery.
-*S3 — MCP + attach:* unchanged acceptance, plus `attach` byte proxy demonstrated over the socket.
-
-**Phase 2 — gates. Estimate: 5–10 weeks.** Verifier engine v1; `vet` enforces bare-mode/pinned-version/allowedTools policy pre-spawn; `pre_merge` and `debrief` on the golden path. *S4 accept:* an agent produces a **verified merged diff** with replayable debrief and recorded cost. **The golden path completes at end of Phase 2.**
-*S5 — fleet board* (ratatui, read-only, watch-channels only) moves earlier — it is now the primary visibility surface beyond the CLI.
-
-**Phase 3 — rescoped from "replace herdr" to "interactive fidelity layer."** VT kernel assembly (libghostty-vt or alacritty_terminal family — licenses verified at kickoff), scrollback re-render, rich attach, optional pane UI as a *client*. **Demand-gated**: pulled only when attach-fidelity friction is measured, not scheduled. The forced parity race with herdr is deleted from the plan entirely.
-
-## Risk register deltas
-
-**Deleted:** herdr API churn / adversarial maintainer; AGPL contamination; Omnigent alpha churn (runtime).
-**Added:** harness CLI churn — claude-code flags and stream-json shape drift, and `--bare` becoming the `-p` default is pre-announced → pin harness versions per AgentSpec, recorded-transcript contract tests, adapter refuses untested majors. PTY/ConPTY edge cases arrive in Phase 1 → carried by `portable-pty` (high-confidence component), WSL2-first unchanged. Attach-fidelity expectations → documented limitation + tail replay; complaint volume is the Phase 3 trigger. NIH creep → the clean-room rule's component clause; violations get the phase-exit-demo test.
-
-## Honest ledger
-
-**Buys:** typed telemetry and per-run cost accounting instead of terminal-scraping heuristics; zero dependency on a rival's roadmap or license; sole-allocator worktree model; a cleaner install story (one binary, no external substrates, nothing to shell out to except git and the harnesses themselves); Phase 3 becomes optional instead of obligatory. **Costs:** attach without screen re-render until demand pulls Phase 3; no multi-pane interactive UX in v1; every PTY edge case is ours from day one.
-
-*Amendments to this record require DR-002.*
-
----
-
-# Decision Record DR-002 — Prior-art protocol for competitor sources
-
-**Date:** 2026-07-04 · **Status:** ACCEPTED 2026-07-16 (owner) · **Amends:** DR-001 clean-room rule — tightens it; reverses nothing.
-
-## Context
-
-Concern raised: using Omnigent as a "donor" — even read-only — anchors rezidnt's design on Databricks' frame ("plan poisoning"). Assessment: **legal** contamination from Apache-2.0 source is near-zero absent copying (permissive license; no obligations attach to reading; patent exposure is orthogonal to reading, since independent invention is not a patent defense — confirm with counsel). **Cognitive** anchoring is a real mechanism, demonstrated by v0.1 inheriting herdr's terminal frame *without anyone reading herdr source* — the vector was the integration plan and product osmosis, not code access. The mitigation is sequencing and traceability, not ignorance.
-
-## Rules
-
-1. **Design-first.** No competitor source is opened until the corresponding rezidnt design is committed in writing. (Satisfied for fabric, traits, run substrate, and gate model as of v0.2 + DR-001.)
-2. **Extraction-scoped reads.** Every competitor read begins with written questions and ends with a findings memo in `/intel/`. Memos feed the benchmark, the risk register, and positioning — never trait or ontology definitions directly.
-3. **Traceable influence.** Any design change motivated by an intel memo requires its own DR citing that memo. Anchoring is made *auditable*, not pretended away.
-4. **Copyleft unchanged.** herdr and all AGPL sources are never read for implementation purposes (DR-001 stands in full).
-5. **Implementation oracles are primary sources.** Harness vendors' own documentation plus recorded-transcript contract tests. Omnigent code is never an implementation reference for any rezidnt component.
-6. **Benchmark exception.** Installing, running, and scoring competitor binaries is unrestricted — a benchmark cannot be built blind, and black-box behavior is not source.
-7. **Post-freeze gap-diff.** The single sanctioned design-adjacent use: after ontology v1 freezes, one scoped read of Omnigent's event/policy taxonomy to diff for *coverage gaps* ("do they handle a lifecycle fact we lack a subject for?"). Output is a memo per rule 2; additions require a DR per rule 3.
-
-*Amendments to this record require DR-003.*
-
----
-
-# Decision Record DR-003 — Retire the employer IP memo standing gate
-
-**Date:** 2026-07-16 · **Status:** ACCEPTED (owner) · **Amends:** the preamble standing gates and §17; removes the pushgate guardrail from the development harness. Reverses nothing in DR-001/DR-002.
-
-## Decision
-
-The repository-stays-private-until-the-employer-IP-memo-is-executed standing gate is retired in full. `git push` is no longer blocked; the repository may be made public at the owner's discretion. The name-registry standing gate (`rezident` fallback) is unchanged.
-
-## Basis
-
-Owner determination, 2026-07-16: the employer-IP question the gate guarded against is not a concern for this project. The maintainers raised the risk profile of removing the gate without an executed memo (publication is the irreversible step; an IP dispute surfacing post-publication is the expensive form) and the owner accepted it and directed removal. This record exists so the decision is dated and attributable rather than implicit.
-
-## Mechanical changes
-
-Preamble standing-gates line reduced to the name gate. §17's "(post-memo)" qualifier and its memo-pending exclusion clause deleted. Harness: `.claude/hooks/pushgate.sh` deleted, its PreToolUse registration removed from `.claude/settings.json`, the session-start gate notice dropped from `slice-status.sh`, and the README/CLAUDE.md guardrail references updated. The `.claude/state/ip-memo-cleared` marker mechanism ceases to exist.
-
-*Amendments to this record require a further decision record.*
-
----
-
-# Decision Record DR-004 — Stable exit-code table: resolve the gate-fail/local-input collision
-
-**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §9 command surfaces (CLI stable exit codes). No invariant text touched; I6 unaffected (verdicts stay `pass|fail|inconclusive` on the fabric — exit codes are the CLI projection only).
-
-## Context
-
-§9 pinned "stable exit codes (0 ok, 2 gate-fail, 3 substrate-fault, 4 daemon-unreachable)." The S1/S2 CLI as built uses **exit 2 for local input errors** (unreadable/unparseable spec, malformed run ULID — before any daemon traffic) and **exit 3 for daemon-side refusals** at open (`Reply::Error`, `open-failed` warning), stretching "substrate-fault." The collision was flagged in `bins/rezidnt/src/main.rs` module docs and `cli_verbs.rs` at implementation time, carried twice, and was REQUIRED before Phase 2: when S4 lands real gates, `rezidnt vet`/`debrief` in CI must distinguish gate-fail from local misuse by exit code alone.
-
-Forcing fact: **clap emits exit 2 for usage errors** (unknown subcommand, bad flags) regardless of our table. §9's gate-fail=2 was unimplementable without overriding the argument parser's error path.
-
-**Options considered.**
-- **A — Keep §9's table; move local-input to a new code (e.g. 64/EX_USAGE).** Honors the ratified text. Cost: override clap's error exit everywhere, change 3 exit sites, rewrite the `Some(2)` pin in `cli_open_missing_spec_is_exit_2_family`, and fight the ecosystem convention forever.
-- **B — Re-ratify §9 with implemented semantics only (2=local-input, 3=substrate-fault-incl-refusal), gate-fail folded into 3.** Zero migration, but loses the very distinction S4 needs: gate-fail vs daemon fault.
-- **C — Widen the table: 0 ok · 1 unexpected internal error · 2 local input/usage (clap-aligned) · 3 substrate-fault (daemon-side refusal or failure) · 4 daemon-unreachable · 5 gate-fail.** Zero code migration (no gate emitter exists yet; 5 is unclaimed), clap-aligned, and gate-fail gets a dedicated code before anything builds on it.
-
-**Dissent recorded:** the counterargument for A is that gate-fail is the golden-path outcome and deserved the low conventional number, and that scripts written against §9's published table would break. Answer: no such scripts exist yet (no gate emitter has shipped), and the published table was never achievable under clap.
-
-## Decision
-
-**Option C** (owner-ratified 2026-07-17). §9's exit-code sentence is replaced with:
-
-> Global `--json` on every verb; stable exit codes (BINDING once ratified): **0** ok · **1** unexpected internal error · **2** local input/usage error (clap convention; daemon never reached) · **3** substrate fault, including daemon-side refusals · **4** daemon unreachable · **5** gate-fail (`vet`/`debrief`/`pre_merge` verdict `fail`; `inconclusive` is NOT 5 — it is 3, never coerced toward pass or fail, per I6).
-
-## Consequences
-
-- Migration cost: **zero code, zero tests.** The sole pinned failure code (`cli_verbs.rs::cli_open_missing_spec_is_exit_2_family`, `Some(2)`) remains correct. Exit-3 refusal paths in `main.rs` are ratified as-is; its module-doc `/dr` flags are retired by citing this record.
-- S4 oracle board MUST pin exit 5 for gate-fail and exit-3-for-`inconclusive` before the gate engine lands. Risk-register delta: removes the twice-carried Phase-2 blocker; adds a small doc-drift risk (any external notes quoting the old table are now stale).
-- No test or criterion is weakened; this tightens the table before anyone depends on the broken one.
-
-*Amendments to this record require DR-005.*
-
----
-
-# Decision Record DR-005 — Badge model consolidation (the badge bundle)
-
-**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §12 (badges: scope, mutating-call rule) and the `spec/ontology.md` badge section (`badge.issued` semantics). No invariant text touched; I3/I6 unaffected. The one BINDING clarification: the §12 "badge on every mutating MCP call" rule is narrowed to "every *state-mutating* call."
-
-## Context
-
-Four coupled threads, verified in code. (a) `badge.issued`/`badge.revoked` are reserved subjects with **no emitter**; issuance is already attributable via `agent.spawned.badge_id` (`bins/rezidentd/src/runs.rs:593,611`). (b) The daemon mints one **daemon-lifetime operator badge** for local human clients, announced in the 0600 lockfile (`bins/rezidentd/src/main.rs:192`) — it has no run, workspace scope, or short expiry, so it does not fit §12's per-`AgentRun` `{workspace, verb set, expiry}` shape. (c) `badge_id` rides `agent.spawned` only; `check_badge` computes but discards a loggable id for `open_project`/`spawn_agent` (`crates/rezidnt-mcp/src/lib.rs:284,313`). (d) `gate_explain` appends `gate.explained` **unbadged** (lib.rs:346), as does `tail_events` — while §12 says "badge on every *mutating* call." Dissent recorded: a strict reading of §12 treats any log-append as a mutation, so leaving interrogation unbadged is a de-facto narrowing.
-
-## Decision (Option A)
-
-- **§12 rule clarified (BINDING):** a badge is required on every **state-mutating** call — spawn, open, merge — i.e. calls that change fleet/workspace/repo state. Interrogation (`gate_explain`, `gate why`) and `tail_events` are **read-class**: they leave audit breadcrumbs but are not badged. This preserves the I6 property that a blocked agent can always read *why* it was blocked, badge or not.
-- **`badge.issued`: drop the emitter (DEFAULT).** `agent.spawned.badge_id` is the issuance record. The subject stays reserved (never renamed), annotated "no emitter; attribution rides `agent.spawned`." Cheap to revisit if a run-independent delegation use case appears.
-- **Operator badge: blessed as a distinct daemon-lifetime badge class (DEFAULT).** §12's per-`AgentRun` shape is the *agent* badge; the operator badge is the *local-human* badge (possession of the 0600 lockfile = capability). Macaroon attenuation stays PROVISIONAL.
-- **`badge_id` on other mutation facts: deferred, not foreclosed (DEFAULT)** — no folding reducer consumes it today.
-
-## Consequences
-
-- **Zero code change**; matches the system as built and debriefed. The change narrows the §12 sentence for `gate_explain`/`tail_events` — a real (intended-all-along) relaxation, recorded here so it is explicit.
-- Retires the S3-T3 carried finding and the badge-bundle `/dr` item. Follow-on: a warden `/subject` pass updates `spec/ontology.md` `badge.issued` to "reserved, no emitter" (ontology edit, gated).
-
-*Amendments to this record require DR-008.*
-
----
-
-# Decision Record DR-006 — Replay-divergence integrity signal
-
-**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §8 (replay/integrity alarm), §14 (self-observation). Mints a new subject (warden follow-on). I3 is the axis.
-
-## Context
-
-`rezidnt debrief <run>` replays recorded verdicts (`crates/rezidnt-gate/src/lib.rs:727`); recorded≠replayed raises an `IntegrityAlarm` (lib.rs:709). Today this is **CLI-report-only**: `debrief` runs in `bins/rezidnt` (main.rs:483), reads the SQLite log + CAS directly, prints `report.alarms[]`, and exits 3 — it **emits nothing to the log**. I3 says the log is truth, so an integrity check that fires but leaves no trace is invisible to `rebuild` and to any auditor querying the log — and log tampering is precisely the signal I3 most needs durable. Load-bearing constraint: `debrief` is a standalone CLI read with **no fabric writer handle**, so emitting a fact requires either routing debrief through the daemon or standing up a second log writer — a real architecture decision, not a one-liner.
-
-## Decision (durability now, dedicated subject)
-
-Divergence **lands a durable fact on the log** via a new dedicated subject, chosen over reusing the broad `daemon.error` bucket so the integrity signal is precisely queryable and the gate vocabulary stays clean (integrity-of-log ≠ gate verdict). Two-part follow-on, both required:
-
-1. **Resolve the writer path.** `debrief` becomes daemon-routed for the append (the daemon owns the single writer); the CLI keeps its direct read for the report. The replay itself stays a deterministic read over log+CAS.
-2. **Warden `/subject` mints `integrity.alarm`** with a **folding reducer** (no consumer-less subject). Payload carries the run, the diverging verifier, and both verdicts (recorded vs replayed). The `SUBJECTS_V0` companion edit lands same-commit (taxonomy-drift precedent).
-
-## Consequences
-
-- The S4 pin `golden_path.rs::cli_debrief_divergence_raises_integrity_alarm` (CLI report + exit 3) stays correct; the durable fact is strictly additive to it.
-- New work stream: an oracle board for the daemon-routed append + the reducer, a warden `/subject` for `integrity.alarm`, then implementation. Retires the divergence `/dr` item.
-- Risk delta: adds the daemon-routed-debrief path to the architecture surface; closes the I3 gap for the one event class (possible tampering) where invisibility was least acceptable.
-
-*Amendments to this record require DR-008.*
-
----
-
-# Decision Record DR-007 — RepoSubstrate BINDING extension: ratify `release_worktree` as-built
-
-**Date:** 2026-07-17 · **Status:** ACCEPTED (owner) · **Amends:** §7 RepoSubstrate trait sketch (BINDING shape). Retroactive: blesses code that shipped and passed S2 debrief. I4 is the axis.
-
-## Context
-
-`release_worktree` extended the BINDING §7 RepoSubstrate sketch with no DR (flagged three times). The sketch listed only `alloc_worktree` and `diff_summary`; the trait as built (`crates/rezidnt-adapters/git/src/lib.rs:165-177`) adds `release_worktree` (the allocate→use→release lifecycle the S2 slice pins) and hard-binds `Result<_, GitError>` into every method. Adding a *method* touches the BINDING *shape*, not just a DEFAULT signature — hence the flags.
-
-## Decision (Option A)
-
-Ratify the three-method trait exactly as built as the §7 RepoSubstrate seam, superseding the two-method sketch:
-
-```rust
-pub trait RepoSubstrate: Send + Sync {
-    async fn alloc_worktree(&self, req: WorktreeReq) -> Result<Worktree, GitError>;
-    async fn diff_summary(&self, wt: &WorktreeId) -> Result<CasRef, GitError>;
-    async fn release_worktree(&self, wt: &WorktreeId) -> Result<(), GitError>;
-}
-```
-
-`release_worktree` is now BINDING; signatures remain DEFAULT ("shape BINDING, signatures DEFAULT" per §7), so the method *set* is fixed but signature tweaks stay note-only. **Deferred (tracked I4 debt):** the trait hard-binds the concrete `GitError`; a future non-git impl would be forced to speak it. The clean shape is an associated `type Error` / shared `RepoError`. With exactly one impl today the abstraction pressure is theoretical, so the fix is deferred to when a second RepoSubstrate impl (or the Phase-3 substrate seam) lands — recorded so it is not dropped a fourth time.
-
-## Consequences
-
-- §7's RepoSubstrate block is replaced with the three-method form above. **No test or behavior changes** — this ratifies passing code.
-- Risk-register / I4 delta: one tracked line — "RepoSubstrate hard-binds `GitError`; introduce associated `type Error`/`RepoError` at the second impl." Retires the thrice-carried `release_worktree` `/dr` item.
-
-*Amendments to this record require DR-008.*
+*End of the plan body. BINDING changes are recorded as decision records — see [§20](#20-decision-records) and [`docs/decisions/`](decisions/).*

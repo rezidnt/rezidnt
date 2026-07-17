@@ -179,7 +179,28 @@ Ratified per-subject payload shapes. A field marked `?` is optional and may be a
 - `ref: CasRef` — carries `hash`, `bytes`, `mime`; the v0 sketch's top-level `mime`/`bytes` live inside the ref (no duplicated fields).
 - `provenance: {run?: string, kind: string, chunk?: u64}` — `run` when the artifact belongs to an agent run; `kind` names the capture class (e.g. `capture-chunk`, `diff`, `gate-evidence`); `chunk` is the 0-based ordinal within the run's capture stream, present iff `kind = "capture-chunk"`. DR-001 chunked run output rides this subject via ref-only manifest facts (`rezidnt-run` `ManifestEntry {run, chunk, ref}`); whether high-rate capture chunks deserve a dedicated subject is an open question flagged for `/dr` — not minted here.
 
+### S2 set (ratified 2026-07-17)
+
+**`worktree.observed` v1** — out-of-band guard fact (DR-001); registers the tree so re-observation stays silent.
+- `path: string` — canonicalized path of the observed tree; the registry key it occupies.
+- `allocator: "human"` — fixed in v1: observation is by definition out-of-band. The value `"rezidnt"` is never emitted on this subject (exact mirror of the `worktree.allocated` reservation).
+- `branch?: string` — branch checked out in the observed tree when the watcher can read one; absent for detached human trees. Additive; family coherence with `worktree.allocated`.
+
+**`worktree.conflict` v1** — emitted instead of double-tracking; exactly one per collision (adapter obligation), each logged fact folded once (reducer obligation, I3).
+- `path: string` — the contested **canonicalized registry key** (the path as registered, not the colliding spelling).
+- `claimed_path?: string` — the colliding claim as observed, pre-canonicalization, present when it differs from `path`. Triage evidence: names the spelling that collided without a registry read.
+- `holder?: "rezidnt" | "human"` — allocator recorded on the standing registry entry at collision time, making the fact self-contained for triage. (Named `holder`, not `allocator`: on this subject "allocator" would be ambiguous between the entry's holder and the out-of-band claimant.)
+
+**`worktree.released` v1**
+- `path: string` — canonicalized registry key; byte-identical to the spelling the allocation minted (both are canonicalized, so the strings agree — the release fact closes exactly the entry the allocated fact opened).
+- `branch?: string` — branch the worktree carried, when it had one. Additive; lets a consumer of the release fact alone know what went away, family coherence with `worktree.allocated`.
+
+**`diff.ready` v1** — I2 contract: the diff summary is a CAS ref, never inline diff bytes.
+- `worktree: string` — canonicalized path of the worktree the diff concerns (the same registry key `worktree.allocated` minted).
+- `diff: CasRef` — the diff summary persisted to the CAS; resolvable at emission time. `mime` is `text/x-diff` (DEFAULT, not load-bearing); a real tree change yields a non-empty summary (`bytes > 0`).
+
 ## Changelog
 
 - 2026-07-16 · warden · bootstrap: taxonomy v0 transcribed from architecture doc v0.2 Appendix B; DR-001 additions `agent.tool.invoked` and `agent.message` (native harness telemetry); DR-001 scope note on `worktree.observed`/`worktree.conflict` (out-of-band guard only, rezidnt sole allocator); all subjects minted at `v = 1`.
 - 2026-07-16 · warden · S1 payload ratification: v1 payload baselines recorded for `workspace.opened`, `workspace.spec.applied`, `worktree.allocated`, `agent.spawned`, `agent.status.changed`, `agent.completed`, `agent.signaled`, `agent.tool.invoked`, `agent.message`, `artifact.captured` — additive documentation of shape, every subject stays `v = 1`; `artifact.captured` sketch normalized (top-level `mime`/`bytes` subsumed into `ref: CasRef`); capture chunks ride `artifact.captured` via `provenance.kind = "capture-chunk"` + `provenance.chunk`, dedicated capture subject deferred and flagged for `/dr`.
+- 2026-07-17 · warden · S2 payload ratification: v1 payload baselines recorded for `worktree.observed`, `worktree.conflict`, `worktree.released`, `diff.ready` — strict supersets of the S2 oracle-pinned minimums (adapter tests, `s2_worktrees.rs` reducer tests, `spec/fixtures/s2_*.jsonl`); additive-only, every subject stays `v = 1`, no reducer/fixture changes required. Additive fields beyond the pinned minimum: `branch?` on observed/released, `claimed_path?` + `holder?` on conflict. Open items left tracked, not expanded: `daemon.warning` payload ratification, `badge.issued` emit-or-drop, capture-chunk subject (still flagged for `/dr`).

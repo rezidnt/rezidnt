@@ -1,0 +1,3 @@
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WB0","ts":"2026-07-17T13:00:00Z","v":1,"source":"git-adapter","subject":"worktree.allocated","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C01","payload":{"path":"/repos/demo/wt-diff","branch":"feat/diff","allocator":"rezidnt"}}
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WB1","ts":"2026-07-17T13:00:01Z","v":1,"source":"git-adapter","subject":"diff.ready","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C01","payload":{"worktree":"/repos/demo/wt-diff","diff":{"hash":"1ab3527d9d9d02b7f089a4380fc5e83ce57e77eac00a70b773eb521539d2360f","bytes":20,"mime":"text/x-diff"}}}
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WB2","ts":"2026-07-17T13:00:02Z","v":1,"source":"git-adapter","subject":"worktree.released","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C01","payload":{"path":"/repos/demo/wt-diff"}}

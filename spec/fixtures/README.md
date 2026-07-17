@@ -26,6 +26,8 @@ independently of the implementation — they are the oracle, not its echo.
 | `s0_chain_tamper.jsonl` | tamper-evidence — row 4's payload was edited after the chain was written; verification must name seq 4 |
 | `s0_envelope_additive.jsonl` | unknown envelope/payload fields never break deserialization |
 | `s1_agent_run.jsonl` (+ `.expected.json`) | S1 agent-run reducers: `agent.spawned` / `agent.status.changed` / `agent.completed` fold into `agent_runs` keyed by payload `run` — status transitions plus dossier accounting (cost, tokens, session id) |
+| `s2_worktree_conflict.jsonl` (+ `.expected.json`) | S2 sole-allocator guard (DR-001): `worktree.allocated` / `worktree.observed` (human) / `worktree.conflict` fold into `worktrees` keyed by canonicalized path — one logged collision counts once, the first claim is never double-tracked |
+| `s2_diff_ready.jsonl` (+ `.expected.json`) | S2 worktree lifecycle: allocate → `diff.ready` (summary as CAS ref, I2) → release; `last_diff` pins the ref hash, release closes the entry. The diff ref is a REAL blake3: hash of the 20-byte preimage `M\toracle_change.txt\n`, computed with the reference blake3 crate independently of any rezidnt code |
 | `transcripts/` | recorded claude-code stream-json for the adapter contract — see `transcripts/README.md` for provenance |
 
 Regenerating or editing a fixture is an oracle act: expected values must be

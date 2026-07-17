@@ -1,0 +1,27 @@
+{
+  "events_folded": 3,
+  "last_event": "01BSZ3NDEKTSV4RRFFQ69G5WA2",
+  "counts_by_subject": {
+    "worktree.allocated": 1,
+    "worktree.conflict": 1,
+    "worktree.observed": 1
+  },
+  "workspaces": {},
+  "agent_runs": {},
+  "worktrees": {
+    "/repos/demo/wt-feat": {
+      "status": "allocated",
+      "branch": "feat/s2",
+      "allocator": "rezidnt",
+      "conflicts": 1,
+      "last_diff": null
+    },
+    "/repos/demo/wt-human": {
+      "status": "observed",
+      "branch": null,
+      "allocator": "human",
+      "conflicts": 0,
+      "last_diff": null
+    }
+  }
+}

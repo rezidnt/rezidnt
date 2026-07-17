@@ -1,0 +1,20 @@
+{
+  "events_folded": 3,
+  "last_event": "01BSZ3NDEKTSV4RRFFQ69G5WB2",
+  "counts_by_subject": {
+    "diff.ready": 1,
+    "worktree.allocated": 1,
+    "worktree.released": 1
+  },
+  "workspaces": {},
+  "agent_runs": {},
+  "worktrees": {
+    "/repos/demo/wt-diff": {
+      "status": "released",
+      "branch": "feat/diff",
+      "allocator": "rezidnt",
+      "conflicts": 0,
+      "last_diff": "1ab3527d9d9d02b7f089a4380fc5e83ce57e77eac00a70b773eb521539d2360f"
+    }
+  }
+}

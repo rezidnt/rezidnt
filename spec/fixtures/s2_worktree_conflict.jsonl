@@ -1,0 +1,3 @@
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WA0","ts":"2026-07-17T12:00:00Z","v":1,"source":"git-adapter","subject":"worktree.allocated","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C00","payload":{"path":"/repos/demo/wt-feat","branch":"feat/s2","allocator":"rezidnt"}}
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WA1","ts":"2026-07-17T12:00:01Z","v":1,"source":"git-adapter","subject":"worktree.observed","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C00","payload":{"path":"/repos/demo/wt-human","allocator":"human"}}
+{"id":"01BSZ3NDEKTSV4RRFFQ69G5WA2","ts":"2026-07-17T12:00:02Z","v":1,"source":"git-adapter","subject":"worktree.conflict","correlation":"01BSZ3NDEKTSV4RRFFQ69G5C00","payload":{"path":"/repos/demo/wt-feat"}}

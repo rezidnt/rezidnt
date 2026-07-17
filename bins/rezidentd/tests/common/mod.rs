@@ -110,22 +110,12 @@ pub fn read_until(
     );
 }
 
-/// A temp project: git repo + stub harness script + §13 spec pointing at both.
-/// The script emits fake stream-json with `gap_ms` between lines, so tests can
-/// hold a run open long enough to kill clients around it.
-pub fn make_project(gap_ms: u64) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path().join("repo");
-    std::fs::create_dir(&repo).expect("mkdir repo");
-    let git = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo)
-        .status()
-        .expect("git init");
-    assert!(git.success());
-
+/// Write the stub harness script into `dir` and return its path. The script
+/// emits fake stream-json with `gap_ms` between lines, so tests can hold a
+/// run open long enough to kill clients (or daemons) around it.
+pub fn stub_harness(dir: &Path, gap_ms: u64) -> PathBuf {
     let gap_s = gap_ms as f64 / 1000.0;
-    let script = dir.path().join("harness.sh");
+    let script = dir.join("harness.sh");
     std::fs::write(
         &script,
         format!(
@@ -143,6 +133,22 @@ echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"dura
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// A temp project: git repo + stub harness script + §13 spec pointing at both.
+pub fn make_project(gap_ms: u64) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).expect("mkdir repo");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .expect("git init");
+    assert!(git.success());
+
+    let script = stub_harness(dir.path(), gap_ms);
 
     let spec = format!(
         r#"[project]
@@ -216,6 +222,31 @@ pub fn start_daemon_with_mcp(seed_fixture: Option<&str>) -> (DaemonGuard, PathBu
         },
         lockfile,
     )
+}
+
+/// Restart the daemon over the SAME db/socket/lockfile paths — a real
+/// restart: process memory is gone (SIGKILL, the S0 precedent), the log
+/// survives. The old socket and lockfile are removed BEFORE the respawn so a
+/// caller waiting on them observes the new process, never a stale artifact.
+pub fn restart_daemon_with_mcp(guard: &mut DaemonGuard, lockfile: &Path) {
+    let _ = guard.child.kill();
+    let _ = guard.child.wait();
+    let _ = std::fs::remove_file(&guard.socket);
+    let _ = std::fs::remove_file(lockfile);
+    guard.child = Command::new(env!("CARGO_BIN_EXE_rezidentd"))
+        .env("REZIDNT_SOCKET", &guard.socket)
+        .env("REZIDNT_DB", &guard.db)
+        .env("REZIDNT_MCP_LOCKFILE", lockfile)
+        .spawn()
+        .expect("respawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !guard.socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "restarted daemon socket never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Wait for the MCP lockfile to appear and parse (S3: port 0 is announced

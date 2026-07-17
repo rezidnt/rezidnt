@@ -25,10 +25,12 @@
 //!   `release_worktree` closes (removes) the entry.
 //! - **On-open reconciliation scan (S2 remediation):** [`GitAdapter::open`]
 //!   compares the reloaded registry against `git worktree list --porcelain`.
-//!   Intact rezidnt allocations (registered branch matches the checkout) are
-//!   rebuilt live — releasable under their persisted id, re-watched; a
-//!   mismatched checkout on a rezidnt-registered path is a human takeover,
-//!   surfaced as exactly one `worktree.conflict` forever; unregistered linked
+//!   Intact rezidnt allocations (the private-gitdir identity marker carries
+//!   the registered [`WorktreeId`] — branch is NOT identity, S2-T3) are
+//!   rebuilt live — releasable under their persisted id, re-watched; a tree
+//!   without (or with a mismatched) marker on a rezidnt-registered path is a
+//!   takeover, surfaced as exactly one `worktree.conflict` forever;
+//!   unregistered linked
 //!   trees are discovered through the same dedup path as
 //!   [`GitAdapter::observe`]. Scan facts ride the broadcast and are pinned
 //!   via [`GitAdapter::startup_facts`].
@@ -75,6 +77,15 @@ pub const SOURCE_ID: &str = "git-adapter";
 
 /// Sole-allocator worktree registry file, relative to the repo root (DR-001).
 pub const REGISTRY_PATH: &str = ".rezidnt/worktrees";
+
+/// Identity-marker filename inside a worktree's PRIVATE gitdir
+/// (`<repo>/.git/worktrees/<name>/`), carrying the persisted [`WorktreeId`]
+/// (pre-S4 remediation, S2-T3). The location is the honest discriminator:
+/// it survives every in-tree operation (checkout/switch/commit), never rides
+/// the working tree or its diffs, and is destroyed by `git worktree remove` —
+/// so a foreign re-add at the same path/branch has no marker and is detected,
+/// while an occupant branch switch keeps it intact. DEFAULT mechanism.
+const IDENTITY_MARKER: &str = "rezidnt-worktree-id";
 
 /// Fan-out capacity of the adapter's fact stream (DEFAULT). Fabric delivery
 /// rules apply: a lagged subscriber resyncs from the log, never pretends
@@ -361,12 +372,15 @@ impl GitAdapter {
     /// lock:
     ///
     /// 1. **Registry → reality.** Every reloaded `"rezidnt"` entry is checked
-    ///    against the actual checkout ([`GitAdapter::list_linked_worktrees`]).
-    ///    Registered branch matches → rezidnt's own intact tree: the
-    ///    allocation is rebuilt live (releasable under its persisted
-    ///    [`WorktreeId`], re-watched) and is not news. Mismatch → a human
-    ///    tree occupies the registered path: exactly one `worktree.conflict`,
-    ///    with the persisted `conflicted` flag making "once" mean forever.
+    ///    against the tree actually at its path
+    ///    ([`GitAdapter::list_linked_worktrees`]) via the private-gitdir
+    ///    identity marker (S2-T3: branch is not identity). Marker carries the
+    ///    registered [`WorktreeId`] → rezidnt's own intact tree: the
+    ///    allocation is rebuilt live (releasable under its persisted id,
+    ///    re-watched) and is not news. Marker missing or mismatched → a
+    ///    foreign tree occupies the registered path: exactly one
+    ///    `worktree.conflict`, with the persisted `conflicted` flag making
+    ///    "once" mean forever.
     ///    Missing from git entirely → logged, entry retained (unpinned).
     ///    `"human"` entries are already-observed by definition — never news.
     /// 2. **Reality → registry.** Linked worktrees git reports that the
@@ -400,7 +414,33 @@ impl GitAdapter {
                     );
                     continue;
                 };
-                if tree.branch == entry.branch {
+                // Identity probe (S2-T3): the discriminator is the persisted
+                // WorktreeId marker in the tree's private gitdir, never the
+                // branch — an occupant switching HEAD keeps the marker (not a
+                // takeover); a foreign re-add at the same path/branch lacks
+                // it (a takeover branch equality would hide).
+                let intact = if entry.id.is_some() {
+                    match self.read_identity_marker(&tree.path).await {
+                        Ok(marker) => marker == entry.id,
+                        Err(e) => {
+                            // Uninterrogable tree: cannot verify either way —
+                            // retained without a fact (mirrors missing-from-
+                            // git handling; unpinned).
+                            tracing::warn!(
+                                path = %key,
+                                error = %e,
+                                "worktree identity unverifiable; entry retained"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Legacy line without an id (migration default): no
+                    // marker was ever written, so branch comparison remains
+                    // the only available discriminator.
+                    tree.branch == entry.branch
+                };
+                if intact {
                     // rezidnt's own intact tree: rebuild the live allocation
                     // under its persisted identity.
                     let Some(id) = entry.id else {
@@ -631,6 +671,48 @@ impl GitAdapter {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Resolve a worktree's PRIVATE gitdir (`<repo>/.git/worktrees/<name>/`
+    /// for a linked tree) from inside the tree. This is where the identity
+    /// marker lives — never in the working tree itself.
+    async fn worktree_gitdir(&self, tree: &Path) -> Result<PathBuf, GitError> {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(cli_path(tree))
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(GitError::Git(format!(
+                "git rev-parse --absolute-git-dir in {} failed ({}): {}",
+                tree.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
+    }
+
+    /// Write the identity marker for a freshly allocated worktree.
+    async fn write_identity_marker(&self, tree: &Path, id: WorktreeId) -> Result<(), GitError> {
+        let gitdir = self.worktree_gitdir(tree).await?;
+        tokio::fs::write(gitdir.join(IDENTITY_MARKER), id.ulid().to_string()).await?;
+        Ok(())
+    }
+
+    /// Read the identity marker of the tree currently at `tree`, if any.
+    /// `Ok(None)` means no marker (or an unparsable one) — a tree rezidnt did
+    /// not allocate. `Err` means the tree could not be interrogated at all.
+    async fn read_identity_marker(&self, tree: &Path) -> Result<Option<WorktreeId>, GitError> {
+        let gitdir = self.worktree_gitdir(tree).await?;
+        match tokio::fs::read_to_string(gitdir.join(IDENTITY_MARKER)).await {
+            Ok(text) => Ok(Ulid::from_string(text.trim()).ok().map(WorktreeId::new)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Start the notify watch on an allocated tree and spawn its debounce
     /// loop. The returned watcher must be kept alive with the allocation.
     fn spawn_watcher(
@@ -708,6 +790,12 @@ impl RepoSubstrate for GitAdapter {
                 )));
             }
 
+            // Mint the identity and stamp it into the tree's private gitdir
+            // BEFORE the fact is emitted: a tree without a marker was never
+            // a rezidnt allocation (S2-T3 identity discriminator).
+            let id = WorktreeId::new(Ulid::new());
+            self.write_identity_marker(&canonical, id).await?;
+
             let mut payload = serde_json::Map::new();
             payload.insert("path".into(), Value::String(canonical_str.clone()));
             if let Some(branch) = &req.branch {
@@ -723,7 +811,6 @@ impl RepoSubstrate for GitAdapter {
             // allocated event id (S2 remediation) — minted just above so one
             // persist suffices — making the allocation releasable and its
             // causal chain recoverable across restart.
-            let id = WorktreeId::new(Ulid::new());
             state.registry.insert(
                 canonical_str.clone(),
                 RegistryEntry {

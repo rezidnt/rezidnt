@@ -15,6 +15,10 @@ use ulid::Ulid;
 
 use crate::runs::{Daemon, begin_open, launch_agent};
 
+/// Ontology cap on `agent.spawned.idempotency_key` (DEFAULT, ratified
+/// 2026-07-17): a key is a short opaque token, trivially inside I2.
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
+
 /// Bridges [`McpSubstrate`] onto the daemon's run substrate.
 pub struct McpBridge {
     pub daemon: Arc<Daemon>,
@@ -51,6 +55,19 @@ impl McpSubstrate for McpBridge {
                     format!("workspace {workspace:?} is not a ULID"),
                 )
             })?;
+
+            // Ontology constraint on `agent.spawned.idempotency_key` (v1,
+            // additive 2026-07-17): non-empty, ≤ 256 bytes UTF-8 — enforced
+            // before any effect so a refused spawn leaves the log untouched.
+            if idempotency_key.is_empty() || idempotency_key.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+                return Err(ToolRefusal::new(
+                    codes::ARGS_INVALID,
+                    format!(
+                        "idempotency_key must be non-empty and at most \
+                         {IDEMPOTENCY_KEY_MAX_BYTES} bytes UTF-8"
+                    ),
+                ));
+            }
 
             // The registry lock is held across the whole spawn: a concurrent
             // retry with the same key waits here and then hits the key map —
@@ -93,6 +110,10 @@ impl McpSubstrate for McpBridge {
                 WorkspaceId::new(ws),
                 Ulid::new(),
                 None,
+                // Recorded on the agent.spawned payload so the key→run map is
+                // log-derivable across restart (I3; envelope workspace is set
+                // by launch_agent, the ontology's keyed-spawn obligation).
+                Some(&idempotency_key),
             )
             .await
             .map_err(|e| ToolRefusal::new(codes::SPAWN_FAILED, format!("{e:#}")))?;

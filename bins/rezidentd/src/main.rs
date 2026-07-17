@@ -61,7 +61,7 @@ mod unix_daemon {
     use tokio::net::{UnixListener, UnixStream};
     use tracing::Instrument;
 
-    use crate::runs::{Daemon, RunRegistry, begin_open, serve_attach};
+    use crate::runs::{Daemon, RunRegistry, begin_open, rebuild_workspaces, serve_attach};
 
     /// Broadcast ring size (DEFAULT). Sized for control-plane volume (doc §5:
     /// facts and refs only); an overflowing subscriber takes the BINDING
@@ -176,6 +176,14 @@ mod unix_daemon {
             .context("cas open task panicked")??
         };
         let daemon = Arc::new(Daemon::new(fabric, cas, Arc::new(RunRegistry::default())));
+
+        // S3-T1 remediation (I3): the open-workspace map is derived state —
+        // rebuild it from log + CAS BEFORE any transport can serve a
+        // `spawn_agent`, so a restart on the same log answers for every
+        // workspace the log says is open (and for every recorded spawn key).
+        rebuild_workspaces(&daemon)
+            .await
+            .context("rebuild open-workspace map from log")?;
 
         // S3 (doc §9, I5): the loopback-HTTP MCP transport, requested via
         // REZIDNT_MCP_LOCKFILE. Bound at 127.0.0.1:0; the REAL port plus the

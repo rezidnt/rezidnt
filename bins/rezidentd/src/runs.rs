@@ -153,6 +153,101 @@ impl Daemon {
     }
 }
 
+/// Rebuild the open-workspace map from log + CAS at daemon startup (S3-T1
+/// remediation, I3: the map is derived state and anything that cannot be
+/// rebuilt from log + CAS is misdesigned). Eager rather than lazy: one
+/// blocking scan before the transports come up keeps the spawn path simple
+/// and never holds the daemon-wide workspaces lock across a log read — the
+/// same restart-derived-state pattern as the S2 git adapter's
+/// reconcile-on-open.
+pub async fn rebuild_workspaces(daemon: &Arc<Daemon>) -> anyhow::Result<()> {
+    let fabric = Arc::clone(&daemon.fabric);
+    let cas = Arc::clone(&daemon.cas);
+    let rebuilt = tokio::task::spawn_blocking(move || fold_workspaces(&fabric, &cas))
+        .await
+        .context("workspace rebuild task panicked")??;
+    let count = rebuilt.len();
+    let mut workspaces = daemon.workspaces.lock().await;
+    for (ws, entry) in rebuilt {
+        workspaces.entry(ws).or_insert(entry);
+    }
+    drop(workspaces);
+    tracing::info!(workspaces = count, "open-workspace map rebuilt from log");
+    Ok(())
+}
+
+/// The pure fold behind [`rebuild_workspaces`]: `workspace.opened` opens an
+/// entry (root from the payload); `workspace.spec.applied` resolves the
+/// applied spec TOML from the CAS and fills the agent list; a keyed
+/// `agent.spawned` rebuilds the §9 idempotency map, scoped to the envelope
+/// `workspace` per the ontology. A ghost open (acked but `workspace.opened`
+/// never reached the log) is absent by construction.
+fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, OpenedWorkspace>> {
+    let mut map: HashMap<Ulid, OpenedWorkspace> = HashMap::new();
+    let events = fabric
+        .replay_since(None)
+        .context("replay log for workspace rebuild")?;
+    for event in events {
+        let Some(ws) = event.workspace else {
+            continue;
+        };
+        let ws = ws.ulid();
+        match event.subject.as_str() {
+            "workspace.opened" => {
+                let Some(root) = event.payload()["root"].as_str() else {
+                    continue;
+                };
+                map.insert(
+                    ws,
+                    OpenedWorkspace {
+                        root: PathBuf::from(root),
+                        agents: Vec::new(),
+                        spawn_keys: HashMap::new(),
+                    },
+                );
+            }
+            "workspace.spec.applied" => {
+                let Some(entry) = map.get_mut(&ws) else {
+                    continue;
+                };
+                let spec_ref = serde_json::from_value::<rezidnt_types::refs::CasRef>(
+                    event.payload()["spec_ref"].clone(),
+                );
+                let spec = spec_ref
+                    .ok()
+                    .and_then(|r| cas.get(&r).ok())
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(|toml| ProjectSpec::from_toml_str(&toml).ok());
+                match spec {
+                    Some(spec) => entry.agents = spec.agents,
+                    // Degraded, never fatal: the workspace stays open with no
+                    // spawnable agents; spawn answers agent.unknown.
+                    None => tracing::warn!(
+                        workspace = %ws,
+                        "applied spec unresolvable from CAS; agents not rebuilt"
+                    ),
+                }
+            }
+            "agent.spawned" => {
+                let payload = event.payload();
+                let (Some(key), Some(run)) =
+                    (payload["idempotency_key"].as_str(), payload["run"].as_str())
+                else {
+                    continue; // keyless spawns never enter the key map
+                };
+                let Ok(run) = Ulid::from_string(run) else {
+                    continue;
+                };
+                if let Some(entry) = map.get_mut(&ws) {
+                    entry.spawn_keys.insert(key.to_string(), run);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(map)
+}
+
 /// Publish one event off the async threads (SQLite append is blocking);
 /// returns the event id for causation chaining.
 async fn publish(fabric: &Arc<Fabric>, event: Event) -> anyhow::Result<Ulid> {
@@ -278,6 +373,11 @@ async fn materialize_open(
 ) {
     if let Err(e) = try_materialize_open(&daemon, spec, &spec_toml, workspace, correlation).await {
         tracing::warn!(error = %e, "open materialization failed");
+        // Ghost-workspace closure (S3-T2): the entry was registered pre-ack,
+        // but `workspace.opened` never reached the log — evict it so
+        // `spawn_agent` answers `workspace.unknown` instead of minting
+        // `agent.spawned` facts for a workspace the log never opened (I3).
+        daemon.workspaces.lock().await.remove(&workspace.ulid());
         warn_open_failed(&daemon, &format!("{e:#}")).await;
     }
 }
@@ -348,6 +448,9 @@ async fn try_materialize_open(
             workspace,
             correlation,
             Some(applied_id),
+            // Spec-driven open-chain spawns are keyless (ontology: the key is
+            // never synthesized).
+            None,
         )
         .await
         .with_context(|| format!("launch agent {:?}", agent.name))?;
@@ -358,6 +461,10 @@ async fn try_materialize_open(
 /// Allocate a worktree and spawn one agent under capture; returns the minted
 /// run id. `causation` is the triggering fact (`workspace.spec.applied` on
 /// the open chain; `None` for a standalone MCP `spawn_agent`).
+/// `idempotency_key` is the caller-supplied spawn key, recorded on the
+/// `agent.spawned` payload so the key→run map is log-derivable (I3; ontology
+/// v1 additive field, ratified 2026-07-17) — `None` for keyless paths (socket
+/// `open` chain), never synthesized.
 pub async fn launch_agent(
     daemon: &Arc<Daemon>,
     agent: &AgentSpec,
@@ -365,6 +472,7 @@ pub async fn launch_agent(
     workspace: WorkspaceId,
     correlation: Ulid,
     causation: Option<Ulid>,
+    idempotency_key: Option<&str>,
 ) -> anyhow::Result<RunId> {
     let run = RunId::new(Ulid::new());
 
@@ -412,6 +520,9 @@ pub async fn launch_agent(
     });
     if let (Some(pid), Some(obj)) = (child.id(), spawned_payload.as_object_mut()) {
         obj.insert("pid".to_string(), json!(pid));
+    }
+    if let (Some(key), Some(obj)) = (idempotency_key, spawned_payload.as_object_mut()) {
+        obj.insert("idempotency_key".to_string(), json!(key));
     }
 
     // Register BEFORE the fact hits the fabric: a client that sees

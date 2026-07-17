@@ -6,6 +6,10 @@ license.workspace = true
 description = "rezidnt event envelope, subjects, and entity id newtypes (doc §5)"
 
 [dependencies]
+# schemars (S3 oracle): doc §9 BINDING — MCP tool JSON Schemas are generated
+# from THIS crate via schemars, so the served surface and the published types
+# can never drift. The derive lives on the `mcp` tool-arg shapes.
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

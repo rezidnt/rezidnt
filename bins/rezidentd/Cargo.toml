@@ -24,3 +24,8 @@ ulid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
+# S3 oracle board: the gate_explain daemon test PRE-SEEDS the event db with a
+# golden fixture (the "forced failure" is a stub verdict ON THE LOG, doc §8 /
+# I3) — seeding goes through the real EventLog so the chain column is honest.
+rezidnt-fabric.workspace = true
+rezidnt-types.workspace = true

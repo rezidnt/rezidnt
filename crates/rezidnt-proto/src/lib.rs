@@ -96,6 +96,65 @@ pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
     Ok(serde_json::from_str(line)?)
 }
 
+/// Machine-readable error codes on [`Reply::Error`] frames (S3 board).
+/// Strings, not an enum, so peers built against an older proto still parse
+/// codes they do not know (additive evolution).
+pub mod codes {
+    /// `attach` named a run the daemon does not know.
+    pub const RUN_UNKNOWN: &str = "run.unknown";
+    /// `open` carried a spec that failed to parse/validate (§13).
+    pub const SPEC_INVALID: &str = "spec.invalid";
+}
+
+/// Request-scoped reply frame (S3 proto addition, parked from S2).
+///
+/// Requests are one-per-connection, so "request-scoped" means: the FIRST
+/// frame the daemon writes after reading a `Request` (and after the hello)
+/// answers THAT request on THAT connection — an ack or a machine-readable
+/// error, never a silent stream start and never a bare disconnect.
+///
+/// Wire pins (daemon-side emission is verified red by
+/// `bins/rezidentd/tests/attach_and_ack.rs`):
+/// - `open` success → `{"reply":"open_ok","workspace":"<ulid>","correlation":"<ulid>"}`
+///   where `correlation` is the causal-chain id every materialization fact of
+///   this open carries (ties the ack to the log);
+/// - any failure → `{"reply":"error","op":"<request op>","code":"<codes::*>",
+///   "message":"…"}` with `run` echoed for attach errors.
+///
+/// The type layer is real (serde is not the thing under test); this is a
+/// pinned wire shape, additive-evolution rules as everywhere else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case")]
+pub enum Reply {
+    /// The open succeeded: the workspace exists and its materialization
+    /// facts (all carrying `correlation`) are on the fabric.
+    OpenOk {
+        workspace: ulid::Ulid,
+        correlation: ulid::Ulid,
+    },
+    /// The request failed. `code` is machine-readable ([`codes`]).
+    Error {
+        /// The request op this error answers (`"open"`, `"attach"`, …).
+        op: String,
+        code: String,
+        /// Human-facing detail; never required for programmatic handling.
+        message: String,
+        /// Echoed run id for attach errors.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<ulid::Ulid>,
+    },
+}
+
+/// Encode a reply as one JSONL frame (single line, no trailing newline).
+pub fn encode_reply(reply: &Reply) -> Result<String, ProtoError> {
+    Ok(serde_json::to_string(reply)?)
+}
+
+/// Decode a reply frame. Unknown fields tolerated (additive evolution).
+pub fn decode_reply(line: &str) -> Result<Reply, ProtoError> {
+    Ok(serde_json::from_str(line)?)
+}
+
 /// Pure socket-path resolution (testable without touching the process env):
 /// `Some(xdg_runtime_dir)` → `<xdg>/rezidnt.sock`; otherwise
 /// `<home>/.local/state/rezidnt/rezidnt.sock` (doc §9 fallback).

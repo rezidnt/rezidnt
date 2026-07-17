@@ -8,6 +8,7 @@ members = [
     "crates/rezidnt-cas",
     "crates/rezidnt-run",
     "crates/rezidnt-adapters/git",
+    "crates/rezidnt-mcp",
     "bins/rezidentd",
     "bins/rezidnt",
 ]
@@ -26,6 +27,20 @@ rezidnt-proto = { path = "crates/rezidnt-proto" }
 rezidnt-cas = { path = "crates/rezidnt-cas" }
 rezidnt-run = { path = "crates/rezidnt-run" }
 rezidnt-adapter-git = { path = "crates/rezidnt-adapters/git" }
+rezidnt-mcp = { path = "crates/rezidnt-mcp" }
+
+# dependency notes by the oracle (S3):
+# - schemars: doc §9 BINDING — every MCP tool's JSON Schema is generated from
+#   rezidnt-types via schemars so the surface and the types can never drift.
+#   Declared in rezidnt-types (derive on the tool-arg shapes) and used by the
+#   no-drift oracle tests. In the approved set by force of §9.
+# - rmcp: pre-approved for EVALUATION per §16/Appendix A ("verify at S3").
+#   Verified 2026-07-17: rmcp 2.2.0 on crates.io, Apache-2.0, official
+#   modelcontextprotocol/rust-sdk, server feature present (and itself
+#   schemars-backed). Deliberately NOT declared in the oracle skeleton (S2
+#   precedent: adapter deps land with the implementer); the board pins
+#   JSON-RPC messages in/out, so a thin hand-rolled layer also satisfies it.
+schemars = { version = "1", features = ["derive"] }
 
 # dependency notes by the oracle (S2) — nothing NEW flagged: gix (reads) and
 # notify (watcher) are already in the approved set (rust-conventions) and are

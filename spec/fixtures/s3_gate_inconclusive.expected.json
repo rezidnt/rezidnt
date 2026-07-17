@@ -1,0 +1,10 @@
+{
+  "events_folded": 2,
+  "last_event": "01S3GATE1NC0NC000000000E02",
+  "counts_by_subject": {
+    "gate.entered": 1,
+    "gate.inconclusive": 1
+  },
+  "workspaces": {},
+  "agent_runs": {}
+}

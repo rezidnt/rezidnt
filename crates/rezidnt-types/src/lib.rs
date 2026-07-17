@@ -7,6 +7,7 @@
 //! S0 oracle note: constructors and wire codecs are `todo!()` stubs. The
 //! failing tests in `tests/envelope.rs` are the implementer's work order.
 
+pub mod mcp;
 pub mod refs;
 pub mod taxonomy;
 

@@ -1,0 +1,15 @@
+{
+  "events_folded": 3,
+  "last_event": "01S3GATEFA1DED000000000E03",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "gate.entered": 1,
+    "gate.failed": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01S3GATEFA1DED000000000R01": {
+      "status": "spawning"
+    }
+  }
+}

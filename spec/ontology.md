@@ -115,6 +115,8 @@ WARN and above from `tracing` are mirrored onto the fabric as `daemon.*` events 
 
 ### badge
 
+**Operator badge (S3 note):** doc §12 badges are per-`AgentRun` capability tokens; S3 additionally mints one daemon-lifetime **operator badge** for local human clients, announced via the 0600 MCP lockfile (`{pid, port, url, badge}`) — possession of the file is possession of the capability. This is a §12/DEFAULT security-layer reading, pinned by the S3 board; the lockfile shape itself is discovery metadata, **not fabric surface**, and is documented at doc level (scribe scope). The concept is blessed here only insofar as `badge.*` semantics must eventually accommodate a badge scoped to the daemon lifetime rather than a run — folded into the open `badge.issued` emit-or-drop question below.
+
 | Subject | v | Emitter | Semantics |
 |---|---|---|---|
 | `badge.issued` | 1 | daemon (security layer) | A per-run capability badge was minted: 256-bit token scoped to `{workspace, verb set, expiry}` (doc §12), injected at spawn (DR-001). Makes an agent's writes attributable in the log. |
@@ -199,8 +201,31 @@ Ratified per-subject payload shapes. A field marked `?` is optional and may be a
 - `worktree: string` — canonicalized path of the worktree the diff concerns (the same registry key `worktree.allocated` minted).
 - `diff: CasRef` — the diff summary persisted to the CAS; resolvable at emission time. `mime` is `text/x-diff` (DEFAULT, not load-bearing); a real tree change yields a non-empty summary (`bytes > 0`).
 
+### S3 set (ratified 2026-07-17)
+
+Strict supersets of the S3 oracle pins (`rezidnt-mcp/tests/gate_explain.rs`, `bins/rezidentd/tests/mcp_http.rs`, `spec/fixtures/s3_gate_forced_failure.jsonl`, `s3_gate_inconclusive.jsonl`). The verdict is carried by the **subject itself** (`gate.failed` → `fail`) — never a bare boolean field, and `inconclusive` is never coerced (I6). The full verifier engine is S4; these baselines cover exactly what S3's forced-failure / `gate_explain` slice emits and interrogates, and S4 extends them additively (e.g. network-opt-in recording, `cost_ms`). `gate.passed` has no S3 emitter or pin and its baseline is deliberately **not** ratified here — S4 scope.
+
+**`gate.entered` v1** — the envelope `correlation` groups the gate run (doc §5); `causation` on subsequent verdict facts points back at this fact.
+- `run: string` — RunId ULID; the key every gate fact carries.
+- `gate: string` — the named policy point (`vet`, `pre_merge`, `post_run`); a string, not a closed enum — gate defs are named policy points (doc §8).
+
+**`gate.failed` v1**
+- `run: string`, `gate: string` — as `gate.entered`.
+- `verifier: string` — the **failing** verifier's name (doc §8; exactly what `gate_explain` must return).
+- `evidence: [CasRef]` — evidence blobs live in the CAS; the fact carries refs only (I2, doc §8 BINDING).
+- `inputs: object` — the exact verifier input document, recorded **verbatim** (doc §8 stdin contract: `{gate, refs, params, timeout_ms}`; `refs` values are `cas:blake3:<hex>` strings — inputs pinned by content hash, per the determinism BINDING). Deliberately an opaque-but-recorded object, not a decomposed schema: `gate_explain` returns it byte-for-byte from the log (I6 interrogability), and the S4 engine widens the document additively without a payload break here.
+
+**`gate.inconclusive` v1** — same shape as `gate.failed` plus `reason`; routed to a human, never coerced to `pass` (I6).
+- `run`, `gate`, `verifier`, `evidence: [CasRef]`, `inputs` — exactly as `gate.failed`.
+- `reason: string` — v1 vocabulary from the §8 causes: `timeout | nonzero_exit | malformed_output`; new causes arrive additively as strings.
+
+**`gate.explained` v1** — interrogations are facts too. The explanation content (verifier, evidence, inputs) is **derived** from the verdict fact already on the log (I3) and is not duplicated into this payload.
+- `run: string` — the interrogated run; the pinned minimum is this field alone.
+- `gate?: string`, `verdict?: "pass" | "fail" | "inconclusive"` — optional self-contained triage context; when present, `verdict` is the recorded verdict verbatim (never coerced, I6).
+
 ## Changelog
 
 - 2026-07-16 · warden · bootstrap: taxonomy v0 transcribed from architecture doc v0.2 Appendix B; DR-001 additions `agent.tool.invoked` and `agent.message` (native harness telemetry); DR-001 scope note on `worktree.observed`/`worktree.conflict` (out-of-band guard only, rezidnt sole allocator); all subjects minted at `v = 1`.
 - 2026-07-16 · warden · S1 payload ratification: v1 payload baselines recorded for `workspace.opened`, `workspace.spec.applied`, `worktree.allocated`, `agent.spawned`, `agent.status.changed`, `agent.completed`, `agent.signaled`, `agent.tool.invoked`, `agent.message`, `artifact.captured` — additive documentation of shape, every subject stays `v = 1`; `artifact.captured` sketch normalized (top-level `mime`/`bytes` subsumed into `ref: CasRef`); capture chunks ride `artifact.captured` via `provenance.kind = "capture-chunk"` + `provenance.chunk`, dedicated capture subject deferred and flagged for `/dr`.
 - 2026-07-17 · warden · S2 payload ratification: v1 payload baselines recorded for `worktree.observed`, `worktree.conflict`, `worktree.released`, `diff.ready` — strict supersets of the S2 oracle-pinned minimums (adapter tests, `s2_worktrees.rs` reducer tests, `spec/fixtures/s2_*.jsonl`); additive-only, every subject stays `v = 1`, no reducer/fixture changes required. Additive fields beyond the pinned minimum: `branch?` on observed/released, `claimed_path?` + `holder?` on conflict. Open items left tracked, not expanded: `daemon.warning` payload ratification, `badge.issued` emit-or-drop, capture-chunk subject (still flagged for `/dr`).
+- 2026-07-17 · warden · S3 payload ratification: v1 payload baselines recorded for `gate.entered`, `gate.failed`, `gate.inconclusive`, `gate.explained` — strict supersets of the S3 oracle pins (`gate_explain.rs`, `mcp_http.rs`, `spec/fixtures/s3_gate_*.jsonl`); additive-only, every subject stays `v = 1`, no reducer/fixture/type changes required; verdict carried by the subject, `inputs` recorded verbatim per the §8 stdin contract (I6). `gate.passed` baseline deliberately not ratified (no S3 emitter/pin — S4 scope). Operator-badge concept noted in the badge section as a §12/DEFAULT doc-level matter, not fabric surface. Deferred with reasons: `badge_id` as an additive field on mutation facts (S3 board ties calls to the log via the acked `correlation`; no pin, no consumer — ratifying a cross-subject attribution convention without a folding reducer risks dead-letter fields); `badge.issued` emit-or-drop (no S3 pin or emitter, and the operator badge adds a daemon-lifetime-scope question that should be settled in the same session as the `badge_id` decision). Capture-chunk subject remains tracked and flagged for `/dr` — not resolved here.

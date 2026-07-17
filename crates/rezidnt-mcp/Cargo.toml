@@ -1,0 +1,33 @@
+# S3 MCP surface (doc §9): transport-agnostic JSON-RPC core + stdio and
+# loopback-HTTP transports (port 0, announced via lockfile — never fixed).
+#
+# Dependency notes (rust-conventions: additions get a written note):
+# - rmcp is pre-approved for evaluation (§16 "verify at S3") and VERIFIED to
+#   exist (2.2.0, Apache-2.0, official modelcontextprotocol/rust-sdk). It is
+#   deliberately NOT declared in this oracle skeleton (S2 precedent) — the
+#   board pins JSON-RPC messages in/out, so the implementer may adopt rmcp or
+#   hand-roll a thin layer; either satisfies the red tests.
+# - schemars rides in via rezidnt-types (doc §9 no-drift rule) and as a
+#   dev-dependency here for the round-trip schema oracle.
+[package]
+name = "rezidnt-mcp"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rezidnt-types = { workspace = true }
+rezidnt-fabric = { workspace = true }
+rezidnt-state = { workspace = true }
+rezidnt-run = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "net", "io-util", "time", "rt", "macros", "fs"] }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+schemars = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

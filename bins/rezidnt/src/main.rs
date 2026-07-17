@@ -196,16 +196,15 @@ fn tail(subject: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
-/// `open`: send the spec, then watch the stream for THIS open's facts and
-/// print the pinned one-line identity once `agent.spawned` lands.
+/// `open`: send the spec, read the S3 request-scoped ack (`open_ok` with the
+/// workspace + correlation, or a machine-readable error frame), then watch
+/// the stream for THIS open's facts and print the pinned one-line identity
+/// once `agent.spawned` lands on the acked correlation.
 ///
-/// Discriminating "this open" from replayed history: envelope ids are
-/// time-ordered ULIDs minted by the daemon on the same host (UDS), so a
-/// marker ULID minted client-side before the request separates history
-/// (id ≤ marker) from consequences (id > marker). The chain itself is then
-/// followed by correlation: our `workspace.opened` (matching the spec's
-/// name) names the correlation, and the `agent.spawned` on that correlation
-/// carries the authoritative run id.
+/// The marker ULID (minted client-side before the request) still guards the
+/// `daemon.warning` arm against replayed history: warnings carry their own
+/// correlation, so time-ordering (id > marker) is what scopes them to this
+/// open.
 #[cfg(unix)]
 fn open(name: &str, spec_toml: String) -> anyhow::Result<()> {
     use std::io::BufRead;
@@ -215,7 +214,30 @@ fn open(name: &str, spec_toml: String) -> anyhow::Result<()> {
     let marker = ulid::Ulid::new();
     let mut reader = connect_and_request(&rezidnt_proto::Request::Open { spec_toml })?;
 
-    let mut correlation: Option<ulid::Ulid> = None;
+    // S3: the daemon acks the request FIRST (rezidnt_proto::Reply) — the
+    // acked correlation is the one every materialization fact carries, so
+    // the marker/name inference of the S1 client is gone.
+    let mut ack_line = String::new();
+    loop {
+        ack_line.clear();
+        let n = reader.read_line(&mut ack_line).context("read open ack")?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the stream before acking the open");
+        }
+        if !ack_line.trim().is_empty() {
+            break;
+        }
+    }
+    let correlation =
+        match rezidnt_proto::decode_reply(ack_line.trim_end()).context("decode open ack frame")? {
+            rezidnt_proto::Reply::OpenOk { correlation, .. } => correlation,
+            rezidnt_proto::Reply::Error { code, message, .. } => {
+                // Daemon-side refusal: substrate fault class (§9 → 3).
+                eprintln!("rezidnt: open refused ({code}): {message}");
+                std::process::exit(3);
+            }
+        };
+
     let mut line = String::new();
     loop {
         line.clear();
@@ -232,12 +254,7 @@ fn open(name: &str, spec_toml: String) -> anyhow::Result<()> {
             continue; // replayed history from before this open
         }
         match event.subject.as_str() {
-            "workspace.opened"
-                if correlation.is_none() && event.payload()["name"].as_str() == Some(name) =>
-            {
-                correlation = Some(event.correlation);
-            }
-            "agent.spawned" if correlation == Some(event.correlation) => {
+            "agent.spawned" if event.correlation == correlation => {
                 let run = event.payload()["run"]
                     .as_str()
                     .context("agent.spawned payload carries no run id")?;

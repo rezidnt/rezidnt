@@ -7,6 +7,7 @@
 //! mutating call; the lockfile is 0600, so possession = the local user).
 //! Unknown fields are tolerated (additive evolution, house rule).
 
+use std::io::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -27,14 +28,42 @@ pub struct Lockfile {
     pub badge: String,
 }
 
-/// Write the lockfile atomically, mode 0600 on unix.
+/// Write the lockfile atomically, mode 0600 on unix: the temp file is
+/// CREATED private (never chmodded after the fact — the badge token must
+/// not be world-readable for even a moment), then renamed into place.
 pub fn write_atomic(path: &Path, lockfile: &Lockfile) -> Result<(), McpError> {
-    let _ = (path, lockfile);
-    todo!("S3 implementer: temp file + rename, 0600")
+    let parent = path.parent().ok_or_else(|| {
+        McpError::Lockfile(format!(
+            "lockfile path {} has no parent dir",
+            path.display()
+        ))
+    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            McpError::Lockfile(format!("lockfile path {} has no file name", path.display()))
+        })?
+        .to_string_lossy();
+    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(serde_json::to_string(lockfile)?.as_bytes())?;
+    // Durable before visible: the rename must never expose a torn file.
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Read and parse a lockfile (tolerating unknown fields).
 pub fn read(path: &Path) -> Result<Lockfile, McpError> {
-    let _ = path;
-    todo!("S3 implementer: read + serde parse")
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text)?)
 }

@@ -120,11 +120,37 @@ impl RunRegistry {
     }
 }
 
+/// One opened workspace's daemon-side working state: what `spawn_agent`
+/// needs to launch spec agents after the fact. Derived bookkeeping only —
+/// the log remains the source of record (I3).
+pub struct OpenedWorkspace {
+    /// Repo root as the spec gave it (canonicalized again at use).
+    pub root: PathBuf,
+    pub agents: Vec<AgentSpec>,
+    /// §9 idempotency: key → the run it minted. A retried `spawn_agent` with
+    /// a known key returns this run and spawns nothing new.
+    pub spawn_keys: HashMap<String, Ulid>,
+}
+
 /// Shared daemon context handed to connection and run tasks.
 pub struct Daemon {
     pub fabric: Arc<Fabric>,
     pub cas: Arc<Cas>,
     pub registry: Arc<RunRegistry>,
+    /// Opened workspaces by ULID (tokio mutex: held across the spawn await
+    /// so same-key `spawn_agent` retries can never double-spawn).
+    pub workspaces: tokio::sync::Mutex<HashMap<Ulid, OpenedWorkspace>>,
+}
+
+impl Daemon {
+    pub fn new(fabric: Arc<Fabric>, cas: Arc<Cas>, registry: Arc<RunRegistry>) -> Self {
+        Self {
+            fabric,
+            cas,
+            registry,
+            workspaces: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// Publish one event off the async threads (SQLite append is blocking);
@@ -139,30 +165,120 @@ async fn publish(fabric: &Arc<Fabric>, event: Event) -> anyhow::Result<Ulid> {
     Ok(id)
 }
 
-/// The `rezidnt open` materialization chain (S1 exit criterion). One
-/// correlation ULID spans the whole chain; causation chains each fact to its
-/// trigger. Every failure is traced and mirrored as `daemon.warning` so a
-/// failed open is visible in `tail`, not silent.
-pub async fn materialize_open(daemon: Arc<Daemon>, spec_toml: String) {
-    if let Err(e) = try_materialize_open(&daemon, &spec_toml).await {
-        tracing::warn!(error = %e, "open materialization failed");
-        let warning = Event::new(
-            SourceId::new("daemon"),
-            None,
-            Subject::new("daemon.warning"),
-            Ulid::new(),
-            None,
-            1,
-            json!({"what": "open-failed", "error": format!("{e:#}")}),
-        );
-        match warning {
-            Ok(event) => {
-                if let Err(e) = publish(&daemon.fabric, event).await {
-                    tracing::error!(error = %e, "could not publish open-failure warning");
-                }
+/// A refused `open`: the request never materialized anything. Answered as a
+/// machine-readable `spec.invalid` frame/refusal by the caller (S3 board).
+#[derive(Debug)]
+pub struct OpenRefusal {
+    pub message: String,
+}
+
+/// Emit the `daemon.warning {what: "open-failed"}` fact that keeps a failed
+/// open visible in `tail`, never silent (S1 pin).
+async fn warn_open_failed(daemon: &Arc<Daemon>, error: &str) {
+    let warning = Event::new(
+        SourceId::new("daemon"),
+        None,
+        Subject::new("daemon.warning"),
+        Ulid::new(),
+        None,
+        1,
+        json!({"what": "open-failed", "error": error}),
+    );
+    match warning {
+        Ok(event) => {
+            if let Err(e) = publish(&daemon.fabric, event).await {
+                tracing::error!(error = %e, "could not publish open-failure warning");
             }
-            Err(e) => tracing::error!(error = %e, "could not construct open-failure warning"),
         }
+        Err(e) => tracing::error!(error = %e, "could not construct open-failure warning"),
+    }
+}
+
+/// Begin an `open` (S3 request-scoped ack shape): validate the spec, mint the
+/// workspace + correlation ids, register the workspace for later
+/// `spawn_agent` calls, and DETACH the materialization task — the run chain
+/// is daemon-owned and survives the requesting client (S1 exit criterion).
+///
+/// Returns the (workspace, correlation) pair the ack names; every
+/// materialization fact of this open carries exactly that correlation.
+///
+/// `warn_on_refuse`: the socket path mirrors refusals as
+/// `daemon.warning {what: "open-failed"}` (S1 pin); the MCP path refuses
+/// without touching the log (§12 refusal-before-effect, S3 board).
+pub async fn begin_open(
+    daemon: &Arc<Daemon>,
+    spec_toml: &str,
+    warn_on_refuse: bool,
+) -> Result<(WorkspaceId, Ulid), OpenRefusal> {
+    let checked = check_open_spec(spec_toml);
+    let spec = match checked {
+        Ok(spec) => spec,
+        Err(message) => {
+            tracing::warn!(error = %message, "open refused");
+            if warn_on_refuse {
+                warn_open_failed(daemon, &message).await;
+            }
+            return Err(OpenRefusal { message });
+        }
+    };
+
+    let correlation = Ulid::new();
+    let workspace = WorkspaceId::new(Ulid::new());
+    daemon.workspaces.lock().await.insert(
+        workspace.ulid(),
+        OpenedWorkspace {
+            root: spec.repo.clone(),
+            agents: spec.agents.clone(),
+            spawn_keys: HashMap::new(),
+        },
+    );
+
+    let task = materialize_open(
+        Arc::clone(daemon),
+        spec,
+        spec_toml.to_string(),
+        workspace,
+        correlation,
+    );
+    let span = tracing::info_span!("open", workspace = %workspace.ulid());
+    tokio::spawn(task.instrument(span));
+    Ok((workspace, correlation))
+}
+
+/// Pre-materialization validation: §13 parse + harness gate. Pure — nothing
+/// touches the fabric here.
+fn check_open_spec(spec_toml: &str) -> Result<ProjectSpec, String> {
+    let spec =
+        ProjectSpec::from_toml_str(spec_toml).map_err(|e| format!("parse project spec: {e}"))?;
+    // I4: refusal keys on the harness NAME, before anything materializes —
+    // a spec naming an unknown harness produces no workspace, no worktree,
+    // and no agent.spawned.
+    for agent in &spec.agents {
+        if !SUPPORTED_HARNESSES.contains(&agent.harness.as_str()) {
+            return Err(format!(
+                "unknown harness {:?} for agent {:?} — this daemon speaks {SUPPORTED_HARNESSES:?}; \
+                 refused at open, nothing materialized",
+                agent.harness, agent.name,
+            ));
+        }
+    }
+    Ok(spec)
+}
+
+/// The detached materialization chain (S1 exit criterion). One correlation
+/// ULID spans the whole chain; causation chains each fact to its trigger.
+/// Every post-ack failure is traced and mirrored as `daemon.warning` so a
+/// failed open is visible in `tail`, not silent.
+async fn materialize_open(
+    daemon: Arc<Daemon>,
+    spec: ProjectSpec,
+    spec_toml: String,
+    workspace: WorkspaceId,
+    correlation: Ulid,
+) {
+    if let Err(e) = try_materialize_open(&daemon, spec, &spec_toml, workspace, correlation).await {
+        tracing::warn!(error = %e, "open materialization failed");
+        warn_open_failed(&daemon, &format!("{e:#}")).await;
     }
 }
 
@@ -171,27 +287,13 @@ pub async fn materialize_open(daemon: Arc<Daemon>, spec_toml: String) {
 /// refusal point.
 const SUPPORTED_HARNESSES: &[&str] = &["claude-code"];
 
-async fn try_materialize_open(daemon: &Arc<Daemon>, spec_toml: &str) -> anyhow::Result<()> {
-    let spec = ProjectSpec::from_toml_str(spec_toml).context("parse project spec")?;
-
-    // I4: refusal keys on the harness NAME, before anything materializes —
-    // a spec naming an unknown harness produces no workspace, no worktree,
-    // and no agent.spawned; the refusal surfaces in `tail` as the
-    // `daemon.warning {what: "open-failed"}` this function's caller emits.
-    for agent in &spec.agents {
-        if !SUPPORTED_HARNESSES.contains(&agent.harness.as_str()) {
-            anyhow::bail!(
-                "unknown harness {:?} for agent {:?} — this daemon speaks {SUPPORTED_HARNESSES:?}; \
-                 refused at open, nothing materialized",
-                agent.harness,
-                agent.name,
-            );
-        }
-    }
-
-    let correlation = Ulid::new();
-    let workspace = WorkspaceId::new(Ulid::new());
-
+async fn try_materialize_open(
+    daemon: &Arc<Daemon>,
+    spec: ProjectSpec,
+    spec_toml: &str,
+    workspace: WorkspaceId,
+    correlation: Ulid,
+) -> anyhow::Result<()> {
     // Workspace root = the spec's repo path (relative paths resolve against
     // the daemon cwd in S1 — the spec arrived over the wire, not from a file).
     let root = tokio::fs::canonicalize(&spec.repo)
@@ -239,21 +341,31 @@ async fn try_materialize_open(daemon: &Arc<Daemon>, spec_toml: &str) -> anyhow::
 
     // 3–6. Per agent: allocate a worktree, spawn under capture, detach.
     for agent in &spec.agents {
-        launch_agent(daemon, agent, &root, workspace, correlation, applied_id)
-            .await
-            .with_context(|| format!("launch agent {:?}", agent.name))?;
+        launch_agent(
+            daemon,
+            agent,
+            &root,
+            workspace,
+            correlation,
+            Some(applied_id),
+        )
+        .await
+        .with_context(|| format!("launch agent {:?}", agent.name))?;
     }
     Ok(())
 }
 
-async fn launch_agent(
+/// Allocate a worktree and spawn one agent under capture; returns the minted
+/// run id. `causation` is the triggering fact (`workspace.spec.applied` on
+/// the open chain; `None` for a standalone MCP `spawn_agent`).
+pub async fn launch_agent(
     daemon: &Arc<Daemon>,
     agent: &AgentSpec,
     repo: &Path,
     workspace: WorkspaceId,
     correlation: Ulid,
-    applied_id: Ulid,
-) -> anyhow::Result<()> {
+    causation: Option<Ulid>,
+) -> anyhow::Result<RunId> {
     let run = RunId::new(Ulid::new());
 
     // 3. worktree.allocated — minimal git-CLI allocation (S2 owns the full
@@ -266,7 +378,7 @@ async fn launch_agent(
             Some(workspace),
             Subject::new("worktree.allocated"),
             correlation,
-            Some(applied_id),
+            causation,
             1,
             json!({
                 "path": worktree.display().to_string(),
@@ -340,7 +452,7 @@ async fn launch_agent(
         }
         .instrument(span),
     );
-    Ok(())
+    Ok(run)
 }
 
 /// `git worktree add` under the workspace dir. A repo with commits gets a

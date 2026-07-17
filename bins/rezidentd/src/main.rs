@@ -21,6 +21,8 @@
 //! pipe (doc §9, S0 platform decision).
 
 #[cfg(unix)]
+mod mcp;
+#[cfg(unix)]
 mod runs;
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +49,10 @@ mod unix_daemon {
     use anyhow::Context;
     use rezidnt_cas::Cas;
     use rezidnt_fabric::{EventLog, Fabric, RecvError, Subscriber};
-    use rezidnt_proto::{Hello, PROTO_VERSION, Request, decode_request, encode_hello, socket_path};
+    use rezidnt_proto::{
+        Hello, PROTO_VERSION, Reply, Request, decode_request, encode_hello, encode_reply,
+        socket_path,
+    };
     use rezidnt_types::taxonomy::{ONTOLOGY_VERSION, SUBJECTS_V0};
     use rezidnt_types::{Event, SourceId, Subject};
     use serde_json::json;
@@ -56,7 +61,7 @@ mod unix_daemon {
     use tokio::net::{UnixListener, UnixStream};
     use tracing::Instrument;
 
-    use crate::runs::{Daemon, RunRegistry, materialize_open, serve_attach};
+    use crate::runs::{Daemon, RunRegistry, begin_open, serve_attach};
 
     /// Broadcast ring size (DEFAULT). Sized for control-plane volume (doc §5:
     /// facts and refs only); an overflowing subscriber takes the BINDING
@@ -170,11 +175,33 @@ mod unix_daemon {
             .await
             .context("cas open task panicked")??
         };
-        let daemon = Arc::new(Daemon {
-            fabric,
-            cas,
-            registry: Arc::new(RunRegistry::default()),
-        });
+        let daemon = Arc::new(Daemon::new(fabric, cas, Arc::new(RunRegistry::default())));
+
+        // S3 (doc §9, I5): the loopback-HTTP MCP transport, requested via
+        // REZIDNT_MCP_LOCKFILE. Bound at 127.0.0.1:0; the REAL port plus the
+        // daemon-lifetime operator badge are announced in the 0600 lockfile.
+        // The handle must live as long as the daemon: dropping it stops the
+        // listener.
+        let _mcp_transport = match std::env::var_os("REZIDNT_MCP_LOCKFILE") {
+            Some(lockfile) => {
+                let bridge: Arc<dyn rezidnt_mcp::McpSubstrate> = Arc::new(crate::mcp::McpBridge {
+                    daemon: Arc::clone(&daemon),
+                });
+                let core = Arc::new(
+                    rezidnt_mcp::McpCore::new_shared(
+                        Arc::clone(&daemon.fabric),
+                        rezidnt_mcp::BadgeBook::new(),
+                    )
+                    .with_substrate(bridge),
+                );
+                let handle = rezidnt_mcp::serve_http(core, std::path::Path::new(&lockfile))
+                    .await
+                    .context("start mcp loopback-http transport")?;
+                tracing::info!(url = %handle.url, "mcp http transport announced");
+                Some(handle)
+            }
+            None => None,
+        };
 
         let listener =
             UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
@@ -245,16 +272,59 @@ mod unix_daemon {
                 serve_tail(&daemon, &mut write_half, subject.as_deref()).await
             }
             Request::Open { spec_toml } => {
-                // The materialization is daemon-owned: it is spawned off this
-                // connection task, so the run survives the client (S1 exit
-                // criterion). The opening client is then served the plain
+                // S3 request-scoped ack (rezidnt_proto::Reply): the FIRST
+                // frame after the hello answers THIS request — open_ok with
+                // the workspace + correlation the materialization facts
+                // carry, or a machine-readable spec.invalid error frame.
+                // The materialization itself is daemon-owned (detached inside
+                // begin_open), so the run survives the client (S1 exit
+                // criterion); the opening client is then served the plain
                 // tail so every step is visible on its own socket.
-                let span = tracing::info_span!("open");
-                tokio::spawn(materialize_open(Arc::clone(&daemon), spec_toml).instrument(span));
-                serve_tail(&daemon, &mut write_half, None).await
+                match begin_open(&daemon, &spec_toml, true).await {
+                    Ok((workspace, correlation)) => {
+                        let ack = Reply::OpenOk {
+                            workspace: workspace.ulid(),
+                            correlation,
+                        };
+                        write_reply(&mut write_half, &ack).await?;
+                        serve_tail(&daemon, &mut write_half, None).await
+                    }
+                    Err(refusal) => {
+                        let error = Reply::Error {
+                            op: "open".to_string(),
+                            code: rezidnt_proto::codes::SPEC_INVALID.to_string(),
+                            message: refusal.message,
+                            run: None,
+                        };
+                        write_reply(&mut write_half, &error).await?;
+                        Ok(()) // orderly close after the error frame
+                    }
+                }
             }
-            Request::Attach { run } => serve_attach(&daemon, run, &mut write_half).await,
+            Request::Attach { run } => {
+                // S3: an unknown run answers ONE machine-readable error frame
+                // and then closes — never a hang, never a silent EOF.
+                if daemon.registry.get(&run).is_none() {
+                    let error = Reply::Error {
+                        op: "attach".to_string(),
+                        code: rezidnt_proto::codes::RUN_UNKNOWN.to_string(),
+                        message: format!("no run {run} on this daemon"),
+                        run: Some(run),
+                    };
+                    write_reply(&mut write_half, &error).await?;
+                    return Ok(());
+                }
+                serve_attach(&daemon, run, &mut write_half).await
+            }
         }
+    }
+
+    /// Write one `Reply` JSONL frame.
+    async fn write_reply(out: &mut OwnedWriteHalf, reply: &Reply) -> anyhow::Result<()> {
+        let mut frame = encode_reply(reply).context("encode reply frame")?;
+        frame.push('\n');
+        out.write_all(frame.as_bytes()).await?;
+        Ok(())
     }
 
     /// Tail stream: replay from seq 0, then live, optionally filtered by

@@ -2025,6 +2025,7 @@ dependencies = [
  "blake3",
  "rezidnt-cas",
  "rezidnt-fabric",
+ "rezidnt-mcp",
  "rezidnt-proto",
  "rezidnt-run",
  "rezidnt-types",

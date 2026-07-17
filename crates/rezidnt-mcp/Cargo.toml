@@ -16,6 +16,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# schemars (implementer, S3): promoted from dev-dependency — tools/list SERVES
+# the generated schemas at runtime (doc §9 no-drift rule), not just in tests.
+schemars = { workspace = true }
 rezidnt-types = { workspace = true }
 rezidnt-fabric = { workspace = true }
 rezidnt-state = { workspace = true }
@@ -23,7 +26,9 @@ rezidnt-run = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "net", "io-util", "time", "rt", "macros", "fs"] }
+# rt-multi-thread (implementer, S3): the HTTP transport runs its own
+# single-worker runtime so it stays responsive under a busy caller executor.
+tokio = { workspace = true, features = ["sync", "net", "io-util", "time", "rt", "rt-multi-thread", "macros", "fs"] }
 tracing = { workspace = true }
 ulid = { workspace = true }
 

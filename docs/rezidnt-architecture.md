@@ -357,8 +357,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-007](decisions/DR-007-release-worktree.md) | RepoSubstrate `release_worktree` as-built | ACCEPTED | §7 |
 | [DR-008](decisions/DR-008-permit-engine-pivot.md) | Permit-engine pivot (rezidnt owns both axes) | ACCEPTED | §1, §8, §16 |
 | [DR-009](decisions/DR-009-match-omnigent-scope.md) | Match-Omnigent scope (four memo-surfaced permit capabilities) | ACCEPTED | §16 |
+| [DR-010](decisions/DR-010-intent-lock-scope.md) | SP-intent scope + criteria (C7 intent-lock) | ACCEPTED | §16 |
 
-*The next record is DR-010.*
+*The next record is DR-011.*
 
 ---
 

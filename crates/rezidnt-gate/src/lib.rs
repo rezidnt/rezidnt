@@ -586,6 +586,165 @@ impl NativeVerifier for AllowedTools {
     }
 }
 
+/// `params[key]` as a plain `Vec<String>` (absent ⇒ empty). Unlike
+/// [`glob_list`] this is intent-neutral — the caller decides whether the items
+/// are globs or literals.
+fn string_list(params: &Value, key: &str) -> Vec<String> {
+    glob_list(params, key)
+}
+
+/// Permit native (SP1): the requested action's `tool` (a `params` scalar) must
+/// be in `params.allow` (a glob/name list). Listed → Pass; unlisted → Fail
+/// (evidence names the offending tool, I6); tool ABSENT → Inconclusive
+/// (cannot-run — the native never SYNTHESIZES a pass, I6).
+///
+/// The tool descriptor rides inline in `params` (not a CAS ref): it is a small
+/// scalar (ontology `permit.requested.target`), so it is content-hash-pinned
+/// via the verbatim `inputs.params` like every other native input (design §8).
+pub struct ToolAllowlist;
+
+impl NativeVerifier for ToolAllowlist {
+    fn name(&self) -> &'static str {
+        "tool-allowlist"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        let Some(tool) = input.params.get("tool").and_then(Value::as_str) else {
+            return Ok(cannot_run(
+                "no tool in params — undecidable, not a pass (I6)",
+            ));
+        };
+        let allow = string_list(&input.params, "allow");
+        if allow.iter().any(|g| glob_match(g, tool)) {
+            return Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            });
+        }
+        fail_evidence(
+            cas,
+            "tool-not-allowed",
+            &format!("tool {tool} not in allowlist"),
+        )
+    }
+}
+
+/// Permit native (SP1): every target path in `params.paths` must be inside
+/// `params.allow` (glob list, the two-star matcher the diff natives use).
+/// In-scope → Pass; out-of-scope → Fail naming the FIRST offending path in
+/// order (deterministic, I6); paths ABSENT → Inconclusive (cannot-run, I6).
+pub struct PathScope;
+
+impl NativeVerifier for PathScope {
+    fn name(&self) -> &'static str {
+        "path-scope"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        let Some(paths) = input.params.get("paths").and_then(Value::as_array) else {
+            return Ok(cannot_run(
+                "no target paths in params — undecidable, not a pass (I6)",
+            ));
+        };
+        let allow = glob_list(&input.params, "allow");
+        // Deterministic scan: the first out-of-scope path in list order is the
+        // named offender (same params → same verdict AND same evidence, I6).
+        let offender = paths
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|p| !allow.iter().any(|g| glob_match(g, p)));
+        match offender {
+            None => Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            }),
+            Some(path) => fail_evidence(
+                cas,
+                "path-out-of-scope",
+                &format!("path {path} outside allowed scope"),
+            ),
+        }
+    }
+}
+
+/// Permit native (SP1, DR-009 C1): the running per-session spend + rate vs. a
+/// soft/hard cap. The running totals arrive as PINNED INPUTS in `params` (the
+/// daemon folds `PermitAccumulators` from the log, I3, and passes the snapshot
+/// verbatim — the native never touches mutable state; determinism BINDING).
+///
+/// Verdicts: projected spend (`cumulative_spend_usd + action_cost_usd`) under
+/// the soft cap → Pass; soft ≤ projected < hard → **Inconclusive** (escalate to
+/// a human, NEVER coerced, I6, DR-008 §4); projected ≥ hard → Fail; the window
+/// action count ≥ the rate limit → Fail (independent of spend); caps MISSING →
+/// Inconclusive (cannot-run — garbage never coerces to a pass, I6).
+pub struct SpendCap;
+
+impl NativeVerifier for SpendCap {
+    fn name(&self) -> &'static str {
+        "spend-cap"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        let p = &input.params;
+        let num = |key: &str| p.get(key).and_then(Value::as_f64);
+        // The caps are the load-bearing inputs: absent caps are undecidable.
+        let (Some(soft), Some(hard)) = (num("soft_cap_usd"), num("hard_cap_usd")) else {
+            return Ok(cannot_run(
+                "no soft/hard cap in params — undecidable, not a pass (I6)",
+            ));
+        };
+        let cumulative = num("cumulative_spend_usd").unwrap_or(0.0);
+        let cost = num("action_cost_usd").unwrap_or(0.0);
+        let projected = cumulative + cost;
+        let window = p
+            .get("window_action_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rate_limit = p.get("rate_limit").and_then(Value::as_u64);
+
+        // Rate limit: at/over the per-window limit → deny, independent of spend.
+        if let Some(limit) = rate_limit
+            && window >= limit
+        {
+            return fail_evidence(
+                cas,
+                "rate-limit-exceeded",
+                &format!("window action count {window} at/over rate limit {limit}"),
+            );
+        }
+
+        // Hard cap: at/over → deny.
+        if projected >= hard {
+            return fail_evidence(
+                cas,
+                "hard-cap-exceeded",
+                &format!("projected spend {projected:.2} at/over hard cap {hard:.2}"),
+            );
+        }
+        // Soft band (soft ≤ projected < hard): escalate to a human. NEVER
+        // coerced to a pass or an auto-deny (I6, DR-008 §4). The evidence names
+        // the crossing so the escalation is interrogable.
+        if projected >= soft {
+            return Ok(VerifierOutput {
+                verdict: Verdict::Inconclusive,
+                evidence: vec![Evidence {
+                    kind: "soft-cap-crossed".to_string(),
+                    msg: format!(
+                        "projected spend {projected:.2} crossed soft cap {soft:.2} (< hard {hard:.2}) — escalate"
+                    ),
+                    cas_ref: None,
+                }],
+                cost_ms: 0,
+            });
+        }
+        // Under the soft cap: allow.
+        Ok(VerifierOutput {
+            verdict: Verdict::Pass,
+            evidence: vec![],
+            cost_ms: 0,
+        })
+    }
+}
+
 /// The v1 native pack, by name — also the registry [`replay`] re-executes
 /// against.
 pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
@@ -595,6 +754,9 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(BareMode),
         Box::new(PinnedVersion),
         Box::new(AllowedTools),
+        Box::new(ToolAllowlist),
+        Box::new(PathScope),
+        Box::new(SpendCap),
     ]
 }
 

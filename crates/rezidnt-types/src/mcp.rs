@@ -53,6 +53,32 @@ pub struct GateExplainArgs {
     pub run: String,
 }
 
+/// `request_permission` — the harness PEP asks the daemon PDP "may this action
+/// proceed?" and gets back a three-valued decision (`allow | deny | ask`),
+/// NEVER coerced (I6, design §5).
+///
+/// Badge posture (design §5): read-class on the DECISION, but the result
+/// authorizes a later mutation, so the caller must be identified — `badge` is
+/// REQUIRED (the caller identity, carried to `permit.requested.badge_id`).
+/// The bulk action context (argv, file bytes) is a `context_ref` CAS-ref
+/// string (`cas:blake3:<hex>`), never inline bytes (I2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RequestPermissionArgs {
+    /// Capability badge token (hex), design §5. The caller identity checked
+    /// before any decision is made.
+    pub badge: String,
+    /// Run ULID (canonical 26-char text form) the action belongs to.
+    pub run: String,
+    /// The action verb (e.g. `tool.invoke`).
+    pub action: String,
+    /// The small inline action descriptor (the tool name).
+    pub tool: String,
+    /// Optional bulk-context CAS ref (`cas:blake3:<hex>`) — the ref only, never
+    /// inline bytes (I2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<String>,
+}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

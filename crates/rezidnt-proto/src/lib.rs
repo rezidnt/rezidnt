@@ -89,6 +89,22 @@ pub enum Request {
     /// (run, gate, verifier) against alarms already on the log and appends an
     /// `integrity.alarm` fact through its Fabric for each new divergence.
     RecordAlarms { alarms: Vec<AlarmRecord> },
+    /// The harness PEP asks the daemon PDP "may this action proceed?" over the
+    /// socket (SP1; design §3/§5, DR-008/DR-009). The small descriptor rides
+    /// inline; bulk action context is a `context_ref` CAS-ref string, never
+    /// inline bytes (I2). `badge` (caller identity) and `context_ref` are both
+    /// optional on the wire — absent = OMITTED, never null. The daemon answers
+    /// with [`Reply::PermitDecision`].
+    RequestPermission {
+        run: String,
+        request_id: String,
+        action: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        badge: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_ref: Option<String>,
+    },
 }
 
 /// One replay-divergence alarm the CLI asks the daemon to make durable
@@ -127,6 +143,11 @@ pub mod codes {
     /// failed during `record_alarms`). The client maps this to its
     /// substrate-fault exit class.
     pub const INTERNAL: &str = "internal";
+    /// The daemon received a well-formed request op it does not yet serve on
+    /// this transport. Honest (never a coerced decision): SP1 pins the
+    /// `request_permission` WIRE shape (this proto), but the socket-side PDP
+    /// handler is not wired here yet — the MCP surface is the SP1 decision path.
+    pub const OP_NOT_SERVED: &str = "op.not_served";
 }
 
 /// Request-scoped reply frame (S3 proto addition, parked from S2).
@@ -162,6 +183,17 @@ pub enum Reply {
     /// after the append lands is what makes the CLI's post-return log read
     /// race-free.
     AlarmsRecorded { appended: usize },
+    /// The permit decision the PDP reached for a [`Request::RequestPermission`]
+    /// (SP1; DR-008 §4). `decision` is exactly one of `allow | deny | ask` —
+    /// `ask` is the escalate/inconclusive branch, carried VERBATIM to the PEP
+    /// and NEVER coerced to `allow` (I6). `reason` says why on a deny/ask so a
+    /// blocked agent can read it; absent on a trivially-granted allow.
+    PermitDecision {
+        request_id: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// The request failed. `code` is machine-readable ([`codes`]).
     Error {
         /// The request op this error answers (`"open"`, `"attach"`, …).

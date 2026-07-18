@@ -23,6 +23,12 @@ rezidnt-types = { workspace = true }
 rezidnt-fabric = { workspace = true }
 rezidnt-state = { workspace = true }
 rezidnt-run = { workspace = true }
+# rezidnt-gate + rezidnt-cas (implementer, SP1): the `request_permission` tool
+# IS the PDP — it runs the native permit-verifier pack against a CAS and maps
+# the verdict via `permit::decision_for` (design §5, DR-008/DR-009). The gate
+# engine is the policy engine; there is no second one.
+rezidnt-gate = { workspace = true }
+rezidnt-cas = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

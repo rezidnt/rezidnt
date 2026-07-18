@@ -351,6 +351,23 @@ mod unix_daemon {
                     }
                 }
             }
+            Request::RequestPermission { request_id, .. } => {
+                // SP1 pins the `request_permission` WIRE shape (rezidnt_proto);
+                // the SP1 DECISION path is the MCP surface (I5 MCP-first). The
+                // socket-side PDP handler is not wired here yet — answer ONE
+                // honest machine-readable frame and close, NEVER a coerced
+                // decision (I6).
+                let error = Reply::Error {
+                    op: "request_permission".to_string(),
+                    code: rezidnt_proto::codes::OP_NOT_SERVED.to_string(),
+                    message: format!(
+                        "request_permission (request_id {request_id}) is served on the MCP surface, not the socket, in SP1"
+                    ),
+                    run: None,
+                };
+                write_reply(&mut write_half, &error).await?;
+                Ok(())
+            }
         }
     }
 

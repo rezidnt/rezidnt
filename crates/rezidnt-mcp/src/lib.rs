@@ -31,9 +31,11 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
+use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
+use rezidnt_gate::NativeVerifier as _;
 use rezidnt_run::badge::Badge;
 use rezidnt_run::spec::ProjectSpec;
 use serde_json::{Value, json};
@@ -177,6 +179,13 @@ pub struct McpCore {
     /// invariant, continuing with the inner value is sound).
     badges: RwLock<BadgeBook>,
     substrate: Option<Arc<dyn McpSubstrate>>,
+    /// The CAS the permit gate runs against (native verifiers write evidence
+    /// blobs and carry refs, I2). The daemon wires its own; a bare test core
+    /// gets a lazily-opened ephemeral CAS (see [`McpCore::permit_cas`]).
+    cas: Option<Arc<Cas>>,
+    /// Ephemeral fallback CAS for a core with no wired CAS — opened once under
+    /// the OS temp dir on first permit decision, then reused.
+    ephemeral_cas: OnceLock<Arc<Cas>>,
 }
 
 impl McpCore {
@@ -191,6 +200,8 @@ impl McpCore {
             fabric,
             badges: RwLock::new(badges),
             substrate: None,
+            cas: None,
+            ephemeral_cas: OnceLock::new(),
         }
     }
 
@@ -199,6 +210,33 @@ impl McpCore {
     pub fn with_substrate(mut self, substrate: Arc<dyn McpSubstrate>) -> Self {
         self.substrate = Some(substrate);
         self
+    }
+
+    /// Wire the CAS the permit gate runs against (builder-style; the daemon
+    /// wires its own CAS, bare test cores fall back to an ephemeral one).
+    pub fn with_cas(mut self, cas: Arc<Cas>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    /// The CAS the permit natives run against: the wired one, or a
+    /// lazily-opened ephemeral CAS under the OS temp dir. Opening the ephemeral
+    /// store can fail (fs error); that surfaces as a decision refusal, never a
+    /// panic and never a coerced verdict.
+    fn permit_cas(&self) -> Result<Arc<Cas>, (i64, String)> {
+        if let Some(cas) = &self.cas {
+            return Ok(Arc::clone(cas));
+        }
+        if let Some(cas) = self.ephemeral_cas.get() {
+            return Ok(Arc::clone(cas));
+        }
+        let root = std::env::temp_dir().join(format!("rezidnt-mcp-cas-{}", std::process::id()));
+        let cas = Arc::new(
+            Cas::open(&root).map_err(|e| (-32603, format!("open ephemeral permit cas: {e}")))?,
+        );
+        // Race: another caller may have set it first — reuse the winner.
+        let _ = self.ephemeral_cas.set(Arc::clone(&cas));
+        Ok(Arc::clone(self.ephemeral_cas.get().unwrap_or(&cas)))
     }
 
     /// The fabric this surface publishes to and reads from (tests assert
@@ -258,6 +296,7 @@ impl McpCore {
         match name {
             "open_project" => self.call_open_project(args).await,
             "spawn_agent" => self.call_spawn_agent(args).await,
+            "request_permission" => self.call_request_permission(args).await,
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
             other => Err((-32602, format!("unknown tool: {other}"))),
@@ -346,6 +385,158 @@ impl McpCore {
         }
     }
 
+    /// `request_permission` — the daemon IS the PDP (design §5, DR-008/DR-009).
+    /// Ordering (§12 door discipline): badge FIRST (the caller of an
+    /// authorization decision must be identified), then the request fact, then
+    /// the decision. The decision is three-valued (`allow | deny | ask`) and
+    /// NEVER coerced — `inconclusive` surfaces as `ask` (route to a human, I6).
+    /// Both the `permit.requested` fact and one decision fact land on the log
+    /// (I3: the permission stream is first-class in `tail`).
+    async fn call_request_permission(&self, args: Value) -> RpcOutcome {
+        // §12: the badge is checked BEFORE any decision or side effect.
+        let badge_id = match self.check_badge(&args) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
+        let field = |name: &str| -> Result<String, Value> {
+            args.get(name)
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| {
+                    tool_refused(
+                        codes::ARGS_INVALID,
+                        format!("request_permission requires {name}"),
+                    )
+                })
+        };
+        let (run, action, tool) = match (field("run"), field("action"), field("tool")) {
+            (Ok(r), Ok(a), Ok(t)) => (r, a, t),
+            (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return Ok(e),
+        };
+        let context_ref = args
+            .get("context_ref")
+            .and_then(Value::as_str)
+            .map(String::from);
+        // One request id ties the request fact to its decision fact.
+        let request_id = ulid::Ulid::new().to_string();
+
+        // The permit.requested fact (I3). Bulk context rides as a ref string,
+        // never inline bytes (I2); the descriptor is small scalars.
+        let mut requested = json!({
+            "run": run,
+            "request_id": request_id,
+            "action": action,
+            "target": { "tool": tool },
+            "badge_id": badge_id,
+        });
+        if let Some(ref cref) = context_ref {
+            requested["context_ref"] = json!(cref);
+        }
+        self.publish_fact("permit.requested", requested).await?;
+
+        // Run the permit gate: the action-tool axis (design §2 — the permit
+        // gate fills the `--allowedTools` enforcement middle). Inputs are pinned
+        // via the verbatim `inputs.params` (determinism BINDING). With no
+        // allowlist configured on a bare surface the tool is not listed → deny;
+        // when the tool descriptor is absent the native escalates (ask), never
+        // a synthesized allow (I6).
+        let cas = self.permit_cas()?;
+        let allow = args.get("allow").cloned().unwrap_or_else(|| json!([]));
+        let input = rezidnt_gate::VerifierInput {
+            gate: rezidnt_gate::permit::LIFECYCLE_POINT.to_string(),
+            workspace: None,
+            refs: BTreeMap::new(),
+            params: json!({ "tool": tool, "allow": allow }),
+            timeout_ms: rezidnt_gate::DEFAULT_TIMEOUT_MS,
+        };
+        let output = {
+            let cas = Arc::clone(&cas);
+            tokio::task::spawn_blocking(move || rezidnt_gate::ToolAllowlist.verify(&input, &cas))
+                .await
+                .map_err(|e| (-32603, format!("permit verify task panicked: {e}")))?
+                .map_err(|e| (-32603, format!("permit verify: {e}")))?
+        };
+
+        // Map the three-valued verdict to a decision (I6: inconclusive → ask,
+        // never coerced). The deciding policy + evidence are pinned into the CAS
+        // so the decision is interrogable via `gate_explain` (I6).
+        let decision = rezidnt_gate::permit::decision_for(output.verdict);
+        let decision_word = match decision {
+            rezidnt_gate::permit::PermitDecision::Grant => "allow",
+            rezidnt_gate::permit::PermitDecision::Deny => "deny",
+            rezidnt_gate::permit::PermitDecision::Escalate => "ask",
+        };
+        let reason = output.evidence.first().map(|e| e.msg.clone());
+
+        // Pin the deciding policy (the params evaluated) into the CAS so the
+        // policy_ref on the decision fact resolves (I6, I2 — ref not inline).
+        let policy_bytes = json!({
+            "gate": "permit",
+            "verifier": "tool-allowlist",
+            "params": { "tool": tool, "allow": args.get("allow").cloned().unwrap_or_else(|| json!([])) },
+        })
+        .to_string();
+        let policy_ref = {
+            let cas = Arc::clone(&cas);
+            tokio::task::spawn_blocking(move || {
+                cas.put(policy_bytes.as_bytes(), "application/json")
+            })
+            .await
+            .map_err(|e| (-32603, format!("policy pin task panicked: {e}")))?
+            .map_err(|e| (-32603, format!("pin policy: {e}")))?
+        };
+        // The evidence blob a native failure wrote (if any) carries as the
+        // decision's evidence_ref (I2: ref, never inline bytes).
+        let evidence_ref = output
+            .evidence
+            .first()
+            .and_then(|e| e.cas_ref.as_deref())
+            .and_then(|r| r.strip_prefix("cas:blake3:"))
+            .map(|hash| rezidnt_types::refs::CasRef {
+                hash: hash.to_string(),
+                bytes: 0,
+                mime: "text/plain".to_string(),
+            });
+
+        let (subject, payload) = rezidnt_gate::permit::decided_fact(
+            output.verdict,
+            &run,
+            &request_id,
+            &policy_ref,
+            evidence_ref.as_ref(),
+            reason.as_deref(),
+            rezidnt_gate::permit::DecisionDeltas::default(),
+        );
+        self.publish_fact(subject, payload).await?;
+
+        let mut result = json!({ "decision": decision_word });
+        if let (Some(r), Some(obj)) = (reason, result.as_object_mut()) {
+            obj.insert("reason".to_string(), Value::String(r));
+        }
+        Ok(tool_ok(result))
+    }
+
+    /// Append one fact through the fabric off the async threads (SQLite is
+    /// blocking; rust-conventions: no blocking in async).
+    async fn publish_fact(&self, subject: &str, payload: Value) -> Result<(), (i64, String)> {
+        let event = rezidnt_types::Event::new(
+            rezidnt_types::SourceId::new("rezidnt-mcp"),
+            None,
+            rezidnt_types::Subject::new(subject),
+            ulid::Ulid::new(),
+            None,
+            1,
+            payload,
+        )
+        .map_err(|e| (-32603, format!("construct {subject}: {e}")))?;
+        let fabric = Arc::clone(&self.fabric);
+        tokio::task::spawn_blocking(move || fabric.publish(event))
+            .await
+            .map_err(|e| (-32603, format!("publish {subject} task panicked: {e}")))?
+            .map_err(|e| (-32603, format!("append {subject}: {e}")))?;
+        Ok(())
+    }
+
     /// I6 interrogability (doc §8): the recorded verdict, the failing
     /// verifier, its evidence CAS refs, and the EXACT inputs — all VERBATIM
     /// from the verdict fact on the log (I3: derived, never re-judged). The
@@ -358,11 +549,19 @@ impl McpCore {
             ));
         };
         let events = self.replay(None).await?;
-        // The LATEST verdict fact for this run wins (append order).
+        // The LATEST verdict-bearing fact for this run wins (append order). The
+        // interrogation resolves BOTH gate verdicts (`gate.passed|failed|
+        // inconclusive`) AND permit decisions (`permit.granted|denied|
+        // escalated`) — a blocked agent reads WHY on either axis (design §5, I6).
         let verdict_fact = events.iter().rev().find(|e| {
             matches!(
                 e.subject.as_str(),
-                "gate.passed" | "gate.failed" | "gate.inconclusive"
+                "gate.passed"
+                    | "gate.failed"
+                    | "gate.inconclusive"
+                    | "permit.granted"
+                    | "permit.denied"
+                    | "permit.escalated"
             ) && e.payload()["run"] == json!(run)
         });
         let Some(fact) = verdict_fact else {
@@ -376,20 +575,49 @@ impl McpCore {
         let verdict = match fact.subject.as_str() {
             "gate.passed" => "pass",
             "gate.failed" => "fail",
-            _ => "inconclusive",
+            "gate.inconclusive" => "inconclusive",
+            // Permit decisions map to their wire vocabulary; escalate → ask,
+            // NEVER coerced to allow (I6, DR-008 §4).
+            "permit.granted" => "allow",
+            "permit.denied" => "deny",
+            _ => "ask",
         };
         let payload = fact.payload();
-        let mut explain = json!({
-            "run": run,
-            "gate": payload["gate"],
-            "verdict": verdict,
-            "verifier": payload["verifier"],
-            "evidence": payload["evidence"],
-            "inputs": payload["inputs"],
-        });
-        if let (Some(reason), Some(obj)) = (payload.get("reason"), explain.as_object_mut()) {
-            obj.insert("reason".to_string(), reason.clone());
-        }
+        let is_permit = fact.subject.as_str().starts_with("permit.");
+        let explain = if is_permit {
+            // A permit decision surfaces its deciding policy + evidence + reason
+            // so the blocked agent reads WHY (I6; ontology permit.denied). The
+            // refs are CAS refs, resolved not inline (I2).
+            let mut e = json!({
+                "run": run,
+                "gate": "permit",
+                "verdict": verdict,
+                "request_id": payload["request_id"],
+                "policy_ref": payload["policy_ref"],
+            });
+            if let Some(obj) = e.as_object_mut() {
+                if let Some(er) = payload.get("evidence_ref") {
+                    obj.insert("evidence_ref".to_string(), er.clone());
+                }
+                if let Some(reason) = payload.get("reason") {
+                    obj.insert("reason".to_string(), reason.clone());
+                }
+            }
+            e
+        } else {
+            let mut e = json!({
+                "run": run,
+                "gate": payload["gate"],
+                "verdict": verdict,
+                "verifier": payload["verifier"],
+                "evidence": payload["evidence"],
+                "inputs": payload["inputs"],
+            });
+            if let (Some(reason), Some(obj)) = (payload.get("reason"), e.as_object_mut()) {
+                obj.insert("reason".to_string(), reason.clone());
+            }
+            e
+        };
 
         // gate.explained v1 (ratified): `run` is the pinned minimum; `gate` /
         // `verdict` are optional triage context. The explanation content is
@@ -401,7 +629,7 @@ impl McpCore {
             fact.correlation,
             Some(fact.id),
             1,
-            json!({"run": run, "gate": payload["gate"], "verdict": verdict}),
+            json!({"run": run, "gate": explain["gate"], "verdict": verdict}),
         )
         .map_err(|e| (-32603, format!("construct gate.explained: {e}")))?;
         let fabric = Arc::clone(&self.fabric);
@@ -527,6 +755,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "spawn_agent",
                 "description": "Spawn one spec agent in an open workspace (mutating: badge and idempotency key required).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::SpawnAgentArgs))?,
+            },
+            {
+                "name": "request_permission",
+                "description": "Ask the daemon PDP whether an agent action may proceed: a three-valued decision (allow|deny|ask), never coerced (I6, design §5). Badge required.",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::RequestPermissionArgs))?,
             },
             {
                 "name": "gate_explain",

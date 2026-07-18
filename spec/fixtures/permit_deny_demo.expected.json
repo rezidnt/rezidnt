@@ -1,0 +1,37 @@
+{
+  "events_folded": 3,
+  "last_event": "01SP1DENYDEM0FXX00000000E3",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "permit.denied": 1,
+    "permit.requested": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01SP1DENYDEM0FXX00000RN01": {
+      "status": "spawning",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {
+        "01SP1DENYDEM0FXXRQ00001": {
+          "action": "tool.invoke",
+          "decision": "denied",
+          "policy_ref": "70014110w1157000000000000000000000000000000000000000d3ny70011s",
+          "reason": "tool Bash not in allowlist"
+        }
+      },
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.0,
+        "risk_score": 4.0,
+        "granted": 0,
+        "denied": 1,
+        "escalated": 0
+      }
+    }
+  },
+  "worktrees": {}
+}

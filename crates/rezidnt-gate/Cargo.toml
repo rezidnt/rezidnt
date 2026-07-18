@@ -38,3 +38,8 @@ proptest = { workspace = true }
 # (tests/permit_emit.rs). serde_json is already a runtime dep; ulid is
 # test-only here (the emit constructors take string ids, not Ulid).
 ulid = { workspace = true }
+# rezidnt-state (dev-only): the SP1 emit-side accumulator pin folds an emitted
+# `permit.granted` payload through the real reducer to prove producer↔consumer
+# agreement on the delta keys (tests/permit_emit.rs::emitted_deltas_fold_*).
+# No cycle: rezidnt-state does not depend on rezidnt-gate.
+rezidnt-state = { workspace = true }

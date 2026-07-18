@@ -2304,6 +2304,7 @@ version = "0.0.1"
 dependencies = [
  "proptest",
  "rezidnt-cas",
+ "rezidnt-state",
  "rezidnt-types",
  "serde",
  "serde_json",
@@ -2319,7 +2320,9 @@ dependencies = [
 name = "rezidnt-mcp"
 version = "0.0.1"
 dependencies = [
+ "rezidnt-cas",
  "rezidnt-fabric",
+ "rezidnt-gate",
  "rezidnt-run",
  "rezidnt-state",
  "rezidnt-types",

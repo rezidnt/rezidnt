@@ -68,6 +68,25 @@ pub fn decision_for(verdict: Verdict) -> PermitDecision {
     }
 }
 
+/// The accumulator/cost deltas a decision contributes onto its fact payload —
+/// the C1 spend-cap verifier is the PRODUCER of the keys `rezidnt-state`'s
+/// reducer already folds (`spend_delta_usd` → cumulative spend, `risk_delta` →
+/// running risk score) plus the §10.2 decision `cost_ms`.
+///
+/// Every field is optional: a decision that measured no spend/risk/cost emits
+/// NONE of these keys. Absence is an OMITTED key on the payload, never a JSON
+/// `null` — the reducer reads `payload["spend_delta_usd"].as_f64()`, and a
+/// `null` there is not a `0` (I3 fold correctness).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DecisionDeltas {
+    /// This action's incremental spend (folds into cumulative spend, C1).
+    pub spend_delta_usd: Option<f64>,
+    /// This action's incremental risk (folds into the running score, C6).
+    pub risk_delta: Option<f64>,
+    /// The §8 stdout decision cost in milliseconds (design §10.2 latency).
+    pub cost_ms: Option<u64>,
+}
+
 /// Build a permit DECISION fact (`permit.granted` / `permit.denied` /
 /// `permit.escalated`) — the PDP turning a verdict into the fact it logs.
 /// Returns `(subject, payload)`; the subject comes from
@@ -76,7 +95,8 @@ pub fn decision_for(verdict: Verdict) -> PermitDecision {
 ///
 /// Payload shape (ontology `permit.granted`/`.denied`/`.escalated` v1, and the
 /// reducer keys in `rezidnt-state`): `run`, `request_id`, `policy_ref: CasRef`,
-/// optional `evidence_ref: CasRef`, optional `reason`. Optional keys are OMITTED
+/// optional `evidence_ref: CasRef`, optional `reason`, and the optional
+/// accumulator/cost deltas ([`DecisionDeltas`]). Optional keys are OMITTED
 /// entirely when `None` — never emitted as JSON `null`. `policy_ref` /
 /// `evidence_ref` are CAS refs so `gate why` / `gate_explain` can resolve the
 /// deciding policy and evidence (I6); bytes never ride inline (I2).
@@ -87,6 +107,7 @@ pub fn decided_fact(
     policy_ref: &CasRef,
     evidence_ref: Option<&CasRef>,
     reason: Option<&str>,
+    deltas: DecisionDeltas,
 ) -> (&'static str, Value) {
     let subject = decision_for(verdict).subject();
 
@@ -102,6 +123,18 @@ pub fn decided_fact(
     }
     if let Some(reason) = reason {
         payload["reason"] = Value::String(reason.to_string());
+    }
+    // Accumulator/cost deltas: PRESENT keys ride the payload verbatim; absent
+    // deltas are OMITTED, never JSON `null` (the reducer's `.as_f64()` must see
+    // absence, not a null-that-is-0 — I3 fold correctness).
+    if let Some(spend) = deltas.spend_delta_usd {
+        payload["spend_delta_usd"] = json!(spend);
+    }
+    if let Some(risk) = deltas.risk_delta {
+        payload["risk_delta"] = json!(risk);
+    }
+    if let Some(cost_ms) = deltas.cost_ms {
+        payload["cost_ms"] = json!(cost_ms);
     }
 
     (subject, payload)

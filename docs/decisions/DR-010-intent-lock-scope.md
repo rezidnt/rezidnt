@@ -14,6 +14,8 @@ The load-bearing fork (design §3): the run's intent→allowed-tool-set must be 
 
 ## Decision
 
+> **Amended by [DR-012](DR-012-empty-vs-absent-intent.md).** The "intent-absent → escalate never a pass" clause below narrows to *genuinely*-absent intent (`Option::None`); a *declared-empty* allowlist (`Some([])`) is instead treated as every-tool-off-task (escalate/deny per `on_off_task`).
+
 1. **Ratify SP-intent scope + acceptance criteria.** Adopt the §8 criteria of [`docs/design/intent-lock.md`](../design/intent-lock.md) as SP-intent's definition of done: an `intent-lock` native permit-verifier registered in `builtin_natives()`; `run.intent.declared` minted and folding to a rebuild-stable per-run intent state; in-intent tool → allow, off-task → escalate (deny under the hardened knob) with interrogable evidence naming the off-task tool + the intent, intent-absent → escalate never a pass; `gate_explain` surfaces the escalation/denial (reason + policy_ref + evidence_ref); and the **accept demo** (memo 001 scenario 5) — a declared on-task intent, an injected off-task request blocked (escalated), an on-task request passing, one take, replayable. This extends DR-009's roadmap note; no invariant text changes.
 
 2. **Ratify the §3 fork.** The intent→allowed-tool-set is **DECLARED and content-pinned**, read by the verifier, never re-derived at decision time (protects the determinism BINDING + I6). **(a) explicit intent manifest is the SP-intent deliverable** — RECOMMENDED and in-scope. **(b) recorded out-of-band derivation is DEFERRED** behind its own later note; it is not built in SP-intent and must not be pulled in.

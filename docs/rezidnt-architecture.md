@@ -359,8 +359,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-009](decisions/DR-009-match-omnigent-scope.md) | Match-Omnigent scope (four memo-surfaced permit capabilities) | ACCEPTED | §16 |
 | [DR-010](decisions/DR-010-intent-lock-scope.md) | SP-intent scope + criteria (C7 intent-lock) | ACCEPTED | §16 |
 | [DR-011](decisions/DR-011-permit-pdp-config-seam.md) | Permit PDP config-resolution seam (McpSubstrate method) | ACCEPTED | §8, §9 |
+| [DR-012](decisions/DR-012-empty-vs-absent-intent.md) | Declared-empty vs absent intent allowlist (intent-lock) | ACCEPTED | §16 |
 
-*The next record is DR-012.*
+*The next record is DR-013.*
 
 ---
 

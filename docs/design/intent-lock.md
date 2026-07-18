@@ -22,6 +22,8 @@ The determinism BINDING (gate-authoring: same content-hashed inputs → same ver
 This split keeps SP-intent honest and shippable while leaving room for the smarter derivation without a determinism violation.
 
 ## 4. The `intent-lock` verifier (a native permit-verifier on the `permit` gate)
+> **Amended by [DR-012](../decisions/DR-012-empty-vs-absent-intent.md).** A *declared-empty* `allowed_tools: []` (`AgentRunState.intent == Some`) means **every tool is off-task** → the off-task path (escalate default, deny under `on_off_task`), NOT cannot-run. Only genuinely-*absent* intent (`Option::None`, key omitted) is cannot-run → escalate.
+
 On a `permit.requested`, compare the requested `target.tool` (and action) against the run's pinned intent allowlist:
 - **in-set → `Pass`** (→ `permit.granted`).
 - **off-task → the honesty question.** Off-task tool use may be a prompt injection or a benign scope-expansion — rezidnt does not know. So the **default is `Inconclusive` → `permit.escalated`** (route to a human; never coerced, I6), with a policy knob (`on_off_task = escalate | deny`, default `escalate`) to harden to `Fail`/`permit.denied` for high-assurance runs. This matches the product's "ask-a-human is the honest default" and the `on_inconclusive` knob SP1 already models.

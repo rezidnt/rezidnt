@@ -1,53 +1,67 @@
-# Handoff — 2026-07-18 (session 6: permit-engine pivot + SP0 COMPLETE)
+# Handoff — 2026-07-18 (session 7: SP1 COMPLETE — request_permission + native permit pack)
 
 ## State of play
-Big strategic pivot this session: rezidnt now **replaces Omnigent's permission axis** (pre-hoc
-"may") natively, not just composes alongside it. Ratified in **DR-008**; scope of what to match
-set in **DR-009**; sized by **intel memo 001** (clean-room, cited). Then built the first slice.
+**SP1 is DONE.** Passed `/vet` (`{"verdict":"pass"}`) and `/debrief` (auditor **pass** — the
+I6 non-coercion guarantee is *structural*, not just tested). Committed as **`c430caf`** and
+**PUSHED** to origin/main (`4d8edac..c430caf`; owner-authorized this session). Tree clean.
+Pointer advanced to **SP-intent** (owner's choice for next slice — but see the blocker below).
 
-**Current slice: SP0 (permit gate lifecycle point) — DONE.** Passed `/vet`
-(`{"verdict":"pass"}`) and `/debrief` (auditor **pass** — the I6 "inconclusive never coerced"
-guarantee is *structural*, not just tested). Pointer advanced to **SP1**. All pushed; tree clean.
-
-## What changed this session — 6 commits, ALL PUSHED (`9d4d424..4d8fcd8`)
-- **`b97a056`** IA cleanup: decision records extracted from the architecture doc into
-  `docs/decisions/` (one file each, DR-001..007), `§20` index added, `/dr` workflow rewired
-  (scribe + command now write to `docs/decisions/`), stale-section "amended by" pointers.
-- **`127ee97` DR-008** — the pivot: rezidnt owns both axes via a permit engine. Design sketch
-  `docs/design/permit-engine.md` (PDP/PEP split, `permit` gate, policy-as-verifier, macaroons).
-- **`3a1a0b3` intel memo 001** — `intel/001-omnigent-permission-governance.md`: 12-row capability
-  matrix + 10-scenario benchmark seed. Omnigent = Databricks meta-harness (Apache-2.0).
-- **`d6e48eb` DR-009** — folds four memo gaps into scope: C1 spend/rate→SP1, C7 intent-lock→new
-  SP-intent, C8 layered precedence→SP4, C3 sandbox/egress→own later phase (fenced behind its own DR).
-- **`ae85b2a` /subject (warden)** — mints `permit.requested/granted/denied/escalated` +
-  pure reducer (per-run ledger + session accumulators: cumulative_spend_usd, risk_score, counts).
-  `SUBJECTS_V0` 35→39, drift guard green.
-- **`4d8fcd8` SP0 (oracle→impl→vet→debrief)** — `crates/rezidnt-gate/src/permit.rs`:
-  `LIFECYCLE_POINT="permit"`, `PermitDecision`, total non-coercing `decision_for`
-  (Pass→Grant/Fail→Deny/Inconclusive→Escalate), `decided_fact`/`requested_fact` (policy_ref +
-  optional evidence_ref/reason omitted-not-null; bulk context as CasRef, I2). Golden fixtures pin
-  the folds; producer/reducer/ontology wire keys agree (auditor-verified, no drift).
+## What changed this session — 1 commit, PUSHED (`c430caf`)
+Full oracle→implementer→vet→debrief loop on SP1 (permit-engine, DR-008/009; design
+`docs/design/permit-engine.md` §5/§6/§11 + DR-009 folding C1 into SP1):
+- **`crates/rezidnt-types/src/mcp.rs`** — `RequestPermissionArgs` (schemars; required
+  `badge`/`run`/`action`/`tool`, optional `context_ref` as `cas:blake3:` ref-string). Badge
+  required per design §5 (result authorizes a mutation → caller identity).
+- **`crates/rezidnt-gate/src/lib.rs`** — native permit pack `ToolAllowlist` / `PathScope` /
+  `SpendCap`, registered in `builtin_natives()` as `tool-allowlist`/`path-scope`/`spend-cap`.
+  `SpendCap` (C1) is the load-bearing I6 test: under-soft→Pass, **soft-band→Inconclusive
+  (never coerced)**, hard-cap/rate→Fail, caps-missing→Inconclusive. Inputs come from
+  `inputs.params` (content-hash-pinned, determinism BINDING), never live state.
+- **`crates/rezidnt-gate/src/permit.rs`** — carried SP0 flag CLOSED: `decided_fact` takes a
+  trailing `DecisionDeltas { spend_delta_usd, risk_delta, cost_ms }` and emits each key
+  omitted-when-`None` (never JSON null). Emit-side pinned + folded through the real reducer.
+- **`crates/rezidnt-proto/src/lib.rs`** — `Request::RequestPermission` + `Reply::PermitDecision`
+  (`allow|deny|ask`; `ask` carried verbatim, never coerced). Wire shape only (see blocker A).
+- **`crates/rezidnt-mcp/src/lib.rs`** — `request_permission` MCP tool = the PDP: publishes
+  `permit.requested` + one decision fact (I3), runs `ToolAllowlist`, maps verdict via
+  `decision_for`. `gate_explain` taught to also resolve `permit.granted|denied|escalated`
+  (honest absence → `GATE_NO_VERDICT`, never a synthesized pass). New `with_cas` seam.
+- **`bins/rezidentd/src/main.rs`** — `Request::RequestPermission` arm answers honest
+  `op.not_served` (socket servicing is SP2, not this slice).
+- Tests/fixtures: `permit_natives.rs` (12), `request_permission.rs` (7), `permit_request.rs`
+  (4), extended `permit_emit.rs` (8), golden `permit_deny_demo.{jsonl,expected.json}`.
 
 ## Next action
-**Start SP1 with `/oracle`.** SP1 = `request_permission` MCP tool + socket path, and the native
-permit-verifiers: **tool-allowlist, path-scope, and C1 spend/rate limits**. Oracle-first as always.
+**Spec SP-intent BEFORE any `/oracle`.** SP-intent (C7 intent-lock: bind an agent's tool
+allowlist to the run's initiating intent, block off-task tool use / anti-prompt-injection) is a
+**roadmap note only** — DR-009 added it "after SP1's native verifiers land" (now) but wrote NO
+acceptance criteria. C7 came from intel memo 001, so **DR-002 rule 3 requires its own DR citing
+the memo before any design change.** So the next action is a design sketch + a `/dr` (scribe)
+that sets SP-intent's scope and criteria — NOT jumping to the oracle. Only after criteria exist:
+`/oracle` → implementer → `/vet` → `/debrief`.
 
-## Open /debrief findings (SP0 — one flag carried to SP1, not a defect)
-- `decided_fact` (`crates/rezidnt-gate/src/permit.rs`) does **not** yet emit
-  `spend_delta_usd`/`risk_delta`/`cost_ms`. The reducer reads them and fixtures carry them
-  (additive optionals), so SP0 is internally consistent — but no emit-side oracle pins those two
-  keys, so a future producer/consumer drift on them would slip past `permit_emit.rs`.
-  **SP1 fix:** add spend/risk params to `decided_fact` + an emit-side pin when the C1 spend-cap
-  verifier lands (that verifier is the producer).
+## Open /debrief findings (SP1 — two coverage notes carried, neither a defect)
+- **Only `ToolAllowlist` is wired into the live `request_permission` path.** `PathScope` and
+  `SpendCap` exist, are registered, and are unit-pinned, but are NOT reachable through the MCP
+  surface this slice. So criterion-4's "the spend-cap verifier is the producer of the deltas" is
+  demonstrated **structurally** (direct `decided_fact` + reducer fold in `permit_emit.rs`), not
+  end-to-end through a live decision. Closes when the permit gate gains verifier-config wiring.
+- **Live path passes `DecisionDeltas::default()`**, so a real surface decision emits no `cost_ms`
+  even when the native measured evidence. Not a violation (all delta keys optional/omitted), but
+  thread `output.cost_ms` into `DecisionDeltas` on the live path when convenient.
+- (Owner declined an "SP1.5 wire-natives-live" consolidation slice; both notes fold into SP2's
+  PEP wiring instead.)
 
-## Decisions still needing a /dr (permit stream)
-- **C3 sole-chokepoint enforcement** (OS sandbox + L7 egress proxy + credential brokering):
-  committed to the roadmap by DR-009 but **fenced** — needs its own design sketch + its own
-  implementation DR before any build. Do not start it as a slice.
+## Blockers / decisions still needing a /dr (permit stream)
+- **SP-intent (C7) needs its own /dr** (design sketch + scope/criteria, citing memo 001) before
+  it can be sliced — this is the gating next action above.
+- **C8 layered policy precedence** → folds into SP4 (roles); not yet designed.
+- **C3 sole-chokepoint enforcement** (OS sandbox + L7 egress + credential brokering): committed
+  by DR-009 but **fenced** — needs its own design sketch + implementation DR before any build.
 - Any design change motivated by memo 001 needs its own DR citing it (DR-002 rule 3).
 - Pre-permit carried debt still open: DR-007 GitError→associated-type (2nd RepoSubstrate impl);
-  badge.issued emitter / badge_id on other mutations; release items (root README, `rezident`
-  fallback note, crates.io needs owner `cargo login`); Phase 3 stays demand-gated.
+  badge.issued emitter / badge_id on other mutations; release items (root README, crates.io
+  owner `cargo login`); Phase 3 stays demand-gated.
 
 ## Environment
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`
@@ -57,6 +71,5 @@ daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never c
 [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask before pushing.
 
 ---
-**NEXT ACTION → Start SP1 with `/oracle`: `request_permission` MCP tool + socket, and native
-permit-verifiers (tool-allowlist, path-scope, C1 spend/rate). Carry the SP0 flag: add
-spend_delta_usd/risk_delta to `decided_fact` with an emit-side pin.**
+**NEXT ACTION → Spec SP-intent (C7 intent-lock) first: a design sketch + a `/dr` citing intel memo
+001 to set scope + acceptance criteria (DR-002 rule 3). Do NOT `/oracle` until criteria exist.**

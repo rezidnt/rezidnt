@@ -358,8 +358,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-008](decisions/DR-008-permit-engine-pivot.md) | Permit-engine pivot (rezidnt owns both axes) | ACCEPTED | §1, §8, §16 |
 | [DR-009](decisions/DR-009-match-omnigent-scope.md) | Match-Omnigent scope (four memo-surfaced permit capabilities) | ACCEPTED | §16 |
 | [DR-010](decisions/DR-010-intent-lock-scope.md) | SP-intent scope + criteria (C7 intent-lock) | ACCEPTED | §16 |
+| [DR-011](decisions/DR-011-permit-pdp-config-seam.md) | Permit PDP config-resolution seam (McpSubstrate method) | ACCEPTED | §8, §9 |
 
-*The next record is DR-011.*
+*The next record is DR-012.*
 
 ---
 

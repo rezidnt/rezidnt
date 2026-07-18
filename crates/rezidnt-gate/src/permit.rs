@@ -18,10 +18,11 @@
 //! `request_permission` MCP tool/socket, the native permit-verifier pack, and
 //! policy engines (exec/OPA/Cedar) are SP1–SP4, not here.
 
+use rezidnt_cas::Cas;
 use rezidnt_types::refs::CasRef;
 use serde_json::{Value, json};
 
-use crate::Verdict;
+use crate::{Evidence, GateError, Verdict, VerifierInput, builtin_natives};
 
 /// The fourth gate lifecycle point (design §4; project spec `[gates.permit]`).
 /// String-modeled like the existing three — a `GateDef` whose `name` is this is
@@ -166,4 +167,239 @@ pub fn requested_fact(
     }
 
     ("permit.requested", payload)
+}
+
+/// One resolved entry in the configured `[gates.permit]` verifier set: a native
+/// name plus its content-pinned params. This is the SP-wire dispatch unit — the
+/// daemon builds it from `VerifierSpec` plus the folded per-run state injected as
+/// content-pinned params (determinism BINDING). The aggregator merges each
+/// verifier's own `params` with the shared request axis (the requested `tool`,
+/// target `paths`, etc.) so both the request and the policy config reach the
+/// native as one pinned `inputs.params` object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermitVerifierSpec {
+    /// The native name resolved via [`builtin_natives`] (`name()`).
+    pub name: String,
+    /// The verifier's pinned params (its `[gates.permit].verifiers` config, e.g.
+    /// `{ "allow": [...] }`), merged over the shared request axis.
+    pub params: Value,
+}
+
+/// The aggregate outcome of dispatching a configured permit-verifier set: the
+/// terminal three-valued [`Verdict`], its mapped [`PermitDecision`], the deciding
+/// verifier's name + evidence (so the caller can pin `policy_ref`/`evidence_ref`
+/// to the REAL reason, I6), the deciding verifier's merged params (the policy
+/// descriptor the caller pins to CAS as `policy_ref`), and how many verifiers ran
+/// (short-circuit proof).
+#[derive(Debug, Clone)]
+pub struct PermitOutcome {
+    /// The aggregate three-valued verdict (all-pass ⇒ Pass; first Fail ⇒ Fail;
+    /// else any Inconclusive ⇒ Inconclusive; empty set ⇒ Inconclusive).
+    pub verdict: Verdict,
+    /// `decision_for(verdict)` — never a bespoke coercion (I6).
+    pub decision: PermitDecision,
+    /// The deciding verifier's name (the first Fail, else the first Inconclusive,
+    /// else the last passing verifier; empty for the empty configured set).
+    pub deciding_verifier: String,
+    /// The deciding verifier's merged params (request axis + its config) — the
+    /// policy descriptor the caller pins to CAS as `policy_ref` so the decision
+    /// stays replayable/interrogable (I3).
+    pub deciding_params: Value,
+    /// The deciding verifier's evidence (a CAS ref, never inline bytes, I2).
+    pub evidence: Vec<Evidence>,
+    /// The deciding evidence's REAL [`CasRef`] — its true `bytes`/`mime`,
+    /// recovered from the store at aggregation time — so the emit site pins an
+    /// HONEST `evidence_ref` and never fabricates the blob's own metadata
+    /// (`bytes: 0`). `None` when the deciding outcome has no evidence blob (a
+    /// grant, an empty set) or the recorded ref is not a resolvable
+    /// `cas:blake3:` ref. The `evidence` string above still carries the ref for
+    /// display; this is the metadata-honest companion.
+    pub deciding_evidence_ref: Option<CasRef>,
+    /// How many verifiers ran before the outcome was decided (first Fail
+    /// short-circuits; Inconclusive does not — only Fail stops the scan).
+    pub verifiers_run: usize,
+}
+
+/// Recover the deciding evidence's HONEST [`CasRef`] from the store — the
+/// finding this closes: the emit site used to reconstruct a `CasRef` with
+/// `bytes: 0` from the bare `cas:blake3:` string, so a durable decision fact
+/// misreported its own evidence blob's size. Here we resolve the FIRST
+/// evidence's ref hash and recover the blob's TRUE byte length from the store's
+/// filesystem metadata — a `stat`, never an inline read of the blob content
+/// (I2: we size the blob without routing its bytes anywhere). The store does
+/// not persist a per-blob mime, so an opaque CAS blob is honestly
+/// `application/octet-stream` (the house convention for a ref whose content
+/// format is not recorded — never a fabricated `text/plain` claim).
+///
+/// Returns `None` when there is no evidence, the evidence carries no ref, the
+/// ref is not a `cas:blake3:` ref, or the blob cannot be `stat`ed (a missing
+/// blob is not an error here — it just means no honest metadata to pin, so the
+/// emit site omits the ref rather than assert a fabricated one).
+fn honest_evidence_ref(evidence: &[Evidence], cas: &Cas) -> Option<CasRef> {
+    let hash = evidence
+        .first()
+        .and_then(|e| e.cas_ref.as_deref())
+        .and_then(|r| r.strip_prefix("cas:blake3:"))?;
+    // `stat` the content-addressed blob for its TRUE size — metadata only, the
+    // bytes never leave the store (I2). A blob the store cannot stat yields no
+    // honest ref (None), never a fabricated one.
+    let bytes = std::fs::metadata(cas.path_for(hash)).ok()?.len();
+    Some(CasRef {
+        hash: hash.to_string(),
+        bytes,
+        mime: "application/octet-stream".to_string(),
+    })
+}
+
+/// Merge a verifier's own pinned `params` over the shared request-axis `params`.
+/// The request axis (the requested `tool`, target `paths`, folded run state)
+/// rides `input.params`; each verifier's config (`allow`, caps, knobs) rides its
+/// `PermitVerifierSpec.params`. Both must reach the native as one pinned object,
+/// so we start from the request axis and overlay the verifier's keys (verifier
+/// config wins on a key collision — the config is the policy). Non-object
+/// verifier params are ignored (there is nothing to overlay).
+fn merge_params(request: &Value, verifier: &Value) -> Value {
+    let mut merged = request.clone();
+    if let (Some(target), Some(overlay)) = (merged.as_object_mut(), verifier.as_object()) {
+        for (k, v) in overlay {
+            target.insert(k.clone(), v.clone());
+        }
+    }
+    merged
+}
+
+/// Dispatch a configured permit-verifier set IN ORDER and aggregate the verdicts
+/// into one permit outcome (the SP-wire aggregation seam; mirrors the S4
+/// `run_gate` first-fail short-circuit, mapped to a [`PermitDecision`]).
+///
+/// Semantics (the aggregation the oracle pins):
+/// - run the natives in order; the FIRST `Fail` SHORT-CIRCUITS → the outcome is
+///   Deny carrying THAT verifier's evidence/params (Fail > Escalate; deny is
+///   stronger, I6);
+/// - an `Inconclusive` does NOT short-circuit — the scan continues (only Fail
+///   stops it), but the FIRST inconclusive is remembered as the fallback deciding
+///   verifier;
+/// - if the scan completes with no Fail but at least one Inconclusive → Escalate
+///   carrying the first inconclusive's evidence (route to a human, NEVER coerced
+///   to allow, I6);
+/// - all `Pass` → Grant;
+/// - an EMPTY configured set → Escalate (undecidable is not a synthesized allow,
+///   I6) — the deciding verifier is empty and there is no evidence.
+///
+/// The aggregate verdict maps via [`decision_for`] — the aggregation layer reuses
+/// the ratified honesty mapping, never re-deriving it.
+///
+/// An unknown native name is a can't-run → `Inconclusive` (honest), NEVER a pass.
+pub fn aggregate(
+    set: &[PermitVerifierSpec],
+    input: &VerifierInput,
+    cas: &Cas,
+) -> Result<PermitOutcome, GateError> {
+    let natives = builtin_natives();
+
+    // Empty configured set: undecidable → Escalate, never a synthesized allow (I6).
+    if set.is_empty() {
+        return Ok(PermitOutcome {
+            verdict: Verdict::Inconclusive,
+            decision: decision_for(Verdict::Inconclusive),
+            deciding_verifier: String::new(),
+            deciding_params: Value::Null,
+            evidence: Vec::new(),
+            deciding_evidence_ref: None,
+            verifiers_run: 0,
+        });
+    }
+
+    // The first inconclusive is the escalate-fallback deciding verifier; it is
+    // only promoted to the outcome if the scan completes without a Fail.
+    let mut first_inconclusive: Option<(String, Value, Vec<Evidence>)> = None;
+    let mut verifiers_run = 0usize;
+
+    for spec in set {
+        verifiers_run += 1;
+        let merged = merge_params(&input.params, &spec.params);
+        let per_input = VerifierInput {
+            gate: input.gate.clone(),
+            workspace: input.workspace.clone(),
+            refs: input.refs.clone(),
+            params: merged.clone(),
+            timeout_ms: input.timeout_ms,
+        };
+
+        // Resolve the native by name; an unknown name is a can't-run →
+        // Inconclusive (honest), never a pass (I6).
+        let out = match natives.iter().find(|n| n.name() == spec.name) {
+            Some(native) => native.verify(&per_input, cas)?,
+            None => {
+                let evidence = vec![Evidence {
+                    kind: "cannot-run".to_string(),
+                    msg: format!("unknown native verifier {}", spec.name),
+                    cas_ref: None,
+                }];
+                if first_inconclusive.is_none() {
+                    first_inconclusive =
+                        Some((spec.name.clone(), merged.clone(), evidence.clone()));
+                }
+                continue;
+            }
+        };
+
+        match out.verdict {
+            Verdict::Fail => {
+                // First Fail short-circuits → Deny carrying THIS verifier's
+                // evidence/params (Fail > any earlier Inconclusive, I6).
+                let deciding_evidence_ref = honest_evidence_ref(&out.evidence, cas);
+                return Ok(PermitOutcome {
+                    verdict: Verdict::Fail,
+                    decision: decision_for(Verdict::Fail),
+                    deciding_verifier: spec.name.clone(),
+                    deciding_params: merged,
+                    evidence: out.evidence,
+                    deciding_evidence_ref,
+                    verifiers_run,
+                });
+            }
+            Verdict::Inconclusive => {
+                // Does NOT short-circuit; remember the first inconclusive as the
+                // fallback deciding verifier and keep scanning for a later Fail.
+                if first_inconclusive.is_none() {
+                    first_inconclusive = Some((spec.name.clone(), merged, out.evidence));
+                }
+            }
+            Verdict::Pass => {}
+        }
+    }
+
+    // No Fail. If any Inconclusive was seen → Escalate carrying the FIRST one's
+    // evidence; else all passed → Grant.
+    match first_inconclusive {
+        Some((name, params, evidence)) => {
+            let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
+            Ok(PermitOutcome {
+                verdict: Verdict::Inconclusive,
+                decision: decision_for(Verdict::Inconclusive),
+                deciding_verifier: name,
+                deciding_params: params,
+                evidence,
+                deciding_evidence_ref,
+                verifiers_run,
+            })
+        }
+        None => {
+            // All passed. The deciding verifier is the last one that ran (a
+            // grant has no single "reason"; the caller pins the whole set's tail
+            // as the policy descriptor). No evidence on a grant.
+            let last = set.last().expect("non-empty set has a last entry");
+            let merged = merge_params(&input.params, &last.params);
+            Ok(PermitOutcome {
+                verdict: Verdict::Pass,
+                decision: decision_for(Verdict::Pass),
+                deciding_verifier: last.name.clone(),
+                deciding_params: merged,
+                evidence: Vec::new(),
+                deciding_evidence_ref: None,
+                verifiers_run,
+            })
+        }
+    }
 }

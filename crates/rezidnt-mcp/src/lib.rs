@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
-use rezidnt_gate::NativeVerifier as _;
+use rezidnt_gate::permit::PermitVerifierSpec;
 use rezidnt_run::badge::Badge;
 use rezidnt_run::spec::ProjectSpec;
 use serde_json::{Value, json};
@@ -151,6 +151,46 @@ pub struct OpenAck {
     pub correlation: String,
 }
 
+/// The resolved `[gates.permit]` verifier set for a run — the ordered native
+/// name/params pairs the PDP dispatches (SP-wire, DR-011). The daemon folds this
+/// from the applied spec (`workspace.spec.applied`, keyed by workspace, I3);
+/// the core injects the run's folded state as pinned params and aggregates via
+/// [`rezidnt_gate::permit::aggregate`].
+///
+/// An EMPTY set is honest-undecidable: the aggregator escalates it, never a
+/// synthesized allow (I6). NO config resolved at all (bare core, no substrate)
+/// degrades the same way — escalate/deny, never allow (DR-011 §3).
+#[derive(Debug, Clone, Default)]
+pub struct PermitConfig {
+    verifiers: Vec<PermitVerifierSpec>,
+}
+
+impl PermitConfig {
+    /// Build a config from native `(name, params)` pairs in dispatch order.
+    pub fn natives(entries: &[(&str, Value)]) -> Self {
+        Self {
+            verifiers: entries
+                .iter()
+                .map(|(name, params)| PermitVerifierSpec {
+                    name: (*name).to_string(),
+                    params: params.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Build a config from already-resolved verifier specs (the daemon path,
+    /// where the specs come from the applied `[gates.permit]` block).
+    pub fn from_specs(verifiers: Vec<PermitVerifierSpec>) -> Self {
+        Self { verifiers }
+    }
+
+    /// The resolved verifier set, in dispatch order.
+    pub fn verifiers(&self) -> &[PermitVerifierSpec] {
+        &self.verifiers
+    }
+}
+
 /// The daemon-side seam behind the mutating tools (I4: the core stays
 /// transport- and substrate-agnostic; the daemon implements this over its run
 /// substrate). Read-only tools and resources never touch it — they interrogate
@@ -168,6 +208,14 @@ pub trait McpSubstrate: Send + Sync {
         agent: String,
         idempotency_key: String,
     ) -> BoxFuture<Result<String, ToolRefusal>>;
+
+    /// Resolve the applied `[gates.permit]` verifier set for a run (SP-wire,
+    /// DR-011 §1). The daemon folds this from its opened-workspace registry
+    /// (`workspace.spec.applied`, keyed by workspace, I3); config selection is a
+    /// substrate capability, like `open_project`/`spawn_agent` (I4). `None` when
+    /// the run maps to no configured permit gate — the PDP then degrades to
+    /// escalate/deny, never a synthesized allow (I6).
+    fn permit_config_for(&self, run: String) -> BoxFuture<Option<PermitConfig>>;
 }
 
 /// The transport-agnostic MCP core: one JSON-RPC request in, one response
@@ -186,6 +234,13 @@ pub struct McpCore {
     /// Ephemeral fallback CAS for a core with no wired CAS — opened once under
     /// the OS temp dir on first permit decision, then reused.
     ephemeral_cas: OnceLock<Arc<Cas>>,
+    /// A statically-injected permit config (SP-wire, DR-011): the resolved
+    /// `[gates.permit]` verifier set to dispatch for EVERY run on this core.
+    /// The daemon-wired path resolves per-run via
+    /// [`McpSubstrate::permit_config_for`]; a static config is the test-double /
+    /// single-workspace seam. `None` here AND no substrate ⇒ no config ⇒
+    /// escalate/deny, never a synthesized allow (I6, DR-011 §3).
+    permit_config: Option<PermitConfig>,
 }
 
 impl McpCore {
@@ -202,6 +257,7 @@ impl McpCore {
             substrate: None,
             cas: None,
             ephemeral_cas: OnceLock::new(),
+            permit_config: None,
         }
     }
 
@@ -216,6 +272,16 @@ impl McpCore {
     /// wires its own CAS, bare test cores fall back to an ephemeral one).
     pub fn with_cas(mut self, cas: Arc<Cas>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Wire a STATIC permit config (SP-wire, DR-011): the resolved
+    /// `[gates.permit]` verifier set the PDP dispatches for every run on this
+    /// core. The daemon-wired path resolves per-run via the substrate instead;
+    /// this builder is the single-workspace / test-double seam. Absent config
+    /// (this unset AND no substrate) degrades to escalate/deny (I6).
+    pub fn with_permit_config(mut self, config: PermitConfig) -> Self {
+        self.permit_config = Some(config);
         self
     }
 
@@ -434,46 +500,90 @@ impl McpCore {
         }
         self.publish_fact("permit.requested", requested).await?;
 
-        // Run the permit gate: the action-tool axis (design §2 — the permit
-        // gate fills the `--allowedTools` enforcement middle). Inputs are pinned
-        // via the verbatim `inputs.params` (determinism BINDING). With no
-        // allowlist configured on a bare surface the tool is not listed → deny;
-        // when the tool descriptor is absent the native escalates (ask), never
-        // a synthesized allow (I6).
+        // SP-wire (DR-011): dispatch the CONFIGURED `[gates.permit]` verifier
+        // set — not a hardcoded single verifier — and aggregate via
+        // `permit::aggregate`. Config resolution is a substrate capability
+        // (DR-011 §1); the core folds the run's state itself (DR-011 §2).
         let cas = self.permit_cas()?;
-        let allow = args.get("allow").cloned().unwrap_or_else(|| json!([]));
+
+        // 1. Resolve the applied verifier set: a static config (test / single
+        //    workspace) wins; else the substrate resolves it per-run; else NO
+        //    config — the aggregator escalates an empty set (I6, DR-011 §3).
+        let config = match &self.permit_config {
+            Some(config) => config.clone(),
+            None => match &self.substrate {
+                Some(substrate) => substrate
+                    .permit_config_for(run.clone())
+                    .await
+                    .unwrap_or_default(),
+                None => PermitConfig::default(),
+            },
+        };
+
+        // 2. Fold this run's per-run state from the fabric the core holds
+        //    (DR-011 §2; the same discipline `resources_read` uses). The intent
+        //    allowlist and the spend accumulator are injected as CONTENT-PINNED
+        //    params — NEVER live state, NEVER re-derived (determinism BINDING).
+        let folded = self.fold_run_state(&run).await?;
+
+        // 3. The request axis + folded state as pinned params. Each verifier's
+        //    own config (`allow`, caps, knobs) rides its `PermitVerifierSpec`
+        //    and the aggregator merges it over this base.
+        let mut base_params = json!({ "tool": tool });
+        if let Some(obj) = base_params.as_object_mut() {
+            if let Some(paths) = args.get("paths") {
+                obj.insert("paths".to_string(), paths.clone());
+            }
+            if let Some(intent) = &folded.intent
+                && !intent.allowed_tools.is_empty()
+            {
+                obj.insert("allowed_tools".to_string(), json!(intent.allowed_tools));
+            }
+            obj.insert(
+                "cumulative_spend_usd".to_string(),
+                json!(folded.permit_accumulators.cumulative_spend_usd),
+            );
+        }
+
         let input = rezidnt_gate::VerifierInput {
             gate: rezidnt_gate::permit::LIFECYCLE_POINT.to_string(),
             workspace: None,
             refs: BTreeMap::new(),
-            params: json!({ "tool": tool, "allow": allow }),
+            params: base_params,
             timeout_ms: rezidnt_gate::DEFAULT_TIMEOUT_MS,
         };
-        let output = {
+
+        // 4. Aggregate the configured set IN ORDER (first Fail short-circuits →
+        //    Deny; else any Inconclusive → Escalate; else Grant). The aggregate
+        //    verdict maps via `decision_for` (I6: inconclusive → ask, never
+        //    coerced). Off the async threads (CAS is blocking).
+        let outcome = {
             let cas = Arc::clone(&cas);
-            tokio::task::spawn_blocking(move || rezidnt_gate::ToolAllowlist.verify(&input, &cas))
-                .await
-                .map_err(|e| (-32603, format!("permit verify task panicked: {e}")))?
-                .map_err(|e| (-32603, format!("permit verify: {e}")))?
+            let verifiers = config.verifiers().to_vec();
+            let input = input.clone();
+            tokio::task::spawn_blocking(move || {
+                rezidnt_gate::permit::aggregate(&verifiers, &input, &cas)
+            })
+            .await
+            .map_err(|e| (-32603, format!("permit aggregate task panicked: {e}")))?
+            .map_err(|e| (-32603, format!("permit aggregate: {e}")))?
         };
 
-        // Map the three-valued verdict to a decision (I6: inconclusive → ask,
-        // never coerced). The deciding policy + evidence are pinned into the CAS
-        // so the decision is interrogable via `gate_explain` (I6).
-        let decision = rezidnt_gate::permit::decision_for(output.verdict);
-        let decision_word = match decision {
+        let decision_word = match outcome.decision {
             rezidnt_gate::permit::PermitDecision::Grant => "allow",
             rezidnt_gate::permit::PermitDecision::Deny => "deny",
             rezidnt_gate::permit::PermitDecision::Escalate => "ask",
         };
-        let reason = output.evidence.first().map(|e| e.msg.clone());
+        let reason = outcome.evidence.first().map(|e| e.msg.clone());
 
-        // Pin the deciding policy (the params evaluated) into the CAS so the
-        // policy_ref on the decision fact resolves (I6, I2 — ref not inline).
+        // 5. Emit ONE aggregate decision fact carrying the DECIDING verifier's
+        //    policy_ref (its merged params, pinned to CAS — I2 ref not inline)
+        //    and evidence_ref (its evidence blob). `gate_explain` then surfaces
+        //    the REAL deciding verifier, not a hardcoded `tool-allowlist`.
         let policy_bytes = json!({
             "gate": "permit",
-            "verifier": "tool-allowlist",
-            "params": { "tool": tool, "allow": args.get("allow").cloned().unwrap_or_else(|| json!([])) },
+            "verifier": outcome.deciding_verifier,
+            "params": outcome.deciding_params,
         })
         .to_string();
         let policy_ref = {
@@ -485,21 +595,17 @@ impl McpCore {
             .map_err(|e| (-32603, format!("policy pin task panicked: {e}")))?
             .map_err(|e| (-32603, format!("pin policy: {e}")))?
         };
-        // The evidence blob a native failure wrote (if any) carries as the
-        // decision's evidence_ref (I2: ref, never inline bytes).
-        let evidence_ref = output
-            .evidence
-            .first()
-            .and_then(|e| e.cas_ref.as_deref())
-            .and_then(|r| r.strip_prefix("cas:blake3:"))
-            .map(|hash| rezidnt_types::refs::CasRef {
-                hash: hash.to_string(),
-                bytes: 0,
-                mime: "text/plain".to_string(),
-            });
+        // The deciding verifier's evidence blob (if any) carries as the
+        // decision's evidence_ref (I2: ref, never inline bytes). The aggregator
+        // already recovered the blob's HONEST metadata (true `bytes`, from a
+        // store `stat`) into `deciding_evidence_ref` — carry it verbatim rather
+        // than reconstruct a `CasRef` with a fabricated `bytes: 0` from the bare
+        // `cas:blake3:` string. A durable decision fact must not misstate its own
+        // evidence blob's size (I3 fact fidelity).
+        let evidence_ref = outcome.deciding_evidence_ref.clone();
 
         let (subject, payload) = rezidnt_gate::permit::decided_fact(
-            output.verdict,
+            outcome.verdict,
             &run,
             &request_id,
             &policy_ref,
@@ -514,6 +620,25 @@ impl McpCore {
             obj.insert("reason".to_string(), Value::String(r));
         }
         Ok(tool_ok(result))
+    }
+
+    /// Fold this run's per-run state (intent allowlist + permit accumulators)
+    /// from the fabric the core holds (DR-011 §2, I3) — off the async threads
+    /// (SQLite replay is blocking). Returns the default state for a run the log
+    /// does not know (never a synthesized permit; the aggregator decides).
+    async fn fold_run_state(
+        &self,
+        run: &str,
+    ) -> Result<rezidnt_state::AgentRunState, (i64, String)> {
+        let events = self.replay(None).await?;
+        let run = run.to_string();
+        // Fold on a blocking thread: the fold is pure but scans the whole log.
+        tokio::task::spawn_blocking(move || {
+            let graph = rezidnt_state::fold(events.iter());
+            graph.agent_runs.get(&run).cloned().unwrap_or_default()
+        })
+        .await
+        .map_err(|e| (-32603, format!("permit state fold task panicked: {e}")))
     }
 
     /// Append one fact through the fabric off the async threads (SQLite is

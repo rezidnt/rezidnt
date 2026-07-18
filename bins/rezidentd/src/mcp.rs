@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use rezidnt_mcp::{BoxFuture, McpSubstrate, OpenAck, ToolRefusal, codes};
+use rezidnt_gate::permit::PermitVerifierSpec;
+use rezidnt_mcp::{BoxFuture, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes};
 use rezidnt_types::WorkspaceId;
 use ulid::Ulid;
 
@@ -126,4 +127,62 @@ impl McpSubstrate for McpBridge {
             Ok(run.ulid().to_string())
         })
     }
+
+    /// Resolve the applied `[gates.permit]` verifier set for a run (SP-wire,
+    /// DR-011 §1). The run→workspace link is log-derived (the `agent.spawned`
+    /// fact's envelope `workspace`, I3); the permit gate config is then read from
+    /// the opened-workspace registry (`gates["permit"]`, folded from
+    /// `workspace.spec.applied`). Only NATIVE verifiers dispatch on the permit
+    /// axis (the SP-wire aggregator resolves natives by name); an exec entry in
+    /// a permit gate is skipped. `None` when the run maps to no workspace or the
+    /// workspace configures no permit gate — the PDP then degrades to
+    /// escalate/deny (I6), never a synthesized allow.
+    fn permit_config_for(&self, run: String) -> BoxFuture<Option<PermitConfig>> {
+        let daemon = Arc::clone(&self.daemon);
+        Box::pin(async move {
+            // 1. run → workspace, log-derived from the run's `agent.spawned`
+            //    envelope (I3: the honest source, not a side table).
+            let ws = run_workspace(&daemon, &run).await?;
+
+            // 2. workspace → applied `[gates.permit]` verifier set. The registry
+            //    is derived state folded from `workspace.spec.applied` (I3).
+            let workspaces = daemon.workspaces.lock().await;
+            let entry = workspaces.get(&ws)?;
+            let gate = entry.gates.get("permit")?;
+            let specs: Vec<PermitVerifierSpec> = gate
+                .verifiers
+                .iter()
+                // Permit dispatch is native-only (SP-wire resolves by name); an
+                // exec entry on the permit axis is skipped, never silently run.
+                .filter_map(|v| {
+                    v.native.as_ref().map(|name| PermitVerifierSpec {
+                        name: name.clone(),
+                        params: v.params.clone(),
+                    })
+                })
+                .collect();
+            Some(PermitConfig::from_specs(specs))
+        })
+    }
+}
+
+/// Fold the log to find a run's workspace (the envelope `workspace` on its
+/// `agent.spawned` fact) — the honest run→workspace source (I3), off the async
+/// threads (SQLite replay is blocking). `None` for a run the log never spawned.
+async fn run_workspace(daemon: &Arc<Daemon>, run: &str) -> Option<Ulid> {
+    let fabric = Arc::clone(&daemon.fabric);
+    let run = run.to_string();
+    tokio::task::spawn_blocking(move || {
+        let events = fabric.replay_since(None).ok()?;
+        events.into_iter().find_map(|e| {
+            if e.subject.as_str() == "agent.spawned" && e.payload()["run"].as_str() == Some(&run) {
+                e.workspace.map(|w| w.ulid())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }

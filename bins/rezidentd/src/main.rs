@@ -204,6 +204,7 @@ mod unix_daemon {
                         Arc::clone(&daemon.fabric),
                         rezidnt_mcp::BadgeBook::new(),
                     )
+                    .with_cas(Arc::clone(&daemon.cas))
                     .with_substrate(bridge),
                 );
                 let handle = rezidnt_mcp::serve_http(core, std::path::Path::new(&lockfile))

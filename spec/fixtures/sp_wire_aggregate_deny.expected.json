@@ -1,0 +1,38 @@
+{
+  "events_folded": 3,
+  "last_event": "01SPW1REAGGDENYE3000000000",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "permit.denied": 1,
+    "permit.requested": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01SPW1REAGGDENYRN000000000": {
+      "status": "spawning",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {
+        "01SPW1REAGGDENYRQ000000001": {
+          "action": "tool.invoke",
+          "decision": "denied",
+          "policy_ref": "pa7hsc0p3d3c1d1n67h3aggr3g4700000000000000000000000000000wire01",
+          "reason": "path /etc/shadow outside allowed scope"
+        }
+      },
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.0,
+        "risk_score": 3.0,
+        "granted": 0,
+        "denied": 1,
+        "escalated": 0
+      },
+      "intent": null
+    }
+  },
+  "worktrees": {}
+}

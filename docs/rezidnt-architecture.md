@@ -302,6 +302,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Superseded by [DR-001](decisions/DR-001-native-substrates.md#roadmap-supersedes-16).** The current roadmap lives in the DR; the slices below are the pre-DR-001 (herdr-integrated) plan, kept for provenance.
 >
 > **Amended by [DR-008](decisions/DR-008-permit-engine-pivot.md).** Adds a permit-engine phase (SP0–SP5) between gates (Phase 2) and terminal fidelity (Phase 3).
+>
+> **Amended by [DR-009](decisions/DR-009-match-omnigent-scope.md).** Folds four memo-001 capabilities into the permit phase — spend/rate limits (C1→SP1), intent-lock (C7→new SP-intent), layered admin/dev/session precedence (C8→SP4) — and adds a distinct later sole-chokepoint enforcement phase (C3), fenced behind its own design + DR.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -354,8 +356,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-006](decisions/DR-006-replay-divergence-signal.md) | Replay-divergence integrity signal | ACCEPTED | §8, §14 |
 | [DR-007](decisions/DR-007-release-worktree.md) | RepoSubstrate `release_worktree` as-built | ACCEPTED | §7 |
 | [DR-008](decisions/DR-008-permit-engine-pivot.md) | Permit-engine pivot (rezidnt owns both axes) | ACCEPTED | §1, §8, §16 |
+| [DR-009](decisions/DR-009-match-omnigent-scope.md) | Match-Omnigent scope (four memo-surfaced permit capabilities) | ACCEPTED | §16 |
 
-*The next record is DR-009.*
+*The next record is DR-010.*
 
 ---
 

@@ -745,6 +745,90 @@ impl NativeVerifier for SpendCap {
     }
 }
 
+/// Permit native (SP-intent, DR-010 C7): the `intent-lock` run-intent check.
+/// The requested action's `tool` (a `params` scalar, same key
+/// [`ToolAllowlist`] uses) must be in the run's DECLARED, content-pinned intent
+/// allowlist `params.allowed_tools`. The allowlist is folded from the log
+/// (`AgentRunState.intent`, I3) and passed verbatim in the PINNED `inputs.params`
+/// — the native NEVER re-derives intent and NEVER touches live state
+/// (determinism BINDING, DR-010 §3; a live LLM inference would break I6 replay).
+///
+/// Verdicts (DR-010 §8 crit 2):
+/// - requested tool ∈ `allowed_tools` → Pass (on-task → allow).
+/// - off-task (∉) under the DEFAULT / `escalate` knob → **Inconclusive**
+///   (escalate to a human, NEVER coerced to pass or deny — the load-bearing I6
+///   honesty guard). Evidence names BOTH the off-task tool AND the declared
+///   intent allowlist so `gate_explain` can surface WHY; the evidence blob goes
+///   to the CAS, the fact carries the ref only (I2).
+/// - off-task under the hardened knob `on_off_task = deny` → Fail (deny) for
+///   high-assurance runs, with the same interrogable evidence.
+/// - intent state ABSENT (no allowlist pinned / empty declared set) →
+///   Inconclusive via cannot-run, NEVER a synthesized pass (same discipline as
+///   [`SpendCap`] with missing caps, I6).
+pub struct IntentLock;
+
+impl NativeVerifier for IntentLock {
+    fn name(&self) -> &'static str {
+        "intent-lock"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        let p = &input.params;
+        let Some(tool) = p.get("tool").and_then(Value::as_str) else {
+            return Ok(cannot_run(
+                "no tool in params — undecidable, not a pass (I6)",
+            ));
+        };
+        // The DECLARED, content-pinned intent allowlist. Absent OR empty is
+        // intent-absent: the verifier cannot decide whether the tool is on-task
+        // → cannot-run (never a synthesized pass, DR-010 §8 crit 2d, I6).
+        let allowed = string_list(p, "allowed_tools");
+        if allowed.is_empty() {
+            return Ok(cannot_run(
+                "no intent allowlist pinned — undecidable, not a pass (I6)",
+            ));
+        }
+
+        // On-task: the requested tool is in the declared intent allowlist → allow.
+        if allowed.iter().any(|t| t == tool) {
+            return Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            });
+        }
+
+        // Off-task. The evidence names BOTH the off-task tool AND the declared
+        // intent so the escalation/denial is interrogable (I6, DR-010 §8).
+        let msg = format!(
+            "off-task tool {tool} not in declared intent [{}]",
+            allowed.join(", ")
+        );
+        // The knob is read from the PINNED params (never live state, DR-010 §3);
+        // ABSENT ⇒ escalate (the honest default — deny is opt-in only).
+        let deny = p
+            .get("on_off_task")
+            .and_then(Value::as_str)
+            .is_some_and(|k| k == "deny");
+        if deny {
+            // Hardened knob → Fail (deny). Evidence blob → CAS, ref carried (I2).
+            return fail_evidence(cas, "off-task-tool", &msg);
+        }
+        // DEFAULT / `escalate` → Inconclusive (escalate to a human). NEVER
+        // coerced to pass or auto-deny (I6, DR-010 §3). The evidence blob goes
+        // to the CAS; the fact carries the ref only (I2).
+        let ev = cas.put(msg.as_bytes(), "text/plain")?;
+        Ok(VerifierOutput {
+            verdict: Verdict::Inconclusive,
+            evidence: vec![Evidence {
+                kind: "off-task-tool".to_string(),
+                msg,
+                cas_ref: Some(format!("cas:blake3:{}", ev.hash)),
+            }],
+            cost_ms: 0,
+        })
+    }
+}
+
 /// The v1 native pack, by name — also the registry [`replay`] re-executes
 /// against.
 pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
@@ -757,6 +841,7 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(ToolAllowlist),
         Box::new(PathScope),
         Box::new(SpendCap),
+        Box::new(IntentLock),
     ]
 }
 

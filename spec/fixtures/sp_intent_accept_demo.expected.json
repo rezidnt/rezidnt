@@ -1,0 +1,49 @@
+{
+  "events_folded": 6,
+  "last_event": "01SPNTENTACCEPTDEM000000E6",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "permit.escalated": 1,
+    "permit.granted": 1,
+    "permit.requested": 2,
+    "run.intent.declared": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01SPNTENTACCEPTDEM0000RN01": {
+      "status": "spawning",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {
+        "01SPNTENTACCEPTDEMRQ00FF01": {
+          "action": "tool.invoke",
+          "decision": "escalated",
+          "policy_ref": "n7en7l0ckp0l1cy00000000000000000000000000000000000000000d3m0p1",
+          "reason": "off-task tool Bash not in declared intent [Read, Grep, Glob]"
+        },
+        "01SPNTENTACCEPTDEMRQ00N001": {
+          "action": "tool.invoke",
+          "decision": "granted",
+          "policy_ref": "n7en7l0ckp0l1cy00000000000000000000000000000000000000000d3m0p1",
+          "reason": null
+        }
+      },
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.0,
+        "risk_score": 0.0,
+        "granted": 1,
+        "denied": 0,
+        "escalated": 1
+      },
+      "intent": {
+        "allowed_tools": ["Read", "Grep", "Glob"],
+        "intent_ref": "9n7en7fixdem0000000000000000000000000000000000000000000000d3m01"
+      }
+    }
+  },
+  "worktrees": {}
+}

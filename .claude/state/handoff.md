@@ -1,67 +1,59 @@
-# Handoff — 2026-07-18 (session 8: SP2 socket-PDP COMPLETE+PUSHED; hook sub-slice DR-014 awaiting sign-off)
+# Handoff — 2026-07-18 (session 8: SP2 COMPLETE end-to-end — the "may" axis now enforces mid-run)
 
 ## State of play
-SP2 = **harness PEP integration** (make the "may" axis *enforce*, not just decide). This
-session took SP2 through the full arc — design sketch → DR-013 (ACCEPTED, owner) → `/oracle`
-→ implementer → `/vet` → `/debrief` (fail: 2 findings) → remediation → re-`/vet` → re-`/debrief`
-(**pass**) → **committed + pushed** (`bb7afe3`). The **socket-PDP half of SP2 is done, green, on
-origin/main**. Then designed the remaining SP2 piece — the claude-code PEP hook binary — in a
-committed design note (`b762213`), then drafted and **ratified DR-014** (ACCEPTED, owner) to gate it.
-DR-014 + §20 index + this handoff are committed and pushed. **No owner blocker outstanding** — the
-SP2 hook sub-slice build is cleared to start (warden `/subject` first; see Next action).
+**SP2 is done.** The permit engine now *enforces*, not just decides: a claude-code `PreToolUse`
+hook (`rezidnt permit-hook`) asks the daemon before a real tool call and **blocks it on policy,
+one take** — the SP2 headline criterion, live. Both halves shipped this session through the full
+loop (design → DR → oracle → implement → vet → debrief), each `/debrief` reaching auditor **pass**:
+- **Socket-PDP half** (`bb7afe3`) — one transport-neutral `decide_permit`; socket un-stubbed.
+- **Hook sub-slice** (`5693aff`) — the PEP hook + `SpawnPlan` injection + socket `paths` wire +
+  `agent.spawned.pep` enforcement-mode fold + `gate_explain` visibility.
+Two DRs ratified (DR-013, DR-014); one warden `/subject` (`agent.spawned.pep`). Everything committed;
+**`main` is ahead 2 of origin** (`de70552`, `5693aff`) — auto-push is classifier-gated, **ask before pushing.**
 
-## What SP2 shipped this session (committed, green)
-- **One PDP code path (I3).** Extracted transport-neutral `McpCore::decide_permit(PermitRequest)
-  → PermitOutcome` from `call_request_permission` (now a thin JSON-RPC adapter). Both on-log facts
-  emit from `decide_permit` ONLY; the socket and MCP **decision** facts are byte-identical (the
-  `permit.requested` fact differs only on `badge_id`, by §3 — pinned by test).
-- **Socket un-stubbed.** `Request::RequestPermission` (was `op.not_served`, `main.rs`) now calls
-  `decide_permit` → returns `Reply::PermitDecision`. The PDP `McpCore` is now built
-  **unconditionally** at startup (no longer gated on `REZIDNT_MCP_LOCKFILE`); socket + optional
-  HTTP transport share the one `Arc`.
-- **Socket identity = 0600 UDS (DR-013 §3).** Socket skips the §12 badge door; MCP badge-first
-  door unchanged. `badge` stays optional on the socket wire.
-- **`Enforcement{Proceed,Block,Escalate}` + `for_decision`** in rezidnt-proto (allow→Proceed,
-  deny→Block, ask→Escalate; unknown→Escalate — never coerce, I6).
-- **`RequestPermissionArgs`** gained `request_id` + `paths` (optional) so the advertised MCP
-  inputSchema matches exactly what the adapter reads (§9 no-drift; closed a /debrief finding).
+## What SP2 shipped (all committed, green)
+- **PDP:** `McpCore::decide_permit` — one code path for MCP + socket; byte-identical decision facts (I3).
+- **PEP:** `rezidnt permit-hook` CLI subcommand (I7, not a new binary). PreToolUse stdin → maps
+  tool/paths, run from `REZIDNT_RUN`, bulky `tool_input` → CAS `context_ref` (I2) → one socket
+  round-trip (250 ms, `REZIDNT_PERMIT_TIMEOUT_MS`) → `hookSpecificOutput.permissionDecision`.
+  **Fail-closed → `ask`** on every failure (unreachable/decode/timeout/malformed-reply/bad-stdin/
+  CAS-pin-failure); never coerced to proceed (I6).
+- **Opt-in:** `SpawnPlan::for_claude_code_permit` injects the hook + `REZIDNT_RUN`/`REZIDNT_SOCKET`,
+  keyed on `[gates.permit]`; `agent.spawned.pep="enforced"` recorded (absent = edge-gated-only).
+- **Path parity:** socket `Request::RequestPermission` gained optional `paths` — socket now DENIES
+  outside scope (was escalate), identical to MCP.
+- **Visibility:** `gate_explain` reports `mid-run-enforced` vs `edge-gated-only` (I4 honesty).
 
-## Commits this session — NOT pushed (`770c228..bb7afe3`, ahead 2)
-`286e2e1` DR-013 + SP2 sketch · `bb7afe3` SP2 socket-PDP slice.
-DR-013 is ACCEPTED; §20 index bumped (next is DR-014). Design sketch: `docs/design/permit-pep-sp2.md`.
+## Commits this session (`770c228..5693aff`) — ahead 2 of origin, NOT fully pushed
+`286e2e1` DR-013+sketch · `bb7afe3` SP2 socket-PDP (pushed) · `b762213` hook design note (pushed) ·
+`762232a` DR-014 (pushed) · `de70552` subject(agent.spawned.pep) **(unpushed)** ·
+`5693aff` SP2 hook sub-slice **(unpushed)**.
 
-## Next action
-**Build the SP2 hook sub-slice (DR-014 ACCEPTED).** Sequence:
-  1. Warden **`/subject`** (§6 enforcement-mode visibility taxonomy) — a field on `agent.spawned`
-     or a `permit.enforcement.declared` subject + reducer (warden's design; no consumer-less subjects).
-  2. **`/oracle`** the now-live criteria: crit-5 fail-posture (`permit_socket_decision.rs` stub) +
-     crit-4 script-leg (`permit_pep_enforcement.rs` stub), both currently `#[ignore]`/`unimplemented!()`,
-     plus crit 1 (live tool call blocked, one take) and crit-5-path parity.
-  3. **Implementer:** `rezidnt permit-hook` CLI subcommand + `SpawnPlan::for_claude_code` injection
-     (`REZIDNT_RUN`/`REZIDNT_SOCKET` + PreToolUse config, keyed on `[gates.permit]`) + add optional
-     `paths` to the socket `Request::RequestPermission` wire; 250 ms timeout, fail-closed → `ask`.
-  4. **`/vet`** → **`/debrief`** → commit.
-DR-014 §Decision is the spec. Ratified decisions: hook = CLI subcommand (I7); opt-in via `[gates.permit]`;
-250 ms `REZIDNT_PERMIT_TIMEOUT_MS`; socket `paths` wire; enforcement-visibility `/subject`.
+## Next action — SP2 done; choose the next slice (owner priority)
+The permit "may" axis is now feature-complete end to end (SP1..SP2). Roadmap options (permit-engine §11):
+- **SP3 — policy-as-exec-verifier** (OPA/Rego or Cedar as an exec permit-verifier). Not spec'd;
+  would open a fresh design→DR→oracle arc like SP2 did.
+- **SP4 — roles + macaroon-attenuated delegation** (promotes DR-005 PROVISIONAL; folds in C8
+  layered admin/dev/session precedence). Not spec'd.
+- **C3 — sole-chokepoint enforcement** (OS sandbox + L7 egress + credential brokering). DR-009
+  fenced; needs its own design sketch + implementation DR before any build.
+- **Carried debt / cleanup** (below) instead of a new slice.
+The pointer is still SP2; advance it once the next slice is chosen. Each new slice is oracle-first
+after its spec + DR.
 
 ## Open /debrief residuals & carried notes (non-blocking)
-- **Criterion 6 (hook-less degradation / `gate_explain` mid-run-enforced vs edge-gated)** — NOT
-  encoded; needs the hook-vs-no-hook harness distinction + possibly a degradation-visibility
-  `/subject` (DR-013 §6.4). Follow-on once the hook binary lands.
-- **MCP-vs-socket path-scope asymmetry** (auditor note, not scored): socket carries no `paths`
-  axis, so a `path-scope` gate degrades to escalate over the socket while MCP-with-paths can deny.
-  Honest fail-closed, within DR-013 scope — worth a design note before the hook binary.
-- `sp_wire_aggregate_deny` fixture residual is **resolved** (folded into criterion-7 golden).
+- SP2 auditor **pass**; the earlier observations (4 KiB `context_ref` threshold, bad-stdin
+  defense-in-depth) were both addressed in remediation — nothing outstanding on SP2.
+- **Host-vs-WSL vet lesson (new):** the definition-of-done `/vet` is **host-side**; WSL-green is NOT
+  sufficient (a `#[cfg(unix)]` dead-code clippy error passed WSL but failed host `/vet`). Verify
+  platform-cfg code against host clippy too. Consider adding to memory.
 
 ## Decisions still needing a /dr (permit stream + beyond)
-- **SP2 hook-binary sub-slice → DR-014 ACCEPTED.** Build cleared; warden `/subject` (§6) is the first step.
-- **C8 layered admin/dev/session precedence** → folds into SP4 (roles + macaroon delegation).
-- **C3 sole-chokepoint enforcement** (OS sandbox + L7 egress + credential brokering) — DR-009
-  fenced; needs its own design sketch + implementation DR before any build.
-- **SP3 policy-as-exec-verifier** (OPA/Rego or Cedar) — permit-engine §11; not yet spec'd.
+- **SP3 / SP4 / C3** — each needs its own spec + DR before build (see Next action).
 - Any design change motivated by memo 001 needs its own DR citing it (DR-002 rule 3).
-- Pre-permit carried debt: DR-007 GitError→associated-type (2nd RepoSubstrate impl); badge.issued
-  emitter / badge_id on other mutations; release items (root README, crates.io `cargo login`).
+- Pre-permit carried debt: DR-007 GitError→associated-type (2nd RepoSubstrate impl); `badge.issued`
+  emitter / `badge_id` on other mutations; release items (root README, crates.io `cargo login`);
+  Phase 3 stays demand-gated.
 
 ## Environment
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`
@@ -71,7 +63,6 @@ daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never c
 [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask before pushing.
 
 ---
-**NEXT ACTION → Build the SP2 hook sub-slice (DR-014 ACCEPTED). Start with the warden `/subject`
-for §6 enforcement-mode visibility, then `/oracle` the two now-live `#[ignore]` stubs + crit 1/4/5,
-then implementer (`rezidnt permit-hook` subcommand + `SpawnPlan` injection + socket `paths` wire,
-250 ms fail-closed → ask), then `/vet` → `/debrief`.**
+**NEXT ACTION → SP2 is COMPLETE (committed `5693aff`, auditor pass). Choose the next slice with the
+owner — SP3 (policy-as-exec-verifier), SP4 (roles + delegation), C3 (sole-chokepoint, fenced), or
+carried cleanup — then run its design→/dr→/oracle arc. ALSO PENDING: owner ok to push (`main` ahead 2).**

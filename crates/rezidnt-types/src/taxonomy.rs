@@ -1,5 +1,5 @@
 //! Subject taxonomy v0 — transcription of `spec/ontology.md` (the canonical
-//! copy; edited only via `/subject`). 39 subjects, all payload `v = 1`.
+//! copy; edited only via `/subject`). 40 subjects, all payload `v = 1`.
 //!
 //! Sync discipline: when the warden changes the ontology, this list changes in
 //! the same commit. (An automated ontology↔const drift test is implementer
@@ -63,4 +63,6 @@ pub const SUBJECTS_V0: &[&str] = &[
     "permit.granted",
     "permit.denied",
     "permit.escalated",
+    // run (DR-010 — the run-intent axis; least-privilege in time)
+    "run.intent.declared",
 ];

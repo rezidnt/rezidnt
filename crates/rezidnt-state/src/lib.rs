@@ -155,6 +155,35 @@ pub struct PermitAccumulators {
     pub escalated: u64,
 }
 
+/// A run's declared intent — the initiating task + the intent-scoped tool set
+/// the `intent-lock` permit-verifier enforces (DR-010; the run-intent axis).
+/// SP-intent REDUCER SCAFFOLD: the type + field exist so `run.intent.declared`
+/// has a folding consumer (no consumer-less subjects — DR-006 precedent); the
+/// `intent-lock` verifier that *reads* this pinned state is the NEXT slice
+/// (SP-intent, oracle-first — NOT built here).
+///
+/// Reducer semantics (folded onto [`AgentRunState::intent`], keyed by the
+/// payload `run`, last write wins):
+/// - `run.intent.declared` `{run, intent_ref: CasRef, allowed_tools: [string]}`
+///   → set `intent = Some(IntentState { allowed_tools, intent_ref })`.
+///
+/// The enforced set is the DECLARED list read verbatim (never re-derived — the
+/// determinism BINDING forbids a live inference at decision time; DR-010 §3).
+/// **Distinct from `agent.spawned.allowed_tools?`**: that is the *composed
+/// harness allowlist* (what the agent was configured with); this is the
+/// *intent-derived least-privilege set* the verifier checks against (DR-010 §4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IntentState {
+    /// The intent-scoped tool names the `intent-lock` verifier enforces
+    /// (in-set → allow; off-task → escalate / deny under the knob).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// blake3 hex of the initiating task/prompt text persisted to the CAS
+    /// (`intent_ref.hash`) — a ref, never inline bytes (I2). The interrogable
+    /// "what was this run for" `gate_explain` names alongside the off-task tool.
+    pub intent_ref: Option<String>,
+}
+
 /// One agent run's derived state (S1: the dossier's accounting seed).
 ///
 /// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
@@ -204,6 +233,13 @@ pub struct AgentRunState {
     /// unedited.
     #[serde(default)]
     pub permit_accumulators: PermitAccumulators,
+    /// DR-010: this run's declared intent (see [`IntentState`]) — the pinned
+    /// state the future `intent-lock` permit-verifier reads. SP-intent REDUCER
+    /// SCAFFOLD. `None` until a `run.intent.declared` fact folds. `#[serde(default)]`
+    /// keeps every pre-DR-010 golden fixture parsing (and comparing equal)
+    /// unedited.
+    #[serde(default)]
+    pub intent: Option<IntentState>,
 }
 
 /// One worktree's derived state (S2: the sole-allocator registry's shadow in
@@ -528,6 +564,30 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         "permit.granted" => apply_permit_decision(graph, event, "granted"),
         "permit.denied" => apply_permit_decision(graph, event, "denied"),
         "permit.escalated" => apply_permit_decision(graph, event, "escalated"),
+        // DR-010 run-intent reducer (the run-intent axis). Keyed by the payload
+        // `run`; folds onto `AgentRunState::intent` the pinned state the future
+        // `intent-lock` verifier reads. A payload without `run` folds as
+        // counters-only — the reducer never guesses a key, never chokes (I3,
+        // the permit-reducer discipline). The enforced set is the DECLARED list
+        // read verbatim (never re-derived; DR-010 §3).
+        "run.intent.declared" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let allowed_tools = payload["allowed_tools"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let intent_ref = payload["intent_ref"]["hash"].as_str().map(String::from);
+                graph.agent_runs.entry(run).or_default().intent = Some(IntentState {
+                    allowed_tools,
+                    intent_ref,
+                });
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
 }

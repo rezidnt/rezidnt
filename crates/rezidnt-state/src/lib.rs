@@ -87,6 +87,74 @@ pub struct IntegrityAlarmRecord {
     pub replayed: String,
 }
 
+/// One entry in a run's permit ledger: an authorization request and, once a
+/// decision lands, its outcome (DR-008/DR-009 — the pre-hoc "may" axis). SP5
+/// REDUCER SCAFFOLD: the type + fields exist so the permit subjects have a
+/// folding consumer (no consumer-less subjects — DR-006 precedent); the
+/// contextual C1/C7 permit-verifiers that *read* this ledger are SP0–SP4.
+///
+/// Reducer semantics (keyed under [`AgentRunState::permit_ledger`] by the
+/// payload `request_id`, so request and decision fold onto the same entry):
+/// - `permit.requested` `{run, request_id, action, target, ...}` → insert with
+///   `action` recorded, `decision = None` (pending);
+/// - `permit.granted`/`permit.denied`/`permit.escalated`
+///   `{run, request_id, ...}` → set `decision` to `"granted"`/`"denied"`/
+///   `"escalated"` on the matching entry (created if the decision is seen
+///   before the request — the log is truth, I3, never gatekeeps).
+///
+/// Decisions stay payload-strings (never an enum gate) for the same I3 reason
+/// as gate verdicts — reducers fold every live payload version. `granted`=allow
+/// (`pass`), `denied`=deny (`fail`), `escalated`=inconclusive→human (`ask`);
+/// `escalated` is never coerced to `granted` (I6, DR-008 §4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermitLedgerEntry {
+    /// The requested action kind (`permit.requested.action`, e.g.
+    /// `"tool.invoke"`), recorded verbatim.
+    pub action: String,
+    /// The decision, once one lands: `"granted" | "denied" | "escalated"`.
+    /// `None` while the request is pending (requested but not yet decided).
+    pub decision: Option<String>,
+    /// The deciding policy's CAS hash (`policy_ref.hash`), recorded so
+    /// `gate why` / `gate_explain` can resolve the deciding policy (I6). Set
+    /// on the decision fact; `None` while pending.
+    pub policy_ref: Option<String>,
+    /// Denial / escalation reason, recorded verbatim (`permit.denied.reason`
+    /// / `permit.escalated.reason`); `None` for grants and while pending.
+    pub reason: Option<String>,
+}
+
+/// A run's per-session permit accumulators: the running state the *contextual*
+/// (stateful) permit-verifiers read to make C6/C7 decisions — a pure fold over
+/// the log (I3), not held imperatively as Omnigent does (intel memo 001 C6).
+/// SP5 REDUCER SCAFFOLD: fields exist so the accumulator inputs on the permit
+/// decision payloads have a folding consumer; the verifiers that read these
+/// are SP0–SP4.
+///
+/// Reducer semantics: every `permit.granted`/`.denied`/`.escalated` fold adds
+/// the payload's optional `spend_delta_usd` / `risk_delta` (when present) to
+/// the running totals and increments the decision counters. Sized per the
+/// intel-memo C6/C7 note so the payload supports contextual decisions without
+/// a `v+1`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermitAccumulators {
+    /// Running cumulative spend charged to this run's granted/denied actions
+    /// (`sum(spend_delta_usd)`); read by the C1 spend-cap verifiers.
+    #[serde(default)]
+    pub cumulative_spend_usd: f64,
+    /// Running per-session risk score (`sum(risk_delta)`); read by the C6
+    /// contextual policy.
+    #[serde(default)]
+    pub risk_score: f64,
+    /// Count of decisions folded, by outcome — cheap contextual signal
+    /// (e.g. escalation rate) and a rebuild-stable counter.
+    #[serde(default)]
+    pub granted: u64,
+    #[serde(default)]
+    pub denied: u64,
+    #[serde(default)]
+    pub escalated: u64,
+}
+
 /// One agent run's derived state (S1: the dossier's accounting seed).
 ///
 /// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
@@ -121,6 +189,21 @@ pub struct AgentRunState {
     /// (gate, verifier), deterministic order.
     #[serde(default)]
     pub integrity_alarms: Vec<IntegrityAlarmRecord>,
+    /// DR-008/DR-009: this run's permit ledger, keyed by `request_id`
+    /// (request→decision folds onto one entry). SP5 REDUCER SCAFFOLD — the
+    /// permit subjects' folding consumer (no consumer-less subjects, DR-006
+    /// precedent). `#[serde(default)]` keeps every pre-permit golden fixture
+    /// parsing (and comparing equal) unedited. `BTreeMap` for deterministic
+    /// whole-graph equality.
+    #[serde(default)]
+    pub permit_ledger: BTreeMap<String, PermitLedgerEntry>,
+    /// DR-008/DR-009: this run's per-session permit accumulators (running
+    /// spend / risk / decision counts) — the state the contextual C1/C7
+    /// permit-verifiers read, folded purely from the log (I3). SP5 REDUCER
+    /// SCAFFOLD. `#[serde(default)]` keeps every pre-permit golden fixture
+    /// unedited.
+    #[serde(default)]
+    pub permit_accumulators: PermitAccumulators,
 }
 
 /// One worktree's derived state (S2: the sole-allocator registry's shadow in
@@ -415,7 +498,72 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 }
             }
         }
+        // DR-008/DR-009 permit reducers (the pre-hoc "may" axis). Keyed under
+        // the run by the payload `request_id` (request and decision fold onto
+        // one ledger entry). A payload without `run`/`request_id` folds as
+        // counters-only — reducers never choke, never guess a key (I3). The
+        // decision facts also accumulate per-session running state (spend/risk)
+        // that the contextual C1/C7 verifiers read (SP0–SP4 work; this is the
+        // fold that feeds them).
+        "permit.requested" => {
+            if let Some(run) = payload_run(event)
+                && let Some(request_id) = payload_request_id(event)
+            {
+                let entry = graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .permit_ledger
+                    .entry(request_id)
+                    .or_default();
+                // Record the requested action; a decision may already have
+                // folded first (out-of-order log), so only fill the action —
+                // never clobber a decision (the log is truth, I3).
+                entry.action = event.payload()["action"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+        "permit.granted" => apply_permit_decision(graph, event, "granted"),
+        "permit.denied" => apply_permit_decision(graph, event, "denied"),
+        "permit.escalated" => apply_permit_decision(graph, event, "escalated"),
         _ => {} // every other subject: counters only (S0 scope)
+    }
+}
+
+/// Fold a permit decision (`permit.granted`/`.denied`/`.escalated`) onto the
+/// run's ledger + per-session accumulators. `decision` is `"granted"` /
+/// `"denied"` / `"escalated"` — `escalated` is NEVER coerced to `granted`
+/// (I6, DR-008 §4). Pure: same event, same delta.
+fn apply_permit_decision(graph: &mut Graph, event: &Event, decision: &str) {
+    let (Some(run), Some(request_id)) = (payload_run(event), payload_request_id(event)) else {
+        return; // counters-only; never guess a key (I3)
+    };
+    let payload = event.payload();
+    let state = graph.agent_runs.entry(run).or_default();
+
+    // Ledger: create the entry if the decision arrived before the request
+    // (out-of-order log — the log is truth, I3).
+    let entry = state.permit_ledger.entry(request_id).or_default();
+    entry.decision = Some(decision.to_string());
+    entry.policy_ref = payload["policy_ref"]["hash"].as_str().map(String::from);
+    entry.reason = payload["reason"].as_str().map(String::from);
+
+    // Accumulators: fold the optional per-session deltas + decision counters,
+    // the state the contextual permit-verifiers read (C1/C6/C7).
+    let acc = &mut state.permit_accumulators;
+    if let Some(spend) = payload["spend_delta_usd"].as_f64() {
+        acc.cumulative_spend_usd += spend;
+    }
+    if let Some(risk) = payload["risk_delta"].as_f64() {
+        acc.risk_score += risk;
+    }
+    match decision {
+        "granted" => acc.granted += 1,
+        "denied" => acc.denied += 1,
+        "escalated" => acc.escalated += 1,
+        _ => {}
     }
 }
 
@@ -432,6 +580,12 @@ fn payload_path(event: &Event) -> Option<String> {
 /// The `gate` key every `gate.*` payload carries (ontology v1 baselines).
 fn payload_gate(event: &Event) -> Option<String> {
     event.payload()["gate"].as_str().map(String::from)
+}
+
+/// The `request_id` key every `permit.*` payload carries (the ledger key;
+/// ontology v1 permit baselines, DR-008/DR-009).
+fn payload_request_id(event: &Event) -> Option<String> {
+    event.payload()["request_id"].as_str().map(String::from)
 }
 
 /// Evidence blob hashes (blake3 hex) from a `gate.failed`/`gate.inconclusive`

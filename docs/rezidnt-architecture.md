@@ -9,6 +9,8 @@
 
 ## 1. Thesis and scope
 
+> **Amended by [DR-008](decisions/DR-008-permit-engine-pivot.md).** The compose-only framing is dropped: rezidnt takes the pre-hoc "may" axis natively via a permit engine; Omnigent becomes a baseline/adapter, not a required companion.
+
 rezidnt is a local-first **resident daemon** that runs, verifies, and audits a fleet of coding agents across workspaces. It is one Rust binary that owns three things no current tool unifies: a **typed event fabric** (every fact about the fleet, append-only, replayable), a **supervisor** (substrates and agents run under restart-with-backoff discipline, like a session-scoped init), and a **verifier gate engine** (deterministic checks that produce evidence, not vibes). Everything else — terminals, harnesses, UIs — attaches to those three through narrow seams.
 
 Positioning, compressed from the strategy record: Omnigent governs what agents *may* do (pre-hoc permissions); rezidnt proves what agents *did* (post-hoc evidence). herdr owns the terminal substrate today; rezidnt integrates it at arm's length and replaces it in Phase 3 with a permissively-licensed kernel it assembles itself. The wedge buyers are (a) the single operator running a fleet on their own hardware and (b) Microsoft-stack enterprises that need an audit trail a compliance reviewer will sign.
@@ -201,6 +203,8 @@ pub trait RepoSubstrate: Send + Sync {
 ## 8. Gate and verifier engine
 
 > **Amended by [DR-006](decisions/DR-006-replay-divergence-signal.md).** Replay divergence now lands a durable `integrity.alarm` fact on the log, not a CLI-only report.
+>
+> **Amended by [DR-008](decisions/DR-008-permit-engine-pivot.md).** A fourth lifecycle point `permit` joins vet/pre_merge/post_run; permit-verifiers make the gate engine the policy engine (pass→allow, fail→deny, inconclusive→escalate).
 
 This is the differentiation layer; over-invest here, under-invest everywhere else.
 
@@ -296,6 +300,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 ## 16. Phased roadmap and slice acceptance criteria
 
 > **Superseded by [DR-001](decisions/DR-001-native-substrates.md#roadmap-supersedes-16).** The current roadmap lives in the DR; the slices below are the pre-DR-001 (herdr-integrated) plan, kept for provenance.
+>
+> **Amended by [DR-008](decisions/DR-008-permit-engine-pivot.md).** Adds a permit-engine phase (SP0–SP5) between gates (Phase 2) and terminal fidelity (Phase 3).
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -347,8 +353,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-005](decisions/DR-005-badge-consolidation.md) | Badge model consolidation | ACCEPTED | §12 |
 | [DR-006](decisions/DR-006-replay-divergence-signal.md) | Replay-divergence integrity signal | ACCEPTED | §8, §14 |
 | [DR-007](decisions/DR-007-release-worktree.md) | RepoSubstrate `release_worktree` as-built | ACCEPTED | §7 |
+| [DR-008](decisions/DR-008-permit-engine-pivot.md) | Permit-engine pivot (rezidnt owns both axes) | ACCEPTED | §1, §8, §16 |
 
-*The next record is DR-008.*
+*The next record is DR-009.*
 
 ---
 

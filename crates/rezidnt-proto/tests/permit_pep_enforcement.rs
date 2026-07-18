@@ -110,21 +110,18 @@ fn a_decoded_deny_reply_enforces_as_block() {
     );
 }
 
-/// §5 criterion 4 (script-level leg) — TRACKING STUB, no honest judge yet. The
-/// full contract "stdin tool descriptor → the harness's PreToolUse block output
-/// plus a non-proceed exit code" needs the hook binary/script that DR-013 defers
-/// to the impl slice ("Deferred to the impl slice" (b): where the hook lives and
-/// how a run opts into PEP enforcement). Writing an assertion here today would
-/// test a script that does not exist — theater. This lives in the hook-script's
-/// own contract test (recorded-transcript style, testing-oracles skill) once the
-/// binary lands. Un-ignore only then.
-#[test]
-#[ignore = "SP2 criterion 4 (script leg): the claude-code PreToolUse hook binary does not \
-            exist yet (DR-013 deferred (b)). The decision→enforcement MAPPING is judged by \
-            decision_word_maps_to_the_right_enforcement_class; the stdin→stdout/exit SCRIPT \
-            contract belongs in the hook-binary crate's recorded-transcript tests."]
-fn pep_hook_script_stdin_to_block_output_contract() {
-    unimplemented!(
-        "the hook-script stdin→PreToolUse-output judge is deferred to the hook-binary slice (DR-013)"
-    );
-}
+// §5 criterion 4 (script-level leg) — the stdin→PreToolUse-output SCRIPT
+// contract. DR-013 deferred this "to the impl slice"; DR-014 (ACCEPTED) settles
+// where the hook lives — the `rezidnt permit-hook` CLI subcommand (§Decision 1)
+// — so the honest judge now EXISTS and is written, not ignored. It cannot live
+// in this proto crate (the subcommand is in the `rezidnt` binary, which does not
+// depend on this crate's test harness), so it is the subcommand-level
+// integration board `bins/rezidnt/tests/permit_hook.rs` (spawn the binary with a
+// stdin tool descriptor + REZIDNT_SOCKET, capture stdout). The `#[ignore]` stub
+// that used to sit here is DELETED: now that the design is settled, an ignored
+// placeholder for a criterion with a real judge would be dishonest coverage.
+//
+// The pure decision→enforcement mapping this crate DOES own is judged above by
+// `decision_word_maps_to_the_right_enforcement_class` and
+// `ask_and_deny_never_map_to_proceed` — those pin the never-coerce contract the
+// script's output mapping is built on.

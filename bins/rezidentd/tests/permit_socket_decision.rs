@@ -27,7 +27,7 @@ mod common;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -344,42 +344,169 @@ fn socket_reply_and_fact_echo_the_caller_request_id() {
 // §5 CRITERION 5 — Fail-posture: PEP fails CLOSED to `ask`, never a silent allow.
 // ---------------------------------------------------------------------------
 //
-// The PEP proper is a claude-code hook SCRIPT (design §3) that connects to the
-// socket. The fail-posture (DR-013 decision 2: unreachable/timed-out PDP →
-// fail closed to `ask`, never a silent proceed) lives in that script's
-// connect/timeout handling — there is no daemon-side judge for "the socket
-// points nowhere", because by definition the daemon is not there. The honest
-// judge is a hook-client-level test: point the client at a dead socket and
-// assert it resolves to `ask`, not `allow`. That client does not exist yet
-// (deferred with the hook binary per DR-013 "Deferred to the impl slice" (b)),
-// so this criterion cannot be given a real judge in THIS crate today.
+// The fail-posture (DR-014 §Decision 3: unreachable/timed-out PDP → fail closed
+// to `ask`, never a silent proceed) lives in the PEP hook's connect/timeout
+// handling — there is no daemon-side judge for "the socket points nowhere",
+// because by definition the daemon is not there. DR-014 §Decision 1 settled
+// WHERE the PEP lives — the `rezidnt permit-hook` CLI subcommand — so the honest
+// judge now EXISTS and is written: `bins/rezidnt/tests/permit_hook.rs` points
+// the subcommand at a dead socket (`REZIDNT_SOCKET` + a low
+// `REZIDNT_PERMIT_TIMEOUT_MS`) and asserts it resolves to `ask`, never `allow`.
 //
-// Encoded as an #[ignore]-with-reason stub so the criterion is tracked and
-// visible, not silently dropped. The daemon-side half of the same honesty —
-// "an EMPTY/unreachable POLICY never synthesizes allow" — IS judged, above, by
-// `socket_permission_escalates_an_empty_policy_never_allows`.
+// The `#[ignore]`/`unimplemented!()` stub that used to sit here is DELETED: now
+// that DR-014 settles where the hook lives, an ignored placeholder for a
+// criterion with a real judge would be dishonest coverage. The daemon-side half
+// of the same honesty — "an EMPTY/unreachable POLICY never synthesizes allow" —
+// is judged above by `socket_permission_escalates_an_empty_policy_never_allows`.
 
-/// §5 criterion 5 (fail-posture) — TRACKING STUB (no honest judge in this
-/// crate yet). The PEP hook client, given an unreachable socket or a timeout,
-/// must resolve to `ask` (fail CLOSED), never `allow` (DR-013 decision 2).
-/// Belongs in the hook-client crate/tests once the hook binary lands (DR-013
-/// "Deferred to the impl slice" (b)). Un-ignore only when that client exists.
-#[test]
-#[ignore = "SP2 criterion 5: PEP-hook fail-closed-to-ask has no daemon-side judge; \
-            lives in the hook-client tests once the hook binary lands (DR-013 deferred (b)). \
-            The daemon-side empty-policy-never-allows honesty IS judged by \
-            socket_permission_escalates_an_empty_policy_never_allows."]
-fn pep_fails_closed_to_ask_when_pdp_unreachable() {
-    // Intentionally empty: the judge (a hook-client that dials a dead socket)
-    // does not exist in this crate. Un-ignoring without that client would be a
-    // vibes test. See the module note above.
-    let _dead_socket = PathBuf::from("/nonexistent/rezidnt.sock");
-    let _ = UnixStream::connect(&_dead_socket); // documents the shape only.
-    unimplemented!("hook-client fail-posture judge is deferred to the hook-binary slice (DR-013)");
+// ---------------------------------------------------------------------------
+// §7 / CRITERION 6 — Path parity: the socket carries `paths`, so `path-scope`
+// decides IDENTICALLY over socket and MCP (DR-014 §Decision 4; design §7). Today
+// the socket op has no `paths` axis, so `path-scope` degrades to escalate over
+// the socket while the MCP path can DENY — the asymmetry the auditor flagged on
+// `bb7afe3`. These tests pin that the socket, once it carries `paths`, DENIES a
+// path outside the allowed scope (where it previously escalated).
+// ---------------------------------------------------------------------------
+
+/// A permit project whose gate is a `path-scope` native scoped to `allow` globs
+/// (the PathScope verifier reads `params.paths` against `params.allow`; a path
+/// outside → Deny, paths ABSENT → escalate). This is the transport-parity judge:
+/// the same `paths` must decide the same on socket and MCP.
+fn make_path_scope_project(gap_ms: u64, allow_glob: &str) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).expect("mkdir repo");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .expect("git init");
+    assert!(git.success());
+    let script = stub_harness(dir.path(), gap_ms);
+    let spec = format!(
+        r#"[project]
+name = "sp2-path-scope"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["permit"]
+bin_override = "{script}"
+
+[gates.permit]
+verifiers = [
+  {{ native = "path-scope", params = {{ allow = ["{allow_glob}"] }} }},
+]
+"#,
+        repo = repo.display(),
+        script = script.display(),
+    );
+    (dir, spec)
 }
 
-// A tiny compile-time guard so the unused imports above (BufReader/UnixStream/
-// BufRead) are honestly used even while the fail-posture judge is a stub.
+/// Send one `request_permission` line CARRYING a `paths` axis and read the reply.
+/// COMPILE-NOTE: the `paths` field on `Request::RequestPermission` does not exist
+/// yet (DR-014 §Decision 4 adds `paths: Option<Value>`); this raw JSON carries it
+/// on the wire so the test is behavior-red on the socket handler that ignores it
+/// today (`bins/rezidentd/src/main.rs` hardcodes `paths: None`), not blocked on
+/// the type. The parity pin is the DECISION, not the struct field.
+fn ask_permission_with_paths(
+    socket: &Path,
+    run: &str,
+    tool: &str,
+    request_id: &str,
+    paths: &[&str],
+) -> serde_json::Value {
+    let mut conn = connect(socket);
+    send_line(
+        &mut conn,
+        &serde_json::to_string(&json!({
+            "op": "request_permission",
+            "run": run,
+            "request_id": request_id,
+            "action": "tool.invoke",
+            "tool": tool,
+            "paths": paths,
+        }))
+        .unwrap(),
+    );
+    read_reply_line(&mut conn, REPLY_DEADLINE)
+}
+
+/// §7 / CRITERION 6 (the parity headline) — a `path-scope` verifier DENIES a path
+/// outside the allowed scope OVER THE SOCKET, exactly as it would over MCP. This
+/// is the asymmetry DR-014 §Decision 4 closes: the socket can now deny where it
+/// previously degraded to escalate.
+///
+/// RED today: the socket op carries no `paths` axis (main.rs `paths: None`), so
+/// `path-scope` sees no paths → cannot-run → escalate → `ask`. The assertion
+/// `decision == "deny"` fails on that `ask` until the wire + handler thread
+/// `paths` through to the PDP.
+#[test]
+fn socket_path_scope_denies_a_path_outside_allowed_scope() {
+    let daemon = start_daemon();
+    // allow only src/**; ask about a path OUTSIDE it → deny.
+    let (_project, spec) = make_path_scope_project(600, "src/**");
+    let run = open_and_get_run(&daemon.socket, &spec);
+
+    let reply = ask_permission_with_paths(
+        &daemon.socket,
+        &run,
+        "Edit",
+        "01SP2PATHDENYREQ0000000001",
+        &["/etc/passwd"],
+    );
+    assert_eq!(
+        reply["reply"],
+        json!("permit_decision"),
+        "the socket answers a permit_decision frame: {reply:#}"
+    );
+    assert_eq!(
+        reply["decision"],
+        json!("deny"),
+        "a path outside the allowed scope is DENIED over the socket — parity with MCP \
+         (DR-014 §Decision 4; the socket now denies where it previously escalated): {reply:#}"
+    );
+}
+
+/// §7 / CRITERION 6 (the parity floor) — a path INSIDE the allowed scope is
+/// allowed over the socket. Paired with the deny test, this pins that the socket
+/// `paths` axis is actually READ (not merely accepted-and-ignored): an ignored
+/// `paths` would leave `path-scope` at cannot-run → `ask` for BOTH, collapsing
+/// the two outcomes. Distinct outcomes prove the axis reaches the verifier.
+///
+/// RED today: `paths` is ignored on the socket (main.rs `paths: None`), so this
+/// is `ask`, not `allow`.
+#[test]
+fn socket_path_scope_allows_a_path_inside_allowed_scope() {
+    let daemon = start_daemon();
+    let (_project, spec) = make_path_scope_project(600, "src/**");
+    let run = open_and_get_run(&daemon.socket, &spec);
+
+    let reply = ask_permission_with_paths(
+        &daemon.socket,
+        &run,
+        "Edit",
+        "01SP2PATHALLOWREQ000000001",
+        &["src/main.rs"],
+    );
+    assert_eq!(
+        reply["reply"],
+        json!("permit_decision"),
+        "the socket answers a permit_decision frame: {reply:#}"
+    );
+    assert_eq!(
+        reply["decision"],
+        json!("allow"),
+        "a path inside the allowed scope is ALLOWED over the socket — the paths axis \
+         reaches the verifier, not silently dropped (DR-014 §Decision 4): {reply:#}"
+    );
+}
+
+// A tiny compile-time guard so the imports above (BufReader/UnixStream/BufRead)
+// stay honestly used.
 #[allow(dead_code)]
 fn _touch_imports(sock: &Path) {
     if let Ok(stream) = UnixStream::connect(sock) {

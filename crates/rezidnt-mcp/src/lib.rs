@@ -858,6 +858,21 @@ impl McpCore {
                 ),
             ));
         };
+        // DR-014 §Decision 5: derive the run's enforcement mode from its
+        // `agent.spawned.pep?` on the log (I3 — from the log, never a side
+        // store), so a reader distinguishes a mid-run-PEP-enforced run from an
+        // edge-gated-only one (I4 degradation honesty). Present `pep:
+        // "enforced"` ⇒ mid-run-enforced; ABSENT ⇒ edge-gated-only — never
+        // synthesized to enforced (the honest absence the ontology mandates).
+        let enforcement = if events.iter().any(|e| {
+            e.subject.as_str() == "agent.spawned"
+                && e.payload()["run"] == json!(run)
+                && e.payload()["pep"] == json!("enforced")
+        }) {
+            "mid-run-enforced"
+        } else {
+            "edge-gated-only"
+        };
         let verdict = match fact.subject.as_str() {
             "gate.passed" => "pass",
             "gate.failed" => "fail",
@@ -904,6 +919,14 @@ impl McpCore {
             }
             e
         };
+        // Surface the enforcement mode on the explain payload (DR-014 §Decision
+        // 5) — the machine-readable distinction a `debrief`/`gate_explain`
+        // reader needs so it never presents an edge-gated run as if it had live
+        // interception.
+        let mut explain = explain;
+        if let Some(obj) = explain.as_object_mut() {
+            obj.insert("enforcement".to_string(), json!(enforcement));
+        }
 
         // gate.explained v1 (ratified): `run` is the pinned minimum; `gate` /
         // `verdict` are optional triage context. The explanation content is

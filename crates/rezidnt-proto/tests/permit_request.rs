@@ -28,6 +28,9 @@ fn request_permission_round_trips() {
         tool: "Bash".into(),
         badge: Some("cafef00d01234567".into()),
         context_ref: Some("cas:blake3:c0n7ex700000000000000000000000000".into()),
+        // DR-014 §Decision 4 added `paths`; a pre-DR-014 constructor omits it.
+        // Mechanical additive update — the round-trip assertion is unchanged.
+        paths: None,
     };
     let line = encode_request(&request).expect("encode");
     assert!(!line.contains('\n'), "JSONL frame must be a single line");
@@ -49,6 +52,8 @@ fn request_permission_wire_shape_pinned() {
         tool: "Read".into(),
         badge: None,
         context_ref: None,
+        // DR-014 §Decision 4 added `paths`; absent = OMITTED (asserted below).
+        paths: None,
     };
     let line = encode_request(&request).expect("encode");
     let v: serde_json::Value = serde_json::from_str(&line).expect("json");

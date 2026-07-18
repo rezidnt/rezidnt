@@ -240,6 +240,27 @@ pub struct AgentRunState {
     /// unedited.
     #[serde(default)]
     pub intent: Option<IntentState>,
+    /// DR-014 §Decision 5: this run's PEP enforcement mode, folded from
+    /// `agent.spawned.pep?`. `Some("enforced")` iff the spawn wired the permit
+    /// PEP (the spec declared a `[gates.permit]` gate); `None` = edge-gated-only
+    /// (no mid-run interception). The value is recorded VERBATIM as a string
+    /// (never a bool) so a future degraded/partial mode arrives additively; the
+    /// ABSENT case is never synthesized to a truthy value (DR-012 declared-vs-
+    /// absent; the honest "no PEP wired"). `#[serde(default)]` keeps every
+    /// pre-DR-014 golden fixture parsing (and comparing equal) unedited (I3
+    /// rebuild-stability). Read through [`AgentRunState::pep_enforced`].
+    #[serde(default)]
+    pub pep: Option<String>,
+}
+
+impl AgentRunState {
+    /// Whether this run was mid-run-PEP-enforced — `true` iff the spawn folded
+    /// `pep == "enforced"` (DR-014 §Decision 5). ABSENCE folds `false`: a run
+    /// with no `pep` on its spawn is edge-gated-only, NEVER synthesized to
+    /// enforced (the honesty the `gate_explain` distinction rests on, I4).
+    pub fn pep_enforced(&self) -> bool {
+        self.pep.as_deref() == Some("enforced")
+    }
 }
 
 /// One worktree's derived state (S2: the sole-allocator registry's shadow in
@@ -328,7 +349,15 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         // folds as counters-only — reducers never choke, never guess (I3).
         "agent.spawned" => {
             if let Some(run) = payload_run(event) {
-                graph.agent_runs.entry(run).or_default().status = "spawning".to_string();
+                let state = graph.agent_runs.entry(run).or_default();
+                state.status = "spawning".to_string();
+                // DR-014 §Decision 5: fold the enforcement mode VERBATIM when
+                // present (`pep: "enforced"`); ABSENT stays `None` — never
+                // synthesized to a truthy value (DR-012; the honest "no PEP
+                // wired"). A pre-DR-014 spawn (no `pep`) folds edge-gated-only.
+                if let Some(pep) = event.payload()["pep"].as_str() {
+                    state.pep = Some(pep.to_string());
+                }
             }
         }
         "agent.status.changed" => {

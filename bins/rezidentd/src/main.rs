@@ -372,6 +372,7 @@ mod unix_daemon {
                 action,
                 tool,
                 context_ref,
+                paths,
                 // DR-013 decision 3: the socket transport skips the §12 badge
                 // door — the 0600 owner-only UDS IS the identity — so `badge` is
                 // ignored here (it stays optional on the wire for forward-compat).
@@ -391,9 +392,11 @@ mod unix_daemon {
                     // The socket skips the badge door (DR-013 decision 3).
                     badge: None,
                     context_ref,
-                    // The proto socket op carries no path axis today; the native
-                    // request axis is the tool. Additive when the wire grows one.
-                    paths: None,
+                    // DR-014 §Decision 4: thread the wire `paths` axis through to
+                    // the PDP so `path-scope` decides identically over socket and
+                    // MCP (closes the `bb7afe3` asymmetry). `None` when the sender
+                    // omits it — the native then sees no paths → escalate.
+                    paths,
                 };
                 match pdp.decide_permit(req).await {
                     Ok(outcome) => {

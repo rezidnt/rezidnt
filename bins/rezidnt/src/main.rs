@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+mod permit_hook;
+
 #[derive(Parser)]
 #[command(
     name = "rezidnt",
@@ -101,6 +103,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GateCmd,
     },
+    /// The permit Policy Enforcement Point (DR-014 §Decision 1). claude-code's
+    /// `PreToolUse` hook config invokes this: it reads the tool descriptor on
+    /// stdin, asks the daemon PDP over `REZIDNT_SOCKET`, and writes the
+    /// `hookSpecificOutput.permissionDecision` (`allow`/`deny`/`ask`) on stdout.
+    /// Fails CLOSED to `ask` when the daemon is unreachable (never a silent
+    /// proceed, I6). Not a separate binary (I7) — a subcommand of `rezidnt`.
+    #[command(name = "permit-hook")]
+    PermitHook,
 }
 
 #[derive(Subcommand)]
@@ -154,6 +164,10 @@ fn main() {
         Cmd::Gate {
             cmd: GateCmd::Why { run, json },
         } => (1, gate_why(&run, json)),
+        // The PEP emits its decision on stdout and fails closed to `ask`
+        // internally; a hard error here (unreadable stdin / stdout write) is an
+        // unexpected internal fault → 1.
+        Cmd::PermitHook => (1, permit_hook::run()),
     };
     if let Err(e) = result {
         eprintln!("rezidnt: {e:#}");
@@ -612,6 +626,15 @@ fn db_path() -> PathBuf {
         .join("state")
         .join("rezidnt")
         .join("events.db")
+}
+
+/// The default CAS root (used by the `permit-hook` PEP to pin a bulky
+/// `tool_input` as a `context_ref`, I2): `REZIDNT_CAS` override, else `cas/`
+/// next to the default log path. Mirrors [`cas_path`] over [`db_path`].
+/// Unix-only: only the UDS `permit_hook::ask_daemon` pins bulk context.
+#[cfg(unix)]
+pub(crate) fn cas_dir() -> PathBuf {
+    cas_path(&db_path())
 }
 
 /// `REZIDNT_CAS` override, else `cas/` next to the log (mirrors the daemon's

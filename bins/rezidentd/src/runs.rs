@@ -682,8 +682,38 @@ pub async fn launch_agent(
     .await?;
 
     // 4. agent.spawned — badge minted, env scrubbed, badge injected (§12).
+    //    A permit-gated agent (its spec declares a `[gates.permit]` gate) also
+    //    gets the PEP wired at spawn (DR-014 §Decision 2): `REZIDNT_RUN` +
+    //    `REZIDNT_SOCKET` in the env and a `PreToolUse` hook config naming
+    //    `rezidnt permit-hook`, written into the worktree's `.claude/settings.json`.
+    //    A non-permit agent spawns exactly as today (no injection).
     let badge = Badge::mint().context("mint badge")?;
-    let plan = SpawnPlan::for_claude_code(agent, &badge, std::env::vars());
+    let pep_enforced = agent.gates.iter().any(|g| g == "permit");
+    let plan = if pep_enforced {
+        let socket = rezidnt_proto::socket_path();
+        SpawnPlan::for_claude_code_permit(
+            agent,
+            &badge,
+            std::env::vars(),
+            &run_str,
+            &socket.to_string_lossy(),
+        )
+    } else {
+        SpawnPlan::for_claude_code(agent, &badge, std::env::vars())
+    };
+    // Write the PreToolUse hook settings into the worktree so claude-code loads
+    // them (design §3(2)). Best-effort surface: a settings-write failure must
+    // not silently drop enforcement, so it is a hard error here.
+    if let Some(hook_config) = plan.permit_hook_config() {
+        let settings_dir = worktree.join(".claude");
+        tokio::fs::create_dir_all(&settings_dir)
+            .await
+            .with_context(|| format!("create {}", settings_dir.display()))?;
+        let settings_path = settings_dir.join("settings.json");
+        tokio::fs::write(&settings_path, hook_config)
+            .await
+            .with_context(|| format!("write permit hook settings {}", settings_path.display()))?;
+    }
     let mut child = tokio::process::Command::new(&plan.bin)
         .args(&plan.args)
         .env_clear()
@@ -722,6 +752,15 @@ pub async fn launch_agent(
         if !agent.allowed_tools.is_empty() {
             obj.insert("allowed_tools".to_string(), json!(agent.allowed_tools));
         }
+    }
+    // DR-014 §Decision 5 / ontology `agent.spawned.pep?`: record `pep:
+    // "enforced"` iff the permit PEP was wired at spawn (the agent declared a
+    // `[gates.permit]` gate), so `gate_explain` distinguishes a
+    // mid-run-PEP-enforced run from an edge-gated-only one (I4). ABSENT when no
+    // PEP was wired — never synthesized to `false`/`"unenforced"` (DR-012
+    // declared-vs-absent discipline; absence is the honest "no PEP wired").
+    if pep_enforced && let Some(obj) = spawned_payload.as_object_mut() {
+        obj.insert("pep".to_string(), json!("enforced"));
     }
 
     // Register BEFORE the fact hits the fabric: a client that sees

@@ -104,6 +104,14 @@ pub enum Request {
         badge: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_ref: Option<String>,
+        /// The path axis the native verifiers read (`path-scope`, etc.). Opaque
+        /// JSON — the native reads it as `params.paths` (an array of path
+        /// strings). Optional + additive (DR-014 §Decision 4): absent = OMITTED
+        /// on the wire, never null, so `path-scope` decides identically over
+        /// socket and MCP and a pre-DR-014 sender that cannot set it is
+        /// unaffected. Same additive discipline as `badge` / `context_ref`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paths: Option<serde_json::Value>,
     },
 }
 

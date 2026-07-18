@@ -1,66 +1,66 @@
-# Handoff — 2026-07-18 (session 7: SP1 + SP-intent COMPLETE; permit engine deepening)
+# Handoff — 2026-07-18 (session 7: permit "may" axis COMPLETE through SP-empty)
 
 ## State of play
-Long session: closed **SP1** (request_permission + native permit pack), then fully spec'd and
-built **SP-intent** (C7 intent-lock) end to end. Both passed `/vet` + `/debrief` (auditor **pass**;
-SP-intent took one remediation round — see below). All work **PUSHED** to origin/main
-(`4d8edac..982e358`); tree clean but for the pointer edit. Pointer advanced to **SP-wire**
-(owner's choice — the PDP verifier-selection consolidation).
+Marathon session. The pre-hoc **"may" axis is now feature-complete and internally honest
+end to end** — four slices closed (SP1, SP-intent, SP-wire, SP-empty), five DRs ratified
+(DR-008..012). Every slice passed `/vet` + `/debrief` (auditor **pass**); SP-intent and
+SP-wire each took ONE remediation round (evidence-string divergence; evidence_ref
+metadata fidelity), SP-empty took a doc-staleness cleanup — all caught by the auditor,
+all fixed before commit. **All pushed** to origin/main (`4d8edac..0f5496e`); tree clean.
+Pointer advanced to **SP2** — but SP2 needs a design pass first (see Next action).
 
-## What changed this session — 5 commits, ALL PUSHED (`4d8edac..982e358`)
-- **`c430caf` SP1** — `request_permission` MCP tool (PDP: logs `permit.requested` + one decision
-  fact, maps verdict via `decision_for`), native pack `tool-allowlist`/`path-scope`/`spend-cap`
-  (SpendCap three-valued: soft-band→escalate, hard/rate→deny, never coerced, I6), proto
-  `Request::RequestPermission`/`Reply::PermitDecision` wire shape, `gate_explain` permit leg,
-  carried SP0 flag closed (`decided_fact` emits spend/risk/cost deltas, omit-when-None).
-- **`b1540bf` handoff** (session-6→7 bridge).
-- **`6f9d47c` DR-010** — ratifies SP-intent scope + criteria; design sketch
-  `docs/design/intent-lock.md`. Load-bearing fork: intent→allowlist is DECLARED + content-pinned,
-  never inferred live (determinism BINDING + I6). (a) explicit manifest in-scope; (b) recorded
-  derivation FENCED. Off-task → escalate default (`on_off_task = escalate|deny` knob). §20 indexed.
-- **`02fe7fe` /subject (warden)** — mints new noun `run` for the run-intent axis:
-  `run.intent.declared v1 {run, intent_ref: CasRef, allowed_tools: [string]}` + folding reducer
-  (`AgentRunState.intent`). Distinct from `agent.spawned.allowed_tools?` (composed harness allowlist
-  vs intent-derived least-privilege). `SUBJECTS_V0` 39→40, drift guard green.
-- **`982e358` SP-intent** — `IntentLock` native (rezidnt-gate): reads `inputs.params` only, in-intent
-  →Pass / off-task→escalate / off-task+deny→Fail / intent-absent→escalate-never-pass; evidence names
-  off-task tool + declared intent (CAS ref). Accept demo (memo scenario 5) folds rebuild-stable.
+## What the permit engine now does (shipped, on the live PDP)
+- `request_permission` MCP tool + proto `Request::RequestPermission`/`Reply::PermitDecision`
+  wire shape (SP1). PDP logs `permit.requested` + one aggregate decision fact.
+- Native permit pack: **tool-allowlist, path-scope, spend/rate cap, intent-lock** (SP1+SP-intent).
+- Live PDP dispatches the CONFIGURED `[gates.permit]` set via `permit::aggregate` — first-Fail
+  short-circuit, else any Inconclusive→escalate, else grant; maps via `decision_for` (I6). Config
+  resolved daemon-side via `McpSubstrate::permit_config_for(run)`; per-run accumulators/intent
+  folded from the fabric and injected as content-pinned params (SP-wire, DR-011).
+- Intent semantics: declared-empty `allowed_tools: []` = lockdown (every tool off-task,
+  deny-capable under `on_off_task=deny`); genuinely-absent = cannot-run/escalate (SP-empty, DR-012).
+- `gate_explain` surfaces every permit decision (granted/denied/escalated) with policy_ref +
+  evidence_ref, interrogable (I6). `run.intent.declared` subject + reducer folded (warden, SP5-era).
+
+## Commits this session — ALL PUSHED (`4d8edac..0f5496e`)
+`c430caf` SP1 · `b1540bf` handoff · `6f9d47c` DR-010 · `02fe7fe` subject(run.intent.declared) ·
+`982e358` SP-intent · `d0e7b7c` handoff · `4293dcd` DR-011 · `8baebff` SP-wire ·
+`3b7fff5` DR-012 · `0f5496e` SP-empty.
 
 ## Next action
-**Start SP-wire with `/oracle`.** SP-wire = a focused consolidation: give `request_permission`
-(the PDP) a **verifier-selection seam** so it dispatches the configured permit-verifier SET
-(tool-allowlist, path-scope, spend-cap, intent-lock) from the project spec `[gates.permit].verifiers`
-block — today it **hardcodes `ToolAllowlist.verify()`** (`crates/rezidnt-mcp/src/lib.rs:454`), so
-the other three natives are registered + tested but never run live. Design is already ratified
-(permit-engine §6 TOML shape; DR-008), so this is likely **oracle-first directly, no new DR**. The one
-design point to pin: **multi-verifier verdict aggregation → permit decision** — follow the gate
-engine's existing first-fail-short-circuit + three-valued precedence (any `Fail`→deny, else any
-`Inconclusive`→escalate, else allow). If aggregation proves contentious, a quick `/dr`; otherwise
-oracle → implementer → `/vet` → `/debrief`. Requires parsing `[gates.permit].verifiers` from the
-§13 spec if SP1 didn't already — check first.
+**Spec SP2 BEFORE any `/oracle`.** SP2 = **harness PEP integration**: the claude-code `PreToolUse`
+hook calls the permit endpoint mid-run so a real tool call is BLOCKED by policy (permit-engine
+§11 SP2; the "make it actually enforce" slice). Everything above DECIDES; SP2 is what makes an
+agent's mid-run action get stopped. It crosses a real external boundary and has open design
+questions that warrant a **design sketch + likely a DR** first (like SP-intent/SP-wire did):
+- **The socket path SP1 stubbed as `op.not_served`** (`bins/rezidentd/src/main.rs`) must now
+  actually service a permit decision over the socket for the harness hook (SP1 left only the
+  wire shape). Design where the hook reaches the PDP: socket `Request::RequestPermission` →
+  daemon → `permit::aggregate` (reuse SP-wire's resolver/fold), returning `Reply::PermitDecision`.
+- **The PEP contract:** claude-code `PreToolUse` hook shape (stdin/stdout JSON), how the daemon
+  is addressed (socket path/lockfile), timeout/fail-closed-or-open posture on the hot path
+  (permit-engine §10.1/§10.2 — latency + "enforcement only as strong as the PEP" honesty).
+- **Degradation (I4):** harnesses without a hook fall back to pre-spawn vet + post-hoc evidence,
+  stated explicitly (design §3) — do not overclaim interception breadth.
+Sequence: design sketch → `/dr` (owner sign-off) → `/oracle` → implementer → `/vet` → `/debrief`.
 
-## Open /debrief residuals (SP-intent — carried, non-blocking)
-- **Live-PDP dispatch gap** (`crates/rezidnt-mcp/src/lib.rs:454`): `request_permission` runs ONLY
-  `ToolAllowlist`; IntentLock/PathScope/SpendCap never execute on the live path. **This is exactly
-  what SP-wire closes** — it is the next slice, not a defect.
-- **Empty-vs-absent allowlist collapse** (`crates/rezidnt-gate/src/lib.rs:~785`): IntentLock treats a
-  DECLARED-empty `allowed_tools: []` identically to intent-absent (both → cannot-run/Inconclusive).
-  Defensible under DR-010 as written (the record didn't distinguish them), but a real latent semantic:
-  is "declared no tools" the same as "no declaration"? **Candidate DR-011** if the answer should be
-  "declared-empty = escalate/deny everything as off-task." Owner deferred it this session.
+## Open /debrief residuals & carried notes (non-blocking)
+- **`sp_wire_aggregate_deny` fixture** (`spec/fixtures/`) green-locks only the reducer fold, not
+  decision production (SP-wire debrief). Either wire it into a debrief-replay assertion or drop it
+  — a committed golden with a thin assertion. Low; fold into SP2 or a cleanup.
+- Live PDP now runs the full native set (SP-wire closed the SP1/SP-intent live-dispatch residual).
 
-## Decisions still needing a /dr (permit stream)
-- **Empty-vs-absent intent semantic** — DR-011 candidate (above).
-- **SP2 harness PEP integration** — claude-code `PreToolUse` hook → permit endpoint; real mid-run
-  block. Roadmap-committed (permit-engine §11); comes after SP-wire. Also wires the socket path that
-  SP1 left as `op.not_served`.
-- **C8 layered admin/dev/session precedence** → folds into SP4 (roles); not yet designed.
-- **C3 sole-chokepoint enforcement** (OS sandbox + L7 egress + credential brokering) — DR-009 fenced;
-  needs its own design sketch + implementation DR before any build.
+## Decisions still needing a /dr (permit stream + beyond)
+- **SP2 needs a design sketch + /dr** (the gating next action above).
+- **C8 layered admin/dev/session precedence** → folds into SP4 (roles + macaroon delegation);
+  not yet designed.
+- **C3 sole-chokepoint enforcement** (OS sandbox + L7 egress + credential brokering) — DR-009
+  fenced; needs its own design sketch + implementation DR before any build.
+- **SP3 policy-as-exec-verifier** (OPA/Rego or Cedar) — permit-engine §11; not yet spec'd.
 - Any design change motivated by memo 001 needs its own DR citing it (DR-002 rule 3).
 - Pre-permit carried debt: DR-007 GitError→associated-type (2nd RepoSubstrate impl); badge.issued
   emitter / badge_id on other mutations; release items (root README, crates.io owner `cargo login`);
-  Phase 3 demand-gated.
+  Phase 3 stays demand-gated.
 
 ## Environment
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`
@@ -70,7 +70,7 @@ daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never c
 [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask before pushing.
 
 ---
-**NEXT ACTION → Start SP-wire with `/oracle`: give `request_permission` a verifier-selection seam
-that dispatches the configured `[gates.permit]` verifier set (tool-allowlist/path-scope/spend-cap/
-intent-lock), aggregating verdicts by the gate engine's first-fail + three-valued precedence.
-Closes the live-PDP-dispatch residual. Check whether `[gates.permit]` spec parsing exists first.**
+**NEXT ACTION → Spec SP2 (harness PEP integration) first: a design sketch covering the socket
+PDP path (un-stub `op.not_served`), the claude-code PreToolUse hook contract, hot-path
+timeout/fail-posture, and graceful degradation (I4) — then a `/dr`, THEN oracle-first. Do NOT
+`/oracle` SP2 until the design + DR land.**

@@ -1,0 +1,45 @@
+[← Decision records index](../rezidnt-architecture.md#20-decision-records) · [Architecture plan](../rezidnt-architecture.md)
+
+# Decision Record DR-013 — permit PEP integration + fail-posture (SP2)
+
+**Date:** 2026-07-18 · **Status:** ACCEPTED (owner) · **Amends:** §16 (roadmap — commits SP2 as the enforcing slice) / §9 (MCP surface — records the transport-neutral `decide_permit` seam); no invariant text is rewritten. **Cites:** — (no intel memo; the four memo-surfaced capabilities are already scoped by DR-009). **Builds on:** [DR-008](DR-008-permit-engine-pivot.md) (PDP/PEP split, enforcement-as-substrate), [DR-009](DR-009-match-omnigent-scope.md) (C3 fence), [DR-011](DR-011-permit-pdp-config-seam.md) (config seam, empty→escalate never allow), [DR-012](DR-012-empty-vs-absent-intent.md); design basis [`docs/design/permit-pep-sp2.md`](../design/permit-pep-sp2.md), honesty constraints [`docs/design/permit-engine.md`](../design/permit-engine.md) §3/§10.1/§10.2/§11; gates the **SP2** slice.
+
+## Context
+
+Everything shipped through SP-empty **decides** "may this action proceed?" — but only when something asks, and today only the MCP surface answers. SP2 is the slice where a **real mid-run tool call is blocked by policy, one take** (permit-engine §11 SP2 acceptance; sketch §5 criterion 1). Two gaps close: the socket PDP path (`bins/rezidentd/src/main.rs:355` answers `RequestPermission` with an honest `op.not_served` stub), and the PEP itself — a claude-code `PreToolUse` hook that asks the daemon over the socket and enforces the answer. The full-flow PDP already exists in `McpCore::call_request_permission` (badge → emit → resolve config (DR-011) → fold per-run state (DR-011/DR-012) → `permit::aggregate` → verdict→decision (I6) → one decision fact); the socket must not reimplement it.
+
+Four decisions require ratification, each drawn from the settled sketch:
+
+1. **One PDP code path (I3).** Two on-log permit facts per permission — MCP and socket — must come from exactly one entrypoint, or the transports drift and one lies. Recommendation B: lift the body of `call_request_permission` into a transport-neutral `decide_permit(PermitRequest) -> PermitOutcome`; the JSON-RPC method and the socket handler both become thin adapters over it. The socket carries the PEP's `request_id` token (proto `lib.rs:98`) so the PEP's ask and the on-log fact share one id. Alternative A (socket re-encodes to `args` and calls the JSON-RPC method) is rejected: it mints a fresh id, discarding the PEP's token, and drags JSON-RPC envelopes onto the socket.
+
+2. **Fail-posture: fail-closed to `ask`, bounded timeout.** If the PDP is unreachable or the request times out, the PEP must NOT silently proceed — permit-by-default when the brain is offline is dishonest and contradicts DR-011 §3 (empty/unresolvable policy escalates, never synthesizes an allow). Fail *to `ask`* (escalate to a human) rather than hard-deny keeps a crashed daemon from freezing every agent into an unrecoverable wall.
+
+   **Dissent (recorded verbatim per house style):** fail-open is friendlier and keeps agents moving when the daemon flaps, and the hot-path timeout adds latency to every governed tool call (permit-engine §10.2 — per-action checks sit on the agent's critical path against a fabric designed for ≤~10³ events/min). **Counter to the counter:** for the "may" axis, silent permit-on-failure is exactly the overclaim §10.1 forbids; the fast-path decision cache (permit-engine §10.2, keyed by policy-hash + request-shape) is the latency answer, not fail-open. **The owner ratified fail-closed-to-`ask` + bounded timeout knowingly (2026-07-18).**
+
+3. **Socket identity: 0600 owner-only UDS is sufficient.** The socket's owner-only mode (`main.rs:222`) is adequate identity for the local hook; `badge` stays optional on the socket `RequestPermission` (proto already optional, `lib.rs:104`), and `decide_permit` skips the §12 badge check on the socket transport. The MCP path's badge-first door discipline is unchanged.
+
+4. **Enforcement is a PEP substrate capability (I4).** Harnesses that expose a `PreToolUse` hook get true mid-run interception; hook-less harnesses degrade **explicitly** to the shipped edges — pre-spawn `vet` + post-hoc `debrief` evidence — and product copy must not overclaim interception breadth (design §10.1; restates the DR-008/DR-009 delta). SP2 is enforcement as strong as the PEP allows and no stronger. C3 (sole execution chokepoint) stays fenced behind its own design + DR (DR-009).
+
+## Decision
+
+1. **Ratify the transport-neutral `decide_permit` entrypoint.** Extract the PDP flow from `call_request_permission` into one method both callers invoke; the JSON-RPC method and the socket handler are thin adapters. `decide_permit` uses the caller-supplied `request_id` when present (the PEP's token), else mints. The `op.not_served` stub is replaced. Startup wires the PDP core (fabric + cas + `McpBridge` substrate, already owned by `Daemon`) **unconditionally** — not only when `REZIDNT_MCP_LOCKFILE` is set — so the socket PDP does not depend on the HTTP transport; both transports share the one `Arc`.
+
+2. **Ratify fail-closed to `ask` with a bounded hot-path timeout.** On unreachable/timed-out PDP the PEP escalates to a human; never a synthesized allow (DR-011 §3), never a hard-deny wall. Fail-open is rejected; the dissent is recorded above.
+
+3. **Ratify socket-transport identity via the 0600 UDS.** `badge` stays optional on the socket `RequestPermission`; `decide_permit` skips the §12 badge check on the socket transport only. The MCP badge-first door is unchanged.
+
+4. **Ratify enforcement as a PEP substrate capability (I4).** Hook-less harnesses degrade explicitly to pre-spawn `vet` + post-hoc evidence; the degradation is tested and surfaced in `gate_explain` (mid-run-enforced vs edge-gated). Product copy states the bound; C3 stays fenced.
+
+**Deferred to the impl slice (NOT decided here):** (a) the concrete timeout budget number (order 100–500ms per the sketch, but the exact deadline is the impl slice's to set); (b) where the hook binary/script lives and how a spec opts a run into PEP enforcement (`[gates.permit]` flag vs harness-config convention). This is scope + posture, not implementation; the build is a follow-on oracle-first slice.
+
+## Consequences
+
+- **§16 roadmap delta:** SP2 (harness PEP integration) is committed as the enforcing slice — the first external-boundary crossing where a live tool call is blocked; acceptance per sketch §5.
+- **§9 MCP-surface delta:** `McpCore` gains a transport-neutral `decide_permit`; `call_request_permission` becomes an adapter; the socket handler maps `PermitOutcome` → `Reply::PermitDecision`. Startup wiring makes the PDP core unconditional (auditor should expect this).
+- **Un-stub is a wire-behavior change:** the `op.not_served` branch and any test pinning it (`crates/rezidnt-proto/tests/permit_request.rs` and socket-level tests) change; the oracle rewrites those expectations — the implementer does not quietly delete a red test.
+- **Risk-register (§18) deltas:** *Enforcement bounded by the PEP* (DR-008/DR-009, permit-engine §10.1) is restated, unchanged — SP2 does not make rezidnt the sole chokepoint; C3 does, later, behind its own DR. *Hot-path latency* (permit-engine §10.2) rises: every governed tool call now round-trips the socket; the mitigation is the decision fast-path cache, not fail-open. If SP2 ships without the cache, the latency ceiling is stated, not hidden.
+- **Invariants touched vs untouched:** no invariant text is rewritten. I3 is *upheld and tightened* — one decision path means MCP and socket facts are byte-identical (sketch §5 criterion 7). I4 is exercised (enforcement is a substrate capability, degradation explicit). I6 is preserved (`inconclusive → ask`, empty → escalate never allow). I1 holds (the escalate/ask surface is a client; the daemon renders nothing). I5 unchanged. The socket badge-skip narrows the §12 check to the MCP transport only — a scoped identity call for the owner-only UDS, not a weakening of the MCP door.
+- **No test or acceptance criterion is weakened by this record.** In plain words: fail-closed-to-`ask` is a *tightening* over the fail-open alternative (it keeps enforcing rather than silently permitting); the socket badge-skip does not loosen the MCP path; the un-stub replaces an honest error with a real decision. The one honesty cost stated plainly: the socket transport trades the badge check for the OS 0600 permission bit — sufficient for a local owner-only hook, not a claim of cryptographic caller identity on the socket.
+- **No ontology / `/subject` change** is decided here. SP2 reuses `permit.requested`/`granted`/`denied`/`escalated`; if the degradation-visibility signal (sketch §4 / criterion 6) later wants its own fact, that is a warden `/subject` pass, gated.
+
+*Amendments to this record require DR-014.*

@@ -360,8 +360,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-010](decisions/DR-010-intent-lock-scope.md) | SP-intent scope + criteria (C7 intent-lock) | ACCEPTED | §16 |
 | [DR-011](decisions/DR-011-permit-pdp-config-seam.md) | Permit PDP config-resolution seam (McpSubstrate method) | ACCEPTED | §8, §9 |
 | [DR-012](decisions/DR-012-empty-vs-absent-intent.md) | Declared-empty vs absent intent allowlist (intent-lock) | ACCEPTED | §16 |
+| [DR-013](decisions/DR-013-permit-pep-sp2-integration.md) | Permit PEP integration + fail-posture (SP2) | ACCEPTED | §9, §16 |
 
-*The next record is DR-013.*
+*The next record is DR-014.*
 
 ---
 

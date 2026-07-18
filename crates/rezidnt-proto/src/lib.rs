@@ -207,6 +207,43 @@ pub enum Reply {
     },
 }
 
+/// The enforcement class a PEP applies for a permit `decision` word (SP2,
+/// DR-013 §3 / design §3). The claude-code `PreToolUse` hook reads one
+/// [`Reply::PermitDecision`] off the socket and maps its `decision` to exactly
+/// one of these classes, which it then renders as the harness's own
+/// block/allow/ask output.
+///
+/// The mapping is TOTAL and NEVER-COERCING (I6): `allow → Proceed`,
+/// `deny → Block`, `ask → Escalate`. `ask` is its own class — never folded into
+/// `Proceed` — and `deny` never proceeds. Any decision word the PDP does not
+/// emit (it emits only the three above) is treated conservatively as
+/// [`Enforcement::Escalate`]: an unrecognized decision is NEVER silently
+/// upgraded to a proceed (the whole permit-axis honesty rests on this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enforcement {
+    /// The tool call proceeds (`allow`).
+    Proceed,
+    /// The tool call is blocked; the agent sees the reason (`deny`).
+    Block,
+    /// Routed to the human escalate surface — a client, I1 (`ask`).
+    Escalate,
+}
+
+impl Enforcement {
+    /// The pure decision → enforcement mapping. Total over the three ratified
+    /// decision words (`allow`/`deny`/`ask`); any other word conservatively
+    /// escalates — an unknown decision is never coerced to Proceed (I6).
+    pub fn for_decision(decision: &str) -> Self {
+        match decision {
+            "allow" => Enforcement::Proceed,
+            "deny" => Enforcement::Block,
+            // `ask`, and defensively anything the PDP does not emit, escalates:
+            // NEVER a silent Proceed (I6).
+            _ => Enforcement::Escalate,
+        }
+    }
+}
+
 /// Encode a reply as one JSONL frame (single line, no trailing newline).
 pub fn encode_reply(reply: &Reply) -> Result<String, ProtoError> {
     Ok(serde_json::to_string(reply)?)

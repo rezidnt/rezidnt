@@ -62,6 +62,12 @@ pub struct GateExplainArgs {
 /// REQUIRED (the caller identity, carried to `permit.requested.badge_id`).
 /// The bulk action context (argv, file bytes) is a `context_ref` CAS-ref
 /// string (`cas:blake3:<hex>`), never inline bytes (I2).
+///
+/// The adapter also reads an optional `request_id` (the PEP's correlation
+/// token; MCP mints one when absent, DR-013) and an optional `paths` axis (the
+/// input the `path-scope` verifiers read). Both are OPTIONAL and declared here
+/// so the served inputSchema matches exactly what `call_request_permission`
+/// consumes — no doc §9 drift.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RequestPermissionArgs {
     /// Capability badge token (hex), design §5. The caller identity checked
@@ -73,6 +79,16 @@ pub struct RequestPermissionArgs {
     pub action: String,
     /// The small inline action descriptor (the tool name).
     pub tool: String,
+    /// Optional caller-supplied correlation token (the PEP's request id).
+    /// Absent = the daemon MINTS one (DR-013 decision 1); when present it is
+    /// echoed onto the on-log decision fact so the caller's ask and the fact
+    /// share one id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Optional path axis the `path-scope` verifiers read over MCP (parity with
+    /// the socket transport). Absent = no path constraint is evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<serde_json::Value>,
     /// Optional bulk-context CAS ref (`cas:blake3:<hex>`) — the ref only, never
     /// inline bytes (I2).
     #[serde(default, skip_serializing_if = "Option::is_none")]

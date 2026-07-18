@@ -191,6 +191,100 @@ impl PermitConfig {
     }
 }
 
+/// A transport-neutral permit decision request (SP2, DR-013 decision 1). Both
+/// callers build this: the MCP JSON-RPC adapter ([`McpCore::call_request_permission`])
+/// from its `args`, and the socket handler from a
+/// `rezidnt_proto::Request::RequestPermission`. Extracting it means the PDP flow
+/// lives in exactly one place ([`McpCore::decide_permit`]) — MCP and socket
+/// facts are byte-identical, no fork (I3).
+#[derive(Debug, Clone)]
+pub struct PermitRequest {
+    /// The run whose per-run state (intent allowlist + spend accumulator) the
+    /// PDP folds (I3).
+    pub run: String,
+    /// The caller-supplied correlation token (the PEP's, over the socket). When
+    /// `Some`, the decision echoes it — the PEP's ask and the on-log fact share
+    /// one id. When `None` (MCP without a token), the PDP mints one.
+    pub request_id: Option<String>,
+    /// The action being authorized (e.g. `tool.invoke`).
+    pub action: String,
+    /// The tool the request axis reads (e.g. `Bash`).
+    pub tool: String,
+    /// The caller's badge token. The MCP adapter checks this at its own door
+    /// (badge-first, §12) BEFORE calling `decide_permit`; the socket transport
+    /// omits it (0600 UDS is the identity, DR-013 decision 3). When present it
+    /// only decorates the `permit.requested` fact's `badge_id` (best-effort
+    /// resolution) — `decide_permit` NEVER refuses on a missing/unknown badge.
+    pub badge: Option<String>,
+    /// Bulk action context as a CAS ref string — never inline bytes (I2).
+    pub context_ref: Option<String>,
+    /// The path axis the native verifiers read (`path-scope`, etc.).
+    pub paths: Option<Value>,
+}
+
+/// The three-valued authorization decision (SP2, DR-013 decision 1) — the wire
+/// vocabulary the PDP reaches, NEVER coerced (I6). Mirrors
+/// [`rezidnt_gate::permit::PermitDecision`] at the MCP-surface boundary so the
+/// socket handler maps it to `rezidnt_proto::Reply::PermitDecision` without
+/// reaching into the gate crate's internal type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// `allow` — the action may proceed.
+    Allow,
+    /// `deny` — the action is blocked.
+    Deny,
+    /// `ask` — escalate to a human; inconclusive is never coerced to allow (I6).
+    Ask,
+}
+
+impl Decision {
+    /// The wire word carried to the PEP (`allow | deny | ask`).
+    pub fn as_word(self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+            Decision::Ask => "ask",
+        }
+    }
+}
+
+impl From<rezidnt_gate::permit::PermitDecision> for Decision {
+    fn from(d: rezidnt_gate::permit::PermitDecision) -> Self {
+        match d {
+            rezidnt_gate::permit::PermitDecision::Grant => Decision::Allow,
+            rezidnt_gate::permit::PermitDecision::Deny => Decision::Deny,
+            rezidnt_gate::permit::PermitDecision::Escalate => Decision::Ask,
+        }
+    }
+}
+
+/// The transport-neutral outcome of a permit decision (SP2, DR-013 decision 1).
+/// The socket handler maps this to `Reply::PermitDecision`; the MCP adapter maps
+/// it back to a `tool_ok`. The on-log facts (`permit.requested` + one decision
+/// fact) are ALREADY emitted by [`McpCore::decide_permit`] before it returns —
+/// no caller re-emits (I3).
+#[derive(Debug, Clone)]
+pub struct PermitOutcome {
+    /// The correlation token this decision resolved under — the caller's when
+    /// supplied, else the minted one. The socket echoes it back to the PEP.
+    pub request_id: String,
+    /// The three-valued decision, never coerced (I6).
+    pub decision: Decision,
+    /// Why, on a deny/ask (the deciding verifier's message); absent on a
+    /// trivially-granted allow.
+    pub reason: Option<String>,
+}
+
+/// PDP-domain errors from [`McpCore::decide_permit`] (thiserror per lib
+/// convention). Distinct from a JSON-RPC error tuple: the socket handler maps
+/// these to `Reply::Error`, the MCP adapter maps them to a `(-32603, msg)`.
+#[derive(Debug, thiserror::Error)]
+pub enum PdpError {
+    /// A daemon-side fault while reaching the decision (CAS/log/aggregate).
+    #[error("permit decision: {0}")]
+    Internal(String),
+}
+
 /// The daemon-side seam behind the mutating tools (I4: the core stays
 /// transport- and substrate-agnostic; the daemon implements this over its run
 /// substrate). Read-only tools and resources never touch it — they interrogate
@@ -459,8 +553,11 @@ impl McpCore {
     /// Both the `permit.requested` fact and one decision fact land on the log
     /// (I3: the permission stream is first-class in `tail`).
     async fn call_request_permission(&self, args: Value) -> RpcOutcome {
-        // §12: the badge is checked BEFORE any decision or side effect.
-        let badge_id = match self.check_badge(&args) {
+        // §12: the MCP door checks the badge BEFORE any decision or side effect.
+        // The socket transport skips this door (0600 UDS is the identity, DR-013
+        // decision 3) by calling `decide_permit` directly; the shared PDP flow
+        // never re-checks the badge, so the door lives here at the MCP edge.
+        let _badge_id = match self.check_badge(&args) {
             Ok(id) => id,
             Err(refusal) => return Ok(refusal),
         };
@@ -479,12 +576,69 @@ impl McpCore {
             (Ok(r), Ok(a), Ok(t)) => (r, a, t),
             (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return Ok(e),
         };
-        let context_ref = args
-            .get("context_ref")
-            .and_then(Value::as_str)
-            .map(String::from);
-        // One request id ties the request fact to its decision fact.
-        let request_id = ulid::Ulid::new().to_string();
+        // Build the transport-neutral request and run the ONE PDP path. The MCP
+        // caller echoes a supplied `request_id` when present (parity with the
+        // socket's PEP token), else `decide_permit` mints one.
+        let req = PermitRequest {
+            run,
+            request_id: args
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(String::from),
+            action,
+            tool,
+            badge: args.get("badge").and_then(Value::as_str).map(String::from),
+            context_ref: args
+                .get("context_ref")
+                .and_then(Value::as_str)
+                .map(String::from),
+            paths: args.get("paths").cloned(),
+        };
+        let outcome = self
+            .decide_permit(req)
+            .await
+            .map_err(|e| (-32603, e.to_string()))?;
+
+        let mut result = json!({ "decision": outcome.decision.as_word() });
+        if let (Some(r), Some(obj)) = (outcome.reason, result.as_object_mut()) {
+            obj.insert("reason".to_string(), Value::String(r));
+        }
+        Ok(tool_ok(result))
+    }
+
+    /// The transport-neutral PDP entrypoint (SP2, DR-013 decision 1). Both the
+    /// MCP JSON-RPC adapter and the socket handler call this; it performs the
+    /// ENTIRE decision flow and emits the two on-log facts (`permit.requested` +
+    /// one decision fact) itself, so no caller re-emits (I3 — MCP and socket
+    /// facts are byte-identical, no fork).
+    ///
+    /// Badge: this method NEVER refuses on a missing/unknown badge — the §12
+    /// door is the MCP adapter's (DR-013 decision 3: the socket's 0600 UDS is
+    /// its identity). A present `badge` only decorates the `permit.requested`
+    /// fact's `badge_id` (best-effort resolution).
+    pub async fn decide_permit(&self, req: PermitRequest) -> Result<PermitOutcome, PdpError> {
+        let PermitRequest {
+            run,
+            request_id,
+            action,
+            tool,
+            badge,
+            context_ref,
+            paths,
+        } = req;
+
+        // The caller's token when supplied (the PEP's, over the socket); else
+        // mint — so the PEP's ask and the on-log decision fact share one id.
+        let request_id = request_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
+
+        // Best-effort badge id for the requested fact (never a refusal here).
+        let badge_id = badge.as_deref().and_then(|token| {
+            self.badges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .id_for(token)
+                .map(str::to_string)
+        });
 
         // The permit.requested fact (I3). Bulk context rides as a ref string,
         // never inline bytes (I2); the descriptor is small scalars.
@@ -493,18 +647,22 @@ impl McpCore {
             "request_id": request_id,
             "action": action,
             "target": { "tool": tool },
-            "badge_id": badge_id,
         });
+        if let Some(id) = &badge_id {
+            requested["badge_id"] = json!(id);
+        }
         if let Some(ref cref) = context_ref {
             requested["context_ref"] = json!(cref);
         }
-        self.publish_fact("permit.requested", requested).await?;
+        self.publish_fact("permit.requested", requested)
+            .await
+            .map_err(|(_, m)| PdpError::Internal(m))?;
 
         // SP-wire (DR-011): dispatch the CONFIGURED `[gates.permit]` verifier
         // set — not a hardcoded single verifier — and aggregate via
         // `permit::aggregate`. Config resolution is a substrate capability
         // (DR-011 §1); the core folds the run's state itself (DR-011 §2).
-        let cas = self.permit_cas()?;
+        let cas = self.permit_cas().map_err(|(_, m)| PdpError::Internal(m))?;
 
         // 1. Resolve the applied verifier set: a static config (test / single
         //    workspace) wins; else the substrate resolves it per-run; else NO
@@ -524,14 +682,17 @@ impl McpCore {
         //    (DR-011 §2; the same discipline `resources_read` uses). The intent
         //    allowlist and the spend accumulator are injected as CONTENT-PINNED
         //    params — NEVER live state, NEVER re-derived (determinism BINDING).
-        let folded = self.fold_run_state(&run).await?;
+        let folded = self
+            .fold_run_state(&run)
+            .await
+            .map_err(|(_, m)| PdpError::Internal(m))?;
 
         // 3. The request axis + folded state as pinned params. Each verifier's
         //    own config (`allow`, caps, knobs) rides its `PermitVerifierSpec`
         //    and the aggregator merges it over this base.
         let mut base_params = json!({ "tool": tool });
         if let Some(obj) = base_params.as_object_mut() {
-            if let Some(paths) = args.get("paths") {
+            if let Some(paths) = &paths {
                 obj.insert("paths".to_string(), paths.clone());
             }
             // DR-012 option B: inject the `allowed_tools` key whenever intent is
@@ -567,15 +728,11 @@ impl McpCore {
                 rezidnt_gate::permit::aggregate(&verifiers, &input, &cas)
             })
             .await
-            .map_err(|e| (-32603, format!("permit aggregate task panicked: {e}")))?
-            .map_err(|e| (-32603, format!("permit aggregate: {e}")))?
+            .map_err(|e| PdpError::Internal(format!("permit aggregate task panicked: {e}")))?
+            .map_err(|e| PdpError::Internal(format!("permit aggregate: {e}")))?
         };
 
-        let decision_word = match outcome.decision {
-            rezidnt_gate::permit::PermitDecision::Grant => "allow",
-            rezidnt_gate::permit::PermitDecision::Deny => "deny",
-            rezidnt_gate::permit::PermitDecision::Escalate => "ask",
-        };
+        let decision = Decision::from(outcome.decision);
         let reason = outcome.evidence.first().map(|e| e.msg.clone());
 
         // 5. Emit ONE aggregate decision fact carrying the DECIDING verifier's
@@ -594,8 +751,8 @@ impl McpCore {
                 cas.put(policy_bytes.as_bytes(), "application/json")
             })
             .await
-            .map_err(|e| (-32603, format!("policy pin task panicked: {e}")))?
-            .map_err(|e| (-32603, format!("pin policy: {e}")))?
+            .map_err(|e| PdpError::Internal(format!("policy pin task panicked: {e}")))?
+            .map_err(|e| PdpError::Internal(format!("pin policy: {e}")))?
         };
         // The deciding verifier's evidence blob (if any) carries as the
         // decision's evidence_ref (I2: ref, never inline bytes). The aggregator
@@ -615,13 +772,15 @@ impl McpCore {
             reason.as_deref(),
             rezidnt_gate::permit::DecisionDeltas::default(),
         );
-        self.publish_fact(subject, payload).await?;
+        self.publish_fact(subject, payload)
+            .await
+            .map_err(|(_, m)| PdpError::Internal(m))?;
 
-        let mut result = json!({ "decision": decision_word });
-        if let (Some(r), Some(obj)) = (reason, result.as_object_mut()) {
-            obj.insert("reason".to_string(), Value::String(r));
-        }
-        Ok(tool_ok(result))
+        Ok(PermitOutcome {
+            request_id,
+            decision,
+            reason,
+        })
     }
 
     /// Fold this run's per-run state (intent allowlist + permit accumulators)

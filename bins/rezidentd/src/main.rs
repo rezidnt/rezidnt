@@ -189,27 +189,36 @@ mod unix_daemon {
             .await
             .context("rebuild open-workspace map from log")?;
 
+        // SP2 (DR-013 decision 1): construct the PDP core UNCONDITIONALLY — not
+        // gated on REZIDNT_MCP_LOCKFILE — so the socket-side permit path does not
+        // depend on the HTTP transport being enabled. The socket handler and the
+        // optional HTTP transport share this ONE Arc: one decision path, MCP and
+        // socket facts are byte-identical (I3, no fork). The `McpBridge`
+        // substrate resolves each run's `[gates.permit]` config (DR-011); the
+        // CAS is the daemon's own (native verifiers pin evidence, I2).
+        let bridge: Arc<dyn rezidnt_mcp::McpSubstrate> = Arc::new(crate::mcp::McpBridge {
+            daemon: Arc::clone(&daemon),
+        });
+        let pdp = Arc::new(
+            rezidnt_mcp::McpCore::new_shared(
+                Arc::clone(&daemon.fabric),
+                rezidnt_mcp::BadgeBook::new(),
+            )
+            .with_cas(Arc::clone(&daemon.cas))
+            .with_substrate(bridge),
+        );
+
         // S3 (doc §9, I5): the loopback-HTTP MCP transport, requested via
         // REZIDNT_MCP_LOCKFILE. Bound at 127.0.0.1:0; the REAL port plus the
         // daemon-lifetime operator badge are announced in the 0600 lockfile.
         // The handle must live as long as the daemon: dropping it stops the
-        // listener.
+        // listener. It serves over the SAME core as the socket PDP.
         let _mcp_transport = match std::env::var_os("REZIDNT_MCP_LOCKFILE") {
             Some(lockfile) => {
-                let bridge: Arc<dyn rezidnt_mcp::McpSubstrate> = Arc::new(crate::mcp::McpBridge {
-                    daemon: Arc::clone(&daemon),
-                });
-                let core = Arc::new(
-                    rezidnt_mcp::McpCore::new_shared(
-                        Arc::clone(&daemon.fabric),
-                        rezidnt_mcp::BadgeBook::new(),
-                    )
-                    .with_cas(Arc::clone(&daemon.cas))
-                    .with_substrate(bridge),
-                );
-                let handle = rezidnt_mcp::serve_http(core, std::path::Path::new(&lockfile))
-                    .await
-                    .context("start mcp loopback-http transport")?;
+                let handle =
+                    rezidnt_mcp::serve_http(Arc::clone(&pdp), std::path::Path::new(&lockfile))
+                        .await
+                        .context("start mcp loopback-http transport")?;
                 tracing::info!(url = %handle.url, "mcp http transport announced");
                 Some(handle)
             }
@@ -227,10 +236,11 @@ mod unix_daemon {
         loop {
             let (stream, _addr) = listener.accept().await.context("accept")?;
             let daemon = Arc::clone(&daemon);
+            let pdp = Arc::clone(&pdp);
             let span = tracing::info_span!("adapter", kind = "uds-conn");
             tokio::spawn(
                 async move {
-                    if let Err(e) = handle_conn(stream, daemon).await {
+                    if let Err(e) = handle_conn(stream, daemon, pdp).await {
                         // Client disconnects surface here; not daemon faults.
                         tracing::debug!(error = %e, "connection ended");
                     }
@@ -257,7 +267,11 @@ mod unix_daemon {
 
     /// Per-connection protocol: hello line → request line (or S0 silence) →
     /// the requested stream.
-    async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<()> {
+    async fn handle_conn(
+        stream: UnixStream,
+        daemon: Arc<Daemon>,
+        pdp: Arc<rezidnt_mcp::McpCore>,
+    ) -> anyhow::Result<()> {
         let (read_half, mut write_half) = stream.into_split();
 
         let hello = Hello {
@@ -352,22 +366,58 @@ mod unix_daemon {
                     }
                 }
             }
-            Request::RequestPermission { request_id, .. } => {
-                // SP1 pins the `request_permission` WIRE shape (rezidnt_proto);
-                // the SP1 DECISION path is the MCP surface (I5 MCP-first). The
-                // socket-side PDP handler is not wired here yet — answer ONE
-                // honest machine-readable frame and close, NEVER a coerced
-                // decision (I6).
-                let error = Reply::Error {
-                    op: "request_permission".to_string(),
-                    code: rezidnt_proto::codes::OP_NOT_SERVED.to_string(),
-                    message: format!(
-                        "request_permission (request_id {request_id}) is served on the MCP surface, not the socket, in SP1"
-                    ),
-                    run: None,
+            Request::RequestPermission {
+                run,
+                request_id,
+                action,
+                tool,
+                context_ref,
+                // DR-013 decision 3: the socket transport skips the §12 badge
+                // door — the 0600 owner-only UDS IS the identity — so `badge` is
+                // ignored here (it stays optional on the wire for forward-compat).
+                badge: _,
+            } => {
+                // SP2 (DR-013 decision 1): service the permit decision over the
+                // SAME transport-neutral PDP the MCP surface uses. The socket
+                // carries the PEP's `request_id` token; `decide_permit` echoes it
+                // so the ask and the on-log decision fact share one id. The two
+                // facts (`permit.requested` + one decision fact) are emitted by
+                // `decide_permit` — the socket handler never re-emits (I3).
+                let req = rezidnt_mcp::PermitRequest {
+                    run,
+                    request_id: Some(request_id),
+                    action,
+                    tool,
+                    // The socket skips the badge door (DR-013 decision 3).
+                    badge: None,
+                    context_ref,
+                    // The proto socket op carries no path axis today; the native
+                    // request axis is the tool. Additive when the wire grows one.
+                    paths: None,
                 };
-                write_reply(&mut write_half, &error).await?;
-                Ok(())
+                match pdp.decide_permit(req).await {
+                    Ok(outcome) => {
+                        let reply = Reply::PermitDecision {
+                            request_id: outcome.request_id,
+                            decision: outcome.decision.as_word().to_string(),
+                            reason: outcome.reason,
+                        };
+                        write_reply(&mut write_half, &reply).await?;
+                        Ok(()) // orderly close after the decision frame
+                    }
+                    Err(e) => {
+                        // A daemon-side PDP fault is honest INTERNAL — never a
+                        // coerced decision (I6).
+                        let error = Reply::Error {
+                            op: "request_permission".to_string(),
+                            code: rezidnt_proto::codes::INTERNAL.to_string(),
+                            message: format!("{e}"),
+                            run: None,
+                        };
+                        write_reply(&mut write_half, &error).await?;
+                        Ok(())
+                    }
+                }
             }
         }
     }

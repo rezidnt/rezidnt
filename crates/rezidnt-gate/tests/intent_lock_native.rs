@@ -232,6 +232,152 @@ fn intent_absent_is_inconclusive_not_pass() {
         Verdict::Pass,
         "intent-absent is NEVER coerced to a pass — the cannot-run guard (I6)"
     );
+    // SP-empty (DR-012) — pin the ABSENT leg's cannot-run EVIDENCE so it is
+    // distinguishable from the DECLARED-empty off-task case below. Absent must
+    // carry the "no intent allowlist pinned" cannot-run message; declared-empty
+    // must NOT. This is the discriminator the two new tests assert against.
+    assert!(
+        out.evidence
+            .iter()
+            .any(|e| e.msg.contains("no intent allowlist pinned")),
+        "intent-ABSENT is cannot-run with the 'no intent allowlist pinned' evidence — the \
+         message declared-empty must NOT carry (DR-012 discriminator); got {:?}",
+        out.evidence
+    );
+}
+
+// --- SP-empty (DR-012): DECLARED-empty allowlist is off-task, NOT cannot-run --
+//
+// DR-012 option B (ACCEPTED) breaks the collapse at lib.rs:784-789: today
+// `string_list(p, "allowed_tools")` returns `[]` for BOTH a missing key
+// (intent ABSENT) and an explicit `[]` (intent DECLARED-empty), and the
+// `if allowed.is_empty() { cannot_run(...) }` guard sends both to cannot-run.
+// Per DR-012 the implementer replaces that guard with a KEY-PRESENCE check:
+//   - `allowed_tools` key ABSENT  → cannot-run (genuinely no declared intent).
+//   - `allowed_tools` key PRESENT but `[]` → "every tool is off-task": fall
+//     through into the EXISTING off-task path (the `any(...)==false` branch),
+//     honoring `on_off_task` (escalate default / deny under the knob).
+// These tests pin the DECLARED-empty half. They are ASSERT-RED against the
+// current collapse: with the `is_empty()` guard in place a declared-empty
+// allowlist returns cannot-run/Inconclusive REGARDLESS of the knob, so
+// `declared_empty_under_deny_knob_fails` (which expects Fail) is red today.
+
+/// DR-012 — an `allowed_tools` key PRESENT but EMPTY (`[]`) means every tool is
+/// off-task. Under the DEFAULT knob it routes through the off-task path →
+/// **Inconclusive** (escalate), NEVER a synthesized pass and NEVER the
+/// cannot-run absent path. The distinction from ABSENT is BEHAVIORAL (it honors
+/// the knob) and INTERROGABLE (the evidence is the off-task wording naming the
+/// empty declared intent `[]`, NOT the "no intent allowlist pinned" cannot-run
+/// message the absent leg carries).
+///
+/// ASSERT-RED against the current collapse: today declared-empty hits the
+/// `is_empty()` cannot-run guard, so the evidence is "no intent allowlist
+/// pinned …" (the absent message) — this test demands the off-task wording and
+/// fails on the collapsed message.
+#[test]
+fn declared_empty_allowlist_is_off_task_not_cannot_run() {
+    let (_d, cas) = empty_cas();
+    let out = IntentLock
+        .verify(
+            // Key PRESENT (`allowed_tools`), value EMPTY (`[]`) — declared
+            // lockdown: the run declared it may use NO tools, so Bash is off-task.
+            &permit_input(json!({
+                "tool": "Bash",
+                "allowed_tools": [],
+            })),
+            &cas,
+        )
+        .expect("off-task/escalate is a verdict, not an error");
+    assert_eq!(
+        out.verdict,
+        Verdict::Inconclusive,
+        "a DECLARED-empty allowlist means every tool is off-task → escalate under the default \
+         knob (DR-012 option B), NOT a synthesized pass"
+    );
+    assert!(
+        !out.evidence.is_empty(),
+        "the escalation carries evidence (I6)"
+    );
+    // The load-bearing DISCRIMINATOR from ABSENT: declared-empty routes through
+    // the OFF-TASK path, so its evidence is the off-task wording naming the
+    // (empty) declared intent — NOT the cannot-run "no intent allowlist pinned"
+    // message. Pin the exact off-task string the existing path produces for an
+    // empty allowlist (join of `[]` is the empty string ⇒ trailing `[]`).
+    assert_eq!(
+        out.evidence[0].msg, "off-task tool Bash not in declared intent []",
+        "declared-empty is the OFF-TASK path (empty declared intent named `[]`), NOT the \
+         cannot-run absent message — this is the DR-012 discriminator; got {:?}",
+        out.evidence
+    );
+    assert!(
+        !out.evidence[0].msg.contains("no intent allowlist pinned"),
+        "declared-empty must NOT carry the ABSENT cannot-run message — that would be the \
+         collapse DR-012 breaks; got {:?}",
+        out.evidence
+    );
+}
+
+/// DR-012 — THE crux of option B. A DECLARED-empty allowlist under the hardened
+/// knob `on_off_task = deny` → **Fail** (deny): a real least-privilege LOCKDOWN
+/// ("this run may use NO tools" → deny every tool). This is the observable
+/// behavior option A could NEVER express — an ABSENT intent under the deny knob
+/// only ever escalates (cannot-run ignores the knob), but declared-empty under
+/// deny denies. Pins BOTH sides of that contrast.
+///
+/// ASSERT-RED against the current collapse: today declared-empty hits the
+/// `is_empty()` cannot-run guard and returns Inconclusive REGARDLESS of the
+/// knob — so this expects Fail and gets Inconclusive. The red reason is the
+/// collapse (cannot-run swallows the knob), not a typo.
+#[test]
+fn declared_empty_under_deny_knob_fails() {
+    let (_d, cas) = empty_cas();
+    // Declared-empty (key present, `[]`) + the hardened deny knob → deny.
+    let declared_empty = IntentLock
+        .verify(
+            &permit_input(json!({
+                "tool": "Bash",
+                "allowed_tools": [],
+                "on_off_task": "deny",
+            })),
+            &cas,
+        )
+        .expect("engine ok");
+    assert_eq!(
+        declared_empty.verdict,
+        Verdict::Fail,
+        "DECLARED-empty under `on_off_task = deny` is a lockdown → DENY every tool (DR-012 \
+         option B crux); the collapse returns Inconclusive here — the RED is the collapse"
+    );
+    assert!(
+        !declared_empty.evidence.is_empty() && declared_empty.evidence[0].msg.contains("Bash"),
+        "the denial names the off-task tool (I6); got {:?}",
+        declared_empty.evidence
+    );
+
+    // The CONTRAST that only option B can express: an ABSENT intent (no
+    // `allowed_tools` key) under the SAME deny knob still only ESCALATES —
+    // cannot-run ignores the knob because we genuinely do not know the intent.
+    let absent = IntentLock
+        .verify(
+            &permit_input(json!({
+                "tool": "Bash",
+                "on_off_task": "deny",
+            })),
+            &cas,
+        )
+        .expect("engine ok");
+    assert_eq!(
+        absent.verdict,
+        Verdict::Inconclusive,
+        "ABSENT intent + deny knob STILL escalates (cannot-run ignores the knob) — the \
+         distinction from declared-empty that makes option B honest (DR-012)"
+    );
+    assert_ne!(
+        absent.verdict,
+        Verdict::Fail,
+        "absent is NEVER coerced to a deny even under the deny knob — only a DECLARED-empty \
+         lockdown denies (DR-012); the deny knob does not manufacture an intent"
+    );
 }
 
 /// DR-010 §3, I6 determinism BINDING — same PINNED params ⇒ same verdict AND

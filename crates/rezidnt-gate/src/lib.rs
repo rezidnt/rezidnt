@@ -762,9 +762,12 @@ impl NativeVerifier for SpendCap {
 ///   to the CAS, the fact carries the ref only (I2).
 /// - off-task under the hardened knob `on_off_task = deny` → Fail (deny) for
 ///   high-assurance runs, with the same interrogable evidence.
-/// - intent state ABSENT (no allowlist pinned / empty declared set) →
+/// - intent ABSENT (the `allowed_tools` KEY omitted from params) →
 ///   Inconclusive via cannot-run, NEVER a synthesized pass (same discipline as
-///   [`SpendCap`] with missing caps, I6).
+///   [`SpendCap`] with missing caps, I6). A DECLARED-empty allowlist
+///   (`allowed_tools: []`, key present) is NOT cannot-run: it is a lockdown
+///   where every tool is off-task, routed through the off-task path above
+///   (escalate/deny per `on_off_task`), per DR-012 option B.
 pub struct IntentLock;
 
 impl NativeVerifier for IntentLock {
@@ -778,15 +781,19 @@ impl NativeVerifier for IntentLock {
                 "no tool in params — undecidable, not a pass (I6)",
             ));
         };
-        // The DECLARED, content-pinned intent allowlist. Absent OR empty is
+        // The DECLARED, content-pinned intent allowlist. Key-ABSENCE is
         // intent-absent: the verifier cannot decide whether the tool is on-task
-        // → cannot-run (never a synthesized pass, DR-010 §8 crit 2d, I6).
-        let allowed = string_list(p, "allowed_tools");
-        if allowed.is_empty() {
+        // → cannot-run (never a synthesized pass, DR-010 §8 crit 2d, I6). A
+        // key-PRESENT-but-empty `[]` is a DECLARED-empty lockdown — the run
+        // declared it may use NO tools, so every tool is off-task and falls
+        // through the off-task path below (DR-012 option B). The discriminator
+        // is key-presence, NOT emptiness.
+        if p.get("allowed_tools").is_none() {
             return Ok(cannot_run(
                 "no intent allowlist pinned — undecidable, not a pass (I6)",
             ));
         }
+        let allowed = string_list(p, "allowed_tools");
 
         // On-task: the requested tool is in the declared intent allowlist → allow.
         if allowed.iter().any(|t| t == tool) {

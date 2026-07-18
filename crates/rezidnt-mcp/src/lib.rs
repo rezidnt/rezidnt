@@ -534,9 +534,11 @@ impl McpCore {
             if let Some(paths) = args.get("paths") {
                 obj.insert("paths".to_string(), paths.clone());
             }
-            if let Some(intent) = &folded.intent
-                && !intent.allowed_tools.is_empty()
-            {
+            // DR-012 option B: inject the `allowed_tools` key whenever intent is
+            // DECLARED (`Some`, even `Some([])`), so a declared-empty lockdown
+            // reaches `IntentLock` as a present-but-empty key (→ off-task path);
+            // OMIT it only when intent is genuinely ABSENT (`None` → cannot-run).
+            if let Some(intent) = &folded.intent {
                 obj.insert("allowed_tools".to_string(), json!(intent.allowed_tools));
             }
             obj.insert(

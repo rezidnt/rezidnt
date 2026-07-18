@@ -28,6 +28,8 @@
 //! network disabled unless the gate def opts in — the opt-in is recorded, the
 //! plumbing beyond recording is out of S4 scope.
 
+pub mod permit;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

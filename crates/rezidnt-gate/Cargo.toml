@@ -33,3 +33,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # proptest: the "garbage never parses to pass" conformance property
 # (testing-oracles: verifier conformance suite).
 proptest = { workspace = true }
+# ulid + serde_json: the SP0 permit-emit oracle builds a `permit.requested`
+# Event to prove the emit path respects the I2 ≤32KiB envelope boundary
+# (tests/permit_emit.rs). serde_json is already a runtime dep; ulid is
+# test-only here (the emit constructors take string ids, not Ulid).
+ulid = { workspace = true }

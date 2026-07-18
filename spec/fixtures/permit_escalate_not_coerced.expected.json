@@ -1,0 +1,36 @@
+{
+  "events_folded": 2,
+  "last_event": "01SP0ESCNCRCEPERMFXX0000E2",
+  "counts_by_subject": {
+    "permit.escalated": 1,
+    "permit.requested": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01SP0ESCNCRCEPERMFXX00RN01": {
+      "status": "",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {
+        "01SP0ESCNCRCEPERMFXXRQ001": {
+          "action": "tool.invoke",
+          "decision": "escalated",
+          "policy_ref": "e5ca1a7e0000000000000000000000000000000000000000000000n0c0erce",
+          "reason": "no policy matched"
+        }
+      },
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.0,
+        "risk_score": 5.0,
+        "granted": 0,
+        "denied": 0,
+        "escalated": 1
+      }
+    }
+  },
+  "worktrees": {}
+}

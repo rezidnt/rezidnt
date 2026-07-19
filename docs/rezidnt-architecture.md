@@ -362,8 +362,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-012](decisions/DR-012-empty-vs-absent-intent.md) | Declared-empty vs absent intent allowlist (intent-lock) | ACCEPTED | §16 |
 | [DR-013](decisions/DR-013-permit-pep-sp2-integration.md) | Permit PEP integration + fail-posture (SP2) | ACCEPTED | §9, §16 |
 | [DR-014](decisions/DR-014-permit-pep-hook.md) | Permit PEP hook binary + spawn injection (SP2 hook sub-slice) | ACCEPTED | §9, §16 |
+| [DR-015](decisions/DR-015-permit-exec-verifier.md) | Permit axis dispatches exec verifiers (SP3 bring-your-own policy DSL) | ACCEPTED | §8, §9, §16 |
 
-*The next record is DR-015.*
+*The next record is DR-016.*
 
 ---
 

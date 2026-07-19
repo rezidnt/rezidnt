@@ -66,10 +66,7 @@ fn permit_input(params: Value) -> VerifierInput {
 /// unit — the daemon builds it from `VerifierSpec` + the folded per-run state
 /// injected as content-pinned params (CRITERION 3, pinned at the MCP layer).
 fn native(name: &str, params: Value) -> PermitVerifierSpec {
-    PermitVerifierSpec {
-        name: name.to_string(),
-        params,
-    }
+    PermitVerifierSpec::native(name, params)
 }
 
 /// CRITERION 1 + 2 — a permit gate configured with THREE natives runs ALL three

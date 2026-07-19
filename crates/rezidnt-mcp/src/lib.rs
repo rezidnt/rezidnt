@@ -151,11 +151,12 @@ pub struct OpenAck {
     pub correlation: String,
 }
 
-/// The resolved `[gates.permit]` verifier set for a run — the ordered native
-/// name/params pairs the PDP dispatches (SP-wire, DR-011). The daemon folds this
-/// from the applied spec (`workspace.spec.applied`, keyed by workspace, I3);
-/// the core injects the run's folded state as pinned params and aggregates via
-/// [`rezidnt_gate::permit::aggregate`].
+/// The resolved `[gates.permit]` verifier set for a run — the ordered verifier
+/// entries the PDP dispatches (SP-wire, DR-011; SP3 adds exec entries, DR-015).
+/// The daemon folds this from the applied spec (`workspace.spec.applied`, keyed
+/// by workspace, I3); the core injects the run's folded state as pinned params
+/// and aggregates via [`rezidnt_gate::permit::aggregate_async`] (natives run
+/// sync in-process; an exec entry runs as an `await`ed §8 subprocess).
 ///
 /// An EMPTY set is honest-undecidable: the aggregator escalates it, never a
 /// synthesized allow (I6). NO config resolved at all (bare core, no substrate)
@@ -171,10 +172,7 @@ impl PermitConfig {
         Self {
             verifiers: entries
                 .iter()
-                .map(|(name, params)| PermitVerifierSpec {
-                    name: (*name).to_string(),
-                    params: params.clone(),
-                })
+                .map(|(name, params)| PermitVerifierSpec::native(*name, params.clone()))
                 .collect(),
         }
     }
@@ -719,18 +717,15 @@ impl McpCore {
         // 4. Aggregate the configured set IN ORDER (first Fail short-circuits →
         //    Deny; else any Inconclusive → Escalate; else Grant). The aggregate
         //    verdict maps via `decision_for` (I6: inconclusive → ask, never
-        //    coerced). Off the async threads (CAS is blocking).
-        let outcome = {
-            let cas = Arc::clone(&cas);
-            let verifiers = config.verifiers().to_vec();
-            let input = input.clone();
-            tokio::task::spawn_blocking(move || {
-                rezidnt_gate::permit::aggregate(&verifiers, &input, &cas)
-            })
+        //    coerced). SP3 lifts aggregation to the ASYNC layer (DR-015
+        //    §Decision 2, option A): natives run sync/in-process inside the
+        //    aggregator (CPU + CAS by design), but an exec permit entry runs as
+        //    an `await`ed subprocess through `ExecVerifier` — visible to the
+        //    scheduler and the hot-path timeout, never `block_on`'d inside
+        //    `spawn_blocking`.
+        let outcome = rezidnt_gate::permit::aggregate_async(config.verifiers(), &input, &cas)
             .await
-            .map_err(|e| PdpError::Internal(format!("permit aggregate task panicked: {e}")))?
-            .map_err(|e| PdpError::Internal(format!("permit aggregate: {e}")))?
-        };
+            .map_err(|e| PdpError::Internal(format!("permit aggregate: {e}")))?;
 
         let decision = Decision::from(outcome.decision);
         let reason = outcome.evidence.first().map(|e| e.msg.clone());

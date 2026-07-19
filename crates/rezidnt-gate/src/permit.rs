@@ -22,7 +22,7 @@ use rezidnt_cas::Cas;
 use rezidnt_types::refs::CasRef;
 use serde_json::{Value, json};
 
-use crate::{Evidence, GateError, Verdict, VerifierInput, builtin_natives};
+use crate::{Evidence, ExecVerifier, GateError, Verdict, VerifierInput, builtin_natives};
 
 /// The fourth gate lifecycle point (design §4; project spec `[gates.permit]`).
 /// String-modeled like the existing three — a `GateDef` whose `name` is this is
@@ -169,20 +169,72 @@ pub fn requested_fact(
     ("permit.requested", payload)
 }
 
-/// One resolved entry in the configured `[gates.permit]` verifier set: a native
-/// name plus its content-pinned params. This is the SP-wire dispatch unit — the
-/// daemon builds it from `VerifierSpec` plus the folded per-run state injected as
+/// The kind of a configured permit-verifier entry (DR-015 §Decision 1). A
+/// permit entry is EITHER a built-in native (resolved by name via
+/// [`builtin_natives`]) or an exec program (an argv speaking the §8 JSON
+/// contract, dispatched through [`crate::ExecVerifier`]). The two dispatch
+/// differently — natives run sync/in-process, exec runs as an `await`ed
+/// subprocess — so the async aggregator ([`aggregate_async`]) branches on this.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermitVerifierKind {
+    /// A built-in native verifier resolved by [`PermitVerifierSpec::name`].
+    Native,
+    /// An exec verifier: the argv (interpreter + policy path + args) the
+    /// operator provides. rezidnt dispatches it, never bundles the engine (I7).
+    Exec { argv: Vec<String> },
+}
+
+/// One resolved entry in the configured `[gates.permit]` verifier set: a display
+/// name, its content-pinned params, and its [`PermitVerifierKind`] (native or
+/// exec, DR-015 §Decision 1). This is the SP-wire dispatch unit — the daemon
+/// builds it from `VerifierSpec` plus the folded per-run state injected as
 /// content-pinned params (determinism BINDING). The aggregator merges each
 /// verifier's own `params` with the shared request axis (the requested `tool`,
 /// target `paths`, etc.) so both the request and the policy config reach the
-/// native as one pinned `inputs.params` object.
+/// verifier as one pinned `inputs.params` object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermitVerifierSpec {
-    /// The native name resolved via [`builtin_natives`] (`name()`).
+    /// The display name: a native's registry name (resolved via
+    /// [`builtin_natives`]) or an exec verifier's operator-chosen label. It is
+    /// the `deciding_verifier` the decision fact records (I6 interrogability).
     pub name: String,
     /// The verifier's pinned params (its `[gates.permit].verifiers` config, e.g.
     /// `{ "allow": [...] }`), merged over the shared request axis.
     pub params: Value,
+    /// Native vs exec dispatch (DR-015 §Decision 1). Private so the kind is only
+    /// set through the [`Self::native`]/[`Self::exec`] constructors — a caller
+    /// cannot mint a half-formed exec entry with no argv.
+    kind: PermitVerifierKind,
+}
+
+impl PermitVerifierSpec {
+    /// A native permit entry: a registry name + its pinned params (DR-015
+    /// §Decision 1). Dispatched in-process by resolving `name` against
+    /// [`builtin_natives`].
+    pub fn native(name: impl Into<String>, params: Value) -> Self {
+        Self {
+            name: name.into(),
+            params,
+            kind: PermitVerifierKind::Native,
+        }
+    }
+
+    /// An exec permit entry: a display name + the argv (interpreter + policy
+    /// path + args) + its pinned params (DR-015 §Decision 1). Dispatched as an
+    /// `await`ed subprocess through [`crate::ExecVerifier`] speaking the §8 JSON
+    /// contract — rezidnt ships the dispatch, never the engine (I7).
+    pub fn exec(name: impl Into<String>, argv: Vec<String>, params: Value) -> Self {
+        Self {
+            name: name.into(),
+            params,
+            kind: PermitVerifierKind::Exec { argv },
+        }
+    }
+
+    /// This entry's dispatch kind (native vs exec).
+    pub fn kind(&self) -> &PermitVerifierKind {
+        &self.kind
+    }
 }
 
 /// The aggregate outcome of dispatching a configured permit-verifier set: the
@@ -389,6 +441,172 @@ pub fn aggregate(
             // All passed. The deciding verifier is the last one that ran (a
             // grant has no single "reason"; the caller pins the whole set's tail
             // as the policy descriptor). No evidence on a grant.
+            let last = set.last().expect("non-empty set has a last entry");
+            let merged = merge_params(&input.params, &last.params);
+            Ok(PermitOutcome {
+                verdict: Verdict::Pass,
+                decision: decision_for(Verdict::Pass),
+                deciding_verifier: last.name.clone(),
+                deciding_params: merged,
+                evidence: Vec::new(),
+                deciding_evidence_ref: None,
+                verifiers_run,
+            })
+        }
+    }
+}
+
+/// Run ONE native permit-verifier by name and return its owned verdict +
+/// evidence. Fully SYNCHRONOUS: it builds and drops the `builtin_natives` pack
+/// (`Vec<Box<dyn NativeVerifier>>`, which is not `Send`) entirely within this
+/// scope, so [`aggregate_async`] can call it without holding a non-`Send` value
+/// across the exec `.await` (the aggregate future is `spawn`ed on the
+/// multi-thread runtime). An unknown native name is an honest can't-run →
+/// `Inconclusive`, never a pass (I6).
+fn native_verdict(
+    name: &str,
+    input: &VerifierInput,
+    cas: &Cas,
+) -> Result<(Verdict, Vec<Evidence>), GateError> {
+    let natives = builtin_natives();
+    match natives.iter().find(|n| n.name() == name) {
+        Some(native) => {
+            let out = native.verify(input, cas)?;
+            Ok((out.verdict, out.evidence))
+        }
+        None => Ok((
+            Verdict::Inconclusive,
+            vec![Evidence {
+                kind: "cannot-run".to_string(),
+                msg: format!("unknown native verifier {name}"),
+                cas_ref: None,
+            }],
+        )),
+    }
+}
+
+/// Dispatch a HETEROGENEOUS permit-verifier set (natives + exec) IN ORDER and
+/// aggregate the verdicts into one permit outcome — the SP3 async lift (DR-015
+/// §Decision 2, option A). This is the async sibling of [`aggregate`]: natives
+/// run sync/in-process (CPU + CAS by design), exec entries run as an `await`ed
+/// subprocess through the existing [`ExecVerifier`] (§8 stdin→stdout,
+/// network-off + scrubbed env, nonzero/malformed/timeout → `inconclusive`), and
+/// the scan interleaves both kinds in CONFIGURED ORDER so first-`Fail`→Deny
+/// short-circuits ACROSS kinds (a native Fail can stop a later exec and an exec
+/// Fail a later native). No `block_on` — the exec subprocess stays visible to
+/// the scheduler and the hot-path timeout (DR-015 rejects (B)).
+///
+/// The aggregation semantics are IDENTICAL to [`aggregate`] (the ratified
+/// honesty mapping is not re-derived): first `Fail` short-circuits → Deny; an
+/// `Inconclusive` does not short-circuit but is remembered as the escalate
+/// fallback; a complete scan with any `Inconclusive` → Escalate; all `Pass` →
+/// Grant; an EMPTY set → Escalate (undecidable is never a synthesized allow,
+/// I6). An unknown native name and a non-running exec both surface as
+/// `Inconclusive` (honest can't-run), NEVER a pass (I6).
+pub async fn aggregate_async(
+    set: &[PermitVerifierSpec],
+    input: &VerifierInput,
+    cas: &Cas,
+) -> Result<PermitOutcome, GateError> {
+    // Empty configured set: undecidable → Escalate, never a synthesized allow (I6).
+    if set.is_empty() {
+        return Ok(PermitOutcome {
+            verdict: Verdict::Inconclusive,
+            decision: decision_for(Verdict::Inconclusive),
+            deciding_verifier: String::new(),
+            deciding_params: Value::Null,
+            evidence: Vec::new(),
+            deciding_evidence_ref: None,
+            verifiers_run: 0,
+        });
+    }
+
+    // The first inconclusive is the escalate-fallback deciding verifier; it is
+    // only promoted to the outcome if the scan completes without a Fail.
+    let mut first_inconclusive: Option<(String, Value, Vec<Evidence>)> = None;
+    let mut verifiers_run = 0usize;
+
+    for spec in set {
+        verifiers_run += 1;
+        let merged = merge_params(&input.params, &spec.params);
+        let per_input = VerifierInput {
+            gate: input.gate.clone(),
+            workspace: input.workspace.clone(),
+            refs: input.refs.clone(),
+            params: merged.clone(),
+            timeout_ms: input.timeout_ms,
+        };
+
+        // Resolve the verdict per kind: a native runs sync/in-process; an exec
+        // entry is `await`ed through the existing ExecVerifier (§8 contract). An
+        // unknown native name and a non-running exec both yield an honest
+        // Inconclusive verdict, never a pass (I6).
+        //
+        // The native pack (`Vec<Box<dyn NativeVerifier>>`) is NOT `Send` and must
+        // never be held across the exec `.await` (this future is `spawn`ed on the
+        // multi-thread runtime). `native_verdict` builds and drops the pack
+        // entirely inside a sync scope, returning an owned verdict; the exec
+        // branch never touches it.
+        let (verdict, evidence) = match spec.kind() {
+            PermitVerifierKind::Native => native_verdict(&spec.name, &per_input, cas)?,
+            PermitVerifierKind::Exec { argv } => {
+                let verifier = ExecVerifier {
+                    name: spec.name.clone(),
+                    argv: argv.clone(),
+                };
+                // Infallible by design: nonzero-exit / malformed / timeout /
+                // could-not-run all return an `Inconclusive` VerdictRecord —
+                // never a synthesized allow (I6, DR-015 §Decision 3).
+                let record = verifier.run(&per_input).await;
+                (record.verdict, record.evidence)
+            }
+        };
+
+        match verdict {
+            Verdict::Fail => {
+                // First Fail short-circuits → Deny carrying THIS verifier's
+                // evidence/params (Fail > any earlier Inconclusive, across
+                // native+exec kinds, I6).
+                let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
+                return Ok(PermitOutcome {
+                    verdict: Verdict::Fail,
+                    decision: decision_for(Verdict::Fail),
+                    deciding_verifier: spec.name.clone(),
+                    deciding_params: merged,
+                    evidence,
+                    deciding_evidence_ref,
+                    verifiers_run,
+                });
+            }
+            Verdict::Inconclusive => {
+                // Does NOT short-circuit; remember the first inconclusive as the
+                // fallback deciding verifier and keep scanning for a later Fail.
+                if first_inconclusive.is_none() {
+                    first_inconclusive = Some((spec.name.clone(), merged, evidence));
+                }
+            }
+            Verdict::Pass => {}
+        }
+    }
+
+    // No Fail. If any Inconclusive was seen → Escalate carrying the FIRST one's
+    // evidence; else all passed → Grant.
+    match first_inconclusive {
+        Some((name, params, evidence)) => {
+            let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
+            Ok(PermitOutcome {
+                verdict: Verdict::Inconclusive,
+                decision: decision_for(Verdict::Inconclusive),
+                deciding_verifier: name,
+                deciding_params: params,
+                evidence,
+                deciding_evidence_ref,
+                verifiers_run,
+            })
+        }
+        None => {
+            // All passed. The deciding verifier is the last one that ran; no
+            // evidence on a grant.
             let last = set.last().expect("non-empty set has a last entry");
             let merged = merge_params(&input.params, &last.params);
             Ok(PermitOutcome {

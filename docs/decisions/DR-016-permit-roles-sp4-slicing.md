@@ -1,0 +1,37 @@
+[← Decision records index](../rezidnt-architecture.md#20-decision-records) · [Architecture plan](../rezidnt-architecture.md)
+
+# Decision Record DR-016 — SP4 slicing + SP4a roles scope
+
+**Date:** 2026-07-19 · **Status:** ACCEPTED (owner) · **Amends:** §16 (roadmap — splits the DR-009 "SP4" commitment into three sub-slices SP4a/SP4b/SP4c and pins SP4a acceptance) / §8–§9 (SP4a adds `role` as a permit input axis on the DR-011 config-pinned per-run params; no wire change); no invariant text is rewritten. **Cites:** design sketch [`docs/design/permit-roles-delegation-sp4.md`](../design/permit-roles-delegation-sp4.md) (three decisions owner-ratified 2026-07-19: §9.1 slicing, §9.2 macaroon-crate-first, §9.5 skip `/intel`); [DR-005](DR-005-badge-consolidation.md) (badge bundle — promotes its PROVISIONAL macaroon item into SP4b); [DR-009](DR-009-match-omnigent-scope.md) (C8 layered-precedence scope, here folded into SP4c). **Builds on:** [DR-011](DR-011-permit-pdp-config-seam.md) (config-pinned per-run params the role rides on), SP1–SP3 native + exec permit verifiers ([DR-013](DR-013-permit-pep-sp2-integration.md)/[DR-014](DR-014-permit-pep-hook.md)/[DR-015](DR-015-permit-exec-verifier.md)); design basis [`docs/design/permit-engine.md`](../design/permit-engine.md) §7 (RBAC & delegation), §10.3 (dilution honesty).
+
+## Context
+
+DR-009 folded C8 into a single "SP4 (roles)" roadmap line. The sketch shows SP4 is in fact **three coupled capabilities** — roles (RBAC seam, permit-engine §7), macaroon-attenuated delegation (promotes DR-005's PROVISIONAL macaroon item and closes the plan §19 open decision "macaroon-attenuated badges — needs a real delegation use case"; sub-agent spawning is that use case), and C8 layered precedence (DR-009). Doing all three inline is the §18 scope-gravity trap. This record ratifies a **split**, not the crypto: it fixes the three-slice program and the concrete SP4a (roles) scope only; SP4b/SP4c are committed to the roadmap but designed in their own later slices/DRs.
+
+**Strongest counterargument (dissent — permit-engine §10.3, restated verbatim):** *"Strategic dilution (the strongest counterargument). rezidnt's defensible wedge (§18) is evidence-gates — 'none of which their model rewards.' Entering the permissions arena fights Omnigent head-on where they have a head start, and risks blurring the one thing nobody else does. Counter: the permit+verify unification on a single replayable log is itself novel, and the marginal build cost is bounded because the seam (vet + badges + verifier kinds) already exists."* SP4 is three capabilities layered onto that arena at once. **The slicing IS the mitigation:** SP4a (roles) is bounded, crypto-free, and rides the SP1–SP3 dispatch; SP4b (crypto) is fenced behind its own follow-on DR that must clear the approved-dep set before any build; SP4c is policy logic on the existing resolution seam. Each is oracle-first and independently shippable, so no piece can silently consume the roadmap. **The owner accepts this split knowingly; sign-off on the SP4a scope is pending.**
+
+## Decision (ratify the split + SP4a scope — not the crypto)
+
+1. **Slicing (sketch §8/§9.1) — three oracle-first, independently shippable sub-slices: SP4a roles → SP4b macaroon delegation → SP4c C8 layered precedence.** This is the load-bearing decision: DR-016 ratifies the SPLIT and the SP4a scope; it does **not** design the delegation crypto. SP4a is the immediate slice; SP4b/SP4c are committed to §16 but detailed in their own later slices.
+
+2. **SP4a (roles) concrete scope (sketch §4):**
+   - `role: Option<String>` on `AgentSpec` — additive, mirroring the `bare`/`harness_version` precedent.
+   - The role is recorded on `agent.spawned` as an additive field (log-derivable, I3). **This requires a warden `/subject`** (additive field, gated, mirroring the `pep`/`bare` precedent) — named here as required SP4a work; DR-016 does **not** design the role taxonomy.
+   - The role is injected into `decide_permit`'s content-pinned per-run params (DR-011 §2) as a **new input axis** that both native and exec permit verifiers read to key decisions. No new verifier machinery, no crypto — a new input field on the existing dispatch.
+   - **Acceptance:** a role-keyed policy decides a permit differently by role.
+
+3. **SP4b direction (NOT ratified concretely here — sketch §2/§3/§9.2):** agent badges become macaroons (the operator badge stays the DR-005 opaque daemon-lifetime class); a permissive Rust macaroon crate is evaluated against the approved-dep set (rust-conventions) **FIRST**, hand-rolling only as fallback if none clears the license/dep/audit bar. The concrete crate-vs-hand-roll choice, the badge migration, and the `permit.delegated`-vs-`agent.spawned`-field question all land in **SP4b's own follow-on DR** — decidable only after evaluation, since it touches the approved-dep set + I7 and likely its own `/subject`. **Security invariant recorded now to govern SP4b:** attenuation only ever NARROWS (monotonicity — a widening bug is privilege escalation); to be property-tested (`verify(M+c) ⊆ verify(M)`).
+
+4. **SP4c direction (sketch §5, DR-009 C8):** admin/dev/session layered precedence, stricter-wins, merged in the `permit_config_for` resolution seam (DR-011). Policy logic, no crypto; detailed in its own slice.
+
+5. **`/intel` skipped (sketch §9.5, owner-ratified).** Memo 001 already sized C8 at DR-009's scope; the macaroon design is DR-005-driven, not a competitor gap. Revisit per-question if SP4b needs it (its own DR then, DR-002).
+
+## Consequences
+
+- **§16 roadmap delta:** the DR-009 "SP4" line splits into **SP4a** (roles — acceptance: a role-keyed policy decides a permit differently by role), **SP4b** (macaroon delegation — gated on its own dep-clearing DR), and **SP4c** (C8 layered precedence — DR-009 C8, policy logic). permit-engine §7 (RBAC & delegation) begins to realize with SP4a.
+- **Invariants touched vs untouched (SP4a):** no invariant text is rewritten. **I3** — the role rides `agent.spawned`, log-derivable, replayable. **I6** — a role-keyed decision is deterministic and interrogable via `gate_explain`. **I7 untouched by SP4a** — no new dependency, no crypto. **I4/I2** unchanged — role is an input field on the existing config-pinned params, small (inline, not CAS). **Flagged forward: SP4b carries the I7 / approved-dep weight and the monotonicity security property** — deferred to its own DR, not decided here.
+- **Warden `/subject` required for SP4a** (role on `agent.spawned`). SP4b and SP4c carry their own gating (SP4b: its own DR + likely `/subject`; SP4c: its own slice).
+- **Risk-register (§18) delta:** *Scope-gravity / strategic dilution (permit-engine §10.3, restated above verbatim).* SP4 is three capabilities; the mitigation is the slicing itself — each sub-slice oracle-first and independently shippable, with the crypto (SP4b) fenced behind a dep-clearing DR so it cannot enter build silently.
+- **No test or acceptance criterion is weakened by this record.** In plain words: SP4a *adds* a new permit input axis (role) — a policy that previously could not distinguish agents by role now can; nothing existing is relaxed. The macaroon monotonicity property (SP4b) is recorded as a tightening to be property-tested, not softened. This record is scope + slicing; new criteria arrive with each sub-slice via the oracle.
+
+*Amendments to this record require DR-017.*

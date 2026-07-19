@@ -1,12 +1,11 @@
-# Handoff — 2026-07-19 (session 8/9: SP1→SP2→SP3 all COMPLETE — permit engine feature-complete)
+# Handoff — 2026-07-19 (session 8/9: SP1–SP3 COMPLETE; SP4 sliced, SP4a roles in build)
 
 ## State of play
-The permit engine is now **feature-complete across its core arc**: SP1 *decides* → SP2 *enforces
-mid-run* → **SP3 *any policy DSL decides*** (all done this session, every `/vet` + `/debrief`
-**pass**). SP3 shipped: design sketch (`830276a`) → DR-015 ACCEPTED (`f77cc07`) → oracle → implementer
-→ vet pass → debrief **pass** (first try) → resolver-coverage gap closed → **committed `f07b86b`**.
-Pointer = **SP3 (done)**. **`main` ahead 1 of origin** (`f07b86b`) — auto-push classifier-gated,
-**ask before pushing.**
+Permit core (SP1 *decides* → SP2 *enforces mid-run* → SP3 *any DSL decides*) is **feature-complete**
+(all done this session, every `/vet` + `/debrief` **pass**, pushed ≤`2d3d239`). **SP4 is now sliced
+and ratified:** design sketch (`5a042dd`) → **DR-016 ACCEPTED** (owner) splits SP4 into SP4a roles →
+SP4b macaroon delegation → SP4c C8 precedence. **SP4a (roles) is in build** (owner said "ratify it,
+then start SP4a"): warden `/subject` → `/oracle` → implementer. Pointer = **SP4** (SP4a immediate).
 
 ## What SP3 shipped (committed `f07b86b`, green host+WSL)
 An external policy (OPA/Rego, Cedar, or ANY argv speaking the §8 JSON contract) decides a permit as
@@ -26,27 +25,30 @@ bundled engine (I7).
 SP2 (all pushed ≤`e6ed589`): DR-013/socket-PDP/hook-note/DR-014/pep-subject/hook-sub-slice.
 SP3: `830276a` sketch · `f77cc07` DR-015 (both pushed) · **`f07b86b` SP3 slice — NOT pushed (ahead 1).**
 
-## Next action — permit core done; choose direction (owner priority)
-The permit "may" axis (SP1–SP3) is feature-complete. Remaining permit-stream + roadmap options:
-- **SP4 — roles + macaroon-attenuated delegation** (promotes DR-005 PROVISIONAL; folds in C8
-  layered admin/dev/session precedence). Not spec'd — fresh design→/dr→oracle arc.
-- **Exec debrief-replay wiring** — the one SP3 `#[ignore]` deferral: `rezidnt_gate::replay` reports
-  exec verifiers as `replayed: None` (v1); threading `policy_ref` back to re-execute recorded §8
-  stdin + raise a DR-006 integrity alarm on divergence. A focused follow-on (its own oracle pass).
-- **Decision fast-path cache** (permit-engine §10.2) — the latency answer for exec-on-hot-path,
-  deferred by DR-015; a likely slice once measured.
-- **Concrete OPA/Cedar adapter** — demand-gated follow-on to SP3, its own DR (+ maybe `/intel`).
-- **C3 — sole-chokepoint enforcement** (OS sandbox + egress + credential brokering). DR-009 fenced;
-  own design sketch + implementation DR before build.
-- **Carried debt / cleanup** instead of a new slice (see below).
-Each new slice is oracle-first after its spec + DR. Advance the pointer once the next slice is chosen.
+## Next action — build SP4a (roles), DR-016 §Decision 2 is the spec
+Sequence (owner-directed, autonomous through the loop):
+  1. Warden **`/subject`** — `role` on `agent.spawned` (additive field, mirroring `pep`/`bare`;
+     no new subject; drift-guard stays green since subject list is unchanged).
+  2. **`/oracle`** — failing tests: `role: Option<String>` on `AgentSpec` parses; recorded on
+     `agent.spawned`; folded to `AgentRunState`; injected into `decide_permit` per-run params; a
+     role-keyed policy (native or exec reference) decides a permit DIFFERENTLY by role (the headline).
+  3. **Implementer:** add `role` to `AgentSpec` + emit on `agent.spawned` + fold + inject into
+     `decide_permit`'s content-pinned params (DR-011 §2 discipline) as a new input axis.
+  4. **`/vet`** → **`/debrief`** → commit.
+Then SP4b/SP4c are separate later slices (SP4b needs its OWN DR — macaroon crate/dep choice +
+badge migration + monotonicity property; SP4c = C8 layered precedence). **Reminder: `/vet` is
+host-side** ([[vet-is-host-side-wsl-insufficient]]).
 
 ## Open /debrief residuals & carried notes (non-blocking)
 - SP1–SP3 all auditor **pass**; SP3 residual coverage gap (resolver un-filter) was CLOSED before commit.
 - Exec debrief-replay is the one honest SP3 deferral (see Next action) — `#[ignore]` panics, not faked.
 
 ## Decisions still needing a /dr (permit stream + beyond)
-- **SP4 / C3 / concrete OPA-Cedar adapter / exec-replay** — each its own spec + DR before build.
+- **SP4b (macaroon delegation)** — its OWN DR: permissive macaroon crate vs hand-roll (approved-dep
+  set + I7), badge→macaroon migration, `permit.delegated`-vs-`agent.spawned`-field (`/subject`),
+  monotonicity property. DR-016 §Decision 3 records the direction; the concrete choice is SP4b's DR.
+- **SP4c (C8 layered precedence)** — its own slice (admin/dev/session, stricter-wins).
+- **C3 / concrete OPA-Cedar adapter / exec-replay wiring** — each its own spec + DR before build.
 - Any memo-001-motivated change needs its own DR (DR-002 rule 3).
 - Pre-permit carried debt: DR-007 GitError→associated-type; `badge.issued` emitter / `badge_id` on
   other mutations; release items (root README, crates.io `cargo login`); Phase 3 demand-gated.
@@ -60,7 +62,7 @@ daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never c
 error 740, [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask first.
 
 ---
-**NEXT ACTION → SP3 COMPLETE (committed `f07b86b`, auditor pass). Permit core (SP1–SP3)
-feature-complete. Choose the next direction with the owner — SP4 (roles+delegation), exec
-debrief-replay wiring, the decision cache, a concrete OPA/Cedar adapter, C3 (fenced), or carried
-cleanup — then run its design→/dr→/oracle arc. ALSO PENDING: owner ok to push (`main` ahead 1).**
+**NEXT ACTION → Build SP4a (roles), DR-016 §Decision 2. Warden `/subject` (role on `agent.spawned`)
+→ `/oracle` (role parses + folds + injects; a role-keyed policy decides differently by role) →
+implementer (`role` on `AgentSpec` + emit + fold + inject into `decide_permit` params) → `/vet` →
+`/debrief`. SP4b (macaroon, own DR) + SP4c (C8) are later slices.**

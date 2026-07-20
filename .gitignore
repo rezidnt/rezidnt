@@ -1,4 +1,5 @@
 /target
+/target-wsl
 **/*.rs.bk
 *.stackdump
 # Guard: agents running host cargo with the WSL CARGO_TARGET_DIR=$HOME/.cache

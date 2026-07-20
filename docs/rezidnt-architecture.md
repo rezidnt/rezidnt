@@ -312,6 +312,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Amended by [DR-009](decisions/DR-009-match-omnigent-scope.md).** Folds four memo-001 capabilities into the permit phase — spend/rate limits (C1→SP1), intent-lock (C7→new SP-intent), layered admin/dev/session precedence (C8→SP4) — and adds a distinct later sole-chokepoint enforcement phase (C3), fenced behind its own design + DR.
 >
 > **Amended by [DR-022](decisions/DR-022-benchmark-harness-slice.md).** Gives the Phase-2 exit ("the benchmark harness runs end-to-end against rezidnt itself") its first defined acceptance criteria + exit demo — a headless in-repo dogfood harness over the completed S4 golden path.
+>
+> **Amended by [DR-025](decisions/DR-025-c3a-linux-sandbox.md).** Slices the DR-009 sole-chokepoint (C3) phase: **C3a** — a Linux `bwrap`-backed `SandboxSubstrate` (I4) wrapping the S1 spawn seam, confinement from folded policy, loud `sandbox.unavailable` degrade when absent — ships first with its own acceptance criteria + exit demo. C3b (egress proxy), C3c (credential brokering), and the macOS/Windows backends stay fenced, each behind its own DR; the Windows tier is coupled to the deferred native-Windows Platform phase.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -382,8 +384,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-022](decisions/DR-022-benchmark-harness-slice.md) | Benchmark-harness slice: in-repo three-metric dogfood, precision/recall fenced external | ACCEPTED | §15, §16, §17 |
 | [DR-023](decisions/DR-023-shared-daemon-driving-client.md) | Extract shared `rezidnt-client` socket driver (unblocks DaemonDriver); fixtures stay dev-only test-support | ACCEPTED | §4 |
 | [DR-024](decisions/DR-024-running-risk-cap-c6.md) | Running-risk cap (C6): deterministic rule-table scorer, pre-action, granted-only fold, contract-free shared-scorer seam | ACCEPTED | §8, §9 |
+| [DR-025](decisions/DR-025-c3a-linux-sandbox.md) | C3a Linux OS-sandbox: bwrap-backed `SandboxSubstrate` (I4), folded-policy binds, loud degrade when absent, `PathConfinement` verdict stays a permit-verifier | ACCEPTED | §16, §18 |
 
-*The next record is DR-025.*
+*The next record is DR-026.*
 
 ---
 

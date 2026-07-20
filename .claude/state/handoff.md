@@ -1,86 +1,81 @@
-# Handoff — 2026-07-20 (session 12: C1 live spend-cap + benchmark harness → Phase 2 EXITED)
+# Handoff — 2026-07-20 (session 12: C1 spend-cap + benchmark harness + C6 risk-cap; Phase 2 EXITED)
 
 ## State of play
-This session shipped **three full slice loops** and **exited Phase 2**. Pointer was `cost_ms` at open
-(done); it advanced through `benchmark` and that slice is now **DONE** — DR-022's exit demo is closed, so
-**Phase 2 (harness + gates) is exited**: the golden path completes end-to-end and the benchmark harness
-drives rezidnt against itself. Tree clean, synced to `origin/main` at **`303b46d`**. `current-slice` reads
-`benchmark` (done) — the **next direction is an open fork** (see Next action); remaining roadmap work is
-DR-gated feature side-quests or demand-gated Phase 3.
+A long, productive session: **four full slice loops + three DRs**, all pushed to `origin/main` at
+**`ff10535`**. **Phase 2 (harness + gates) is EXITED** and the **C1/C6 contextual-permit-verifier pair is
+COMPLETE** (spend-cap + risk-cap, both live, both I3-honest). Tree clean, synced. `current-slice` reads
+`benchmark` (done) — the next direction is an open fork (see Next action). High autonomy is ON
+([[autonomy-high-trust]]).
 
-## What shipped this session (all pushed to main)
-- **`17721bb` — C1 live spend-cap (DR-021 build).** `action.metered` v1 subject (warden); spend fold-source
-  moved off `permit.*` onto `action.metered` in the reducer; PDP injects `window_action_count = granted`;
-  SpendCap live. 5 DR-021 criteria oracle'd, incl. the B2 denied-action-folds-zero honesty property.
-  `spend_delta_usd?` retired from all three permit facts. /vet + /debrief PASS.
-- **`23b15a4` — DR-022 (ACCEPTED)** benchmark-harness slice: in-repo three-metric dogfood
-  (task-completion, merge success, cost-per-verified-diff — all log-derived, replay-stable); gate
-  precision/recall fenced behind the permanently-external private held-out set (§17), exposed as a seam
-  that returns `inconclusive` unfed.
-- **`d69e574` — benchmark Parts 1&2:** `bench/harness` crate — pure log-replay `collate` + `run_cases`
-  orchestration w/ catch_unwind panic isolation. Host-green. Part 3 (real driving) flagged as an
-  architecture boundary (rezidentd bin-only, driving code test/bin-private).
-- **`6b74602` — DR-023 (ACCEPTED)** ratify the shared-client extraction ((A)+(C): mint `rezidnt-client`
-  socket lib consumed by CLI + DaemonDriver; fixtures stay dev-only `rezidnt-testkit`; reject a rezidentd
-  `[lib]` on I4/I7).
-- **`303b46d` — DR-023 extraction:** `crates/rezidnt-client` (socket lib, no new external dep, CLI pure-moved
-  onto it — golden_path.rs 10/10 unchanged) + `crates/rezidnt-testkit` (dev-only fixture builders;
-  common/mod.rs now a re-export shim, 15 daemon tests unedited); `DaemonDriver::drive` fills as real
-  production driving (open existing spec → CLI → tail pre_merge gate.passed→diff.merged → real ULID; missing
-  spec = scored MISS, I6). **This CLOSED DR-022's exit demo.** /vet pass; /debrief PASS *after* the auditor
-  caught a criterion-4 spirit violation (drive was staging a fixture INLINE in production) and it was
-  reworked (real_driver.rs stages via testkit + real path; stage_gated_fixture stripped from prod).
+## What shipped this session (all pushed)
+- **`17721bb` — C1 live spend-cap (DR-021 build).** `action.metered` subject; spend fold moved off permit
+  onto `action.metered`; PDP injects `window_action_count`; SpendCap live. B2 denied-folds-zero honesty.
+- **`23b15a4` — DR-022** benchmark-harness slice (three log-derived metrics; precision/recall fenced
+  external). **`d69e574`** benchmark Parts 1&2 (`bench/harness`: collate + orchestration, host-green).
+- **`6b74602` — DR-023** shared-client extraction ((A)+(C)). **`303b46d`** the extraction: `rezidnt-client`
+  (socket lib, CLI pure-moved onto it) + dev-only `rezidnt-testkit` (fixture builders; common/mod.rs a
+  re-export shim); `DaemonDriver` drives the real golden path. **This CLOSED DR-022's exit demo → Phase 2
+  EXITED.** (One rework mid-flight: auditor caught fixture-staging in production `drive`, stripped it.)
+- **`d1d6cac` — DR-024** running-risk cap (C6). **`ff10535`** the C6 build: `risk_score()` shared pure
+  scorer + `RiskCap` native (mirrors SpendCap) + PDP `cumulative_risk_score` injection + emit-site
+  `risk_delta` stamp (contract-free Q5 seam, same fn → verdict==delta) + granted-only reducer narrowing.
+  Warden retired `risk_delta?` from permit.denied/.escalated (rides permit.granted only). /vet + /debrief
+  PASS.
 
-## The maker/checker discipline earned its keep this session
-- The orchestrator caught a FALSE ORACLE before impl (bench orchestration test would've let run_cases echo
-  `expect_merge` and drive nothing) → oracle dependency-injected a `Driver` trait.
-- The auditor caught the inline-fixture-staging (criterion-4 spirit) at /debrief and FAILED it → reworked to
-  green. Reusable rule: **fixture CONSTRUCTION (git init, script-writing, chmod, spec synthesis) stays in
-  dev-only test-support; production drivers OPEN an existing spec, never build one.** A dep-graph guard
-  (manifest scan) can't catch std-only inline staging — the auditor's spirit-check is the real gate.
+## The maker/checker discipline earned its keep REPEATEDLY this session (all caught pre-merge)
+1. **False oracle** — bench orchestration test would've let `run_cases` echo `expect_merge` and drive
+   nothing → oracle DI'd a `Driver` trait.
+2. **Fixture-staging in production** — `DaemonDriver::drive` git-init'd repos + wrote scripts inline
+   (criterion-4 spirit violation) → auditor FAILED it → stripped to open-existing-spec + honest MISS.
+3. **DR producer-seam gap** — DR-024 draft didn't resolve how `risk_delta` flows verifier→fact → sent the
+   scribe back; resolved with the shared-scorer seam (Q5, option iii, contract-free).
+4. **Privilege-escalation smell** — C6 impl added a self-declarable `PermitRequest.role` feeding the risk
+   scorer (a run could claim `admin` to duck the cap) → VETOED; role is folded-authority-only (DR-016);
+   oracle reworked to seed folded role + a `never_self_declared` discriminator.
+Reusable rules distilled: **fixture CONSTRUCTION stays in dev-only test-support, never production drivers**;
+**a permit input that lowers a cap must come from folded authority, never a self-declared request arg**;
+**a DR that puts a delta on a fact must resolve the producer seam (mirror DR-021 §C)**.
 
-## OWNER GRANTED HIGH AUTONOMY this session — [[autonomy-high-trust]]
-Owner (2026-07-20): "the system has built trust… run more without my approval… only needed for really
-important PRs." Now proceed WITHOUT asking: the full loop (/subject,/oracle,impl,/vet,/debrief,advance
-slice), **commit AND push** green+debrief-PASS increments, **draft+self-ratify+build** routine
-decomposition/engineering DRs (DR-022/DR-023 were self-ratified under this). Auditor /debrief stays on every
-diff. **Still surface:** irreversible/destructive git (force-push, history rewrite, releases/tags), a DR
-amending BINDING invariant (I1–I8) TEXT or licensing/clean-room posture, reading firewalled sources,
-publishing beyond a main push, or a genuine one-way-door.
+## Autonomy — [[autonomy-high-trust]] (owner granted 2026-07-20)
+Proceed WITHOUT asking: full loop, commit+push green+debrief-PASS increments, draft+self-ratify+build
+routine engineering DRs (DR-022/023/024 self-ratified). Auditor /debrief stays on every diff. **Still
+surface:** irreversible/destructive git, a DR amending BINDING invariant TEXT or licensing/clean-room,
+firewalled sources, publishing beyond a main push, one-way doors. Direction forks at milestones are worth a
+light checkpoint (asked at Phase-2 exit → owner picked C6).
 
-## Next action — DIRECTION FORK (surfaced to owner; Phase 2 is exited, no mandated next slice)
-The permit-engine arc (SP0–SP5, incl. C1/C7/C8) AND the Phase-2 exit benchmark are COMPLETE. Remaining
-roadmap work is DR-gated or demand-gated — pick a direction:
-- **C6 risk verifier** — the natural continuation; reuses the DR-021 post-action metering seam. Needs its
-  own DR (deterministic risk-scoring fn, I6 no live inference). Handoff-listed since session 11.
-- **C3 sole-chokepoint** (sandbox/egress/credential) — fenced behind its own DR (DR-009).
-- **Deferred /dr items:** holder-offline attenuation (DR-018 §b) · decision fast-path cache · OPA/Cedar
-  adapter · the `bench.completed`-subject-vs-out-of-band question DR-022 deferred to a warden /subject.
-- **Phase 3** (interactive terminal fidelity) — demand-gated, NOT scheduled (pull only when attach-fidelity
-  friction is measured).
-Owner was asked to pick at session close; whatever they choose, the pattern is DR-first (draft→ratify) then
-oracle→impl→/vet→/debrief.
+## Next action — DIRECTION FORK (C6 done; the C1/C6 pair is complete)
+Remaining permit-family + roadmap work, all DR-gated or demand-gated — pick a direction:
+- **C3 sole-chokepoint** (sandbox/egress/credential) — the biggest remaining permit-family arc; fenced
+  behind its own DR (DR-009). A distinct enforcement phase, less continuous than C1/C6 were.
+- **Smaller deferred /dr items** (lighter, self-contained): the `bench.completed` subject (warden /subject,
+  deferred by DR-022) · holder-offline attenuation (DR-018 §b) · decision fast-path cache · OPA/Cedar
+  policy adapter.
+- **Phase 3** (interactive terminal fidelity) — demand-gated, NOT scheduled.
+Pattern for any of these: DR-first (draft→self-ratify) then oracle→impl→/vet→/debrief.
 
 ## Open /debrief residuals — NONE
-Both benchmark slices closed clean (after the one rework). C1 clean.
+All four slice loops closed clean (C1, benchmark P1&2, DR-023 extraction, C6) — each after at most one
+in-loop rework. No carried residue.
 
 ## Environment (unchanged)
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`.
-**Quote the PATH export** (`export PATH="$HOME/.cargo/bin:$PATH"`) — interop PATH parens break it unquoted.
-Vet host-side (`bash .claude/hooks/vet.sh`); **host + WSL SEQUENTIAL** ([[vet-concurrency-flake]]).
-**`/vet` is host-side; WSL-green NOT sufficient** ([[vet-is-host-side-wsl-insufficient]]) — `#[cfg(unix)]`
-suites (daemon golden_path.rs, bench real_driver.rs) run on WSL only; host compiles them to 0 tests.
-`bench/harness` collate/orchestration/manifest-guard tests ARE host-runnable. ULIDs 26-char Crockford.
-Auto-push to main now allowed under [[autonomy-high-trust]] (no per-push ask).
+**Quote the PATH export** (parens break it unquoted). Vet host-side (`bash .claude/hooks/vet.sh`); **host +
+WSL SEQUENTIAL** ([[vet-concurrency-flake]]). **`/vet` host-side; WSL-green NOT sufficient**
+([[vet-is-host-side-wsl-insufficient]]) — `#[cfg(unix)]` suites (daemon golden_path.rs, bench
+real_driver.rs, permit_role_live.rs) run on WSL only; host compiles them to 0 tests. C1/C6 native +
+state-fold + live-PDP suites ARE host-runnable. **clippy::doc_lazy_continuation** bites `//!`/test-doc
+headers ([[clippy-doc-lazy-continuation-trap]]) — bit the C6 oracle files (fixed). ULIDs 26-char Crockford.
+New crates this session: `crates/rezidnt-client` (prod socket lib), `crates/rezidnt-testkit` (dev-only
+fixtures), `bench/harness` (public benchmark harness).
 
 ## Decisions still needing a /dr
-- **C6 risk** · **C3 sole-chokepoint** · holder-offline attenuation (DR-018 §b) · decision fast-path cache ·
-  OPA/Cedar adapter · `bench.completed` subject (warden /subject). Carried debt: DR-007 GitError→associated
-  type; `badge.issued` emitter; release items.
+- **C3 sole-chokepoint** · holder-offline attenuation (DR-018 §b) · decision fast-path cache · OPA/Cedar
+  adapter · `bench.completed` subject (warden /subject). Carried debt: DR-007 GitError→associated type;
+  `badge.issued` emitter; release items.
 
 ---
-**NEXT ACTION → Phase 2 EXITED (`303b46d`). C1 spend-cap + benchmark harness both shipped; the harness drives
-rezidnt end-to-end. `current-slice`=benchmark (done). Remaining work is a DIRECTION FORK — C6 risk (natural
-next, reuses DR-021 seam, needs a DR) vs C3 vs deferred /dr items vs demand-gated Phase 3. High autonomy is
-ON ([[autonomy-high-trust]]): proceed DR-first→oracle→impl→/vet→/debrief without asking; surface only
-irreversible/constitution-level/outward-facing calls.**
+**NEXT ACTION → C6 shipped (`ff10535`); the C1/C6 spend+risk permit-verifier pair is COMPLETE and Phase 2 is
+EXITED. `current-slice`=benchmark (done). Next is a DIRECTION FORK — C3 sole-chokepoint (big, own DR) vs
+smaller deferred /dr items (bench.completed subject / holder-offline / fast-path cache / OPA-Cedar) vs
+demand-gated Phase 3. High autonomy ON ([[autonomy-high-trust]]): proceed DR-first→oracle→impl→/vet→/debrief
+without asking; surface only irreversible/constitution-level/outward-facing calls.**

@@ -762,6 +762,16 @@ pub async fn launch_agent(
     if pep_enforced && let Some(obj) = spawned_payload.as_object_mut() {
         obj.insert("pep".to_string(), json!("enforced"));
     }
+    // SP4a permit input axis (DR-016 §Decision 2 / ontology `agent.spawned.role?`):
+    // record the RBAC role VERBATIM iff the spec declared one, so a role-keyed
+    // permit policy can decide on it (role rides the run's derived state). ABSENT
+    // when no role was declared — never synthesized to a default like
+    // "contributor" (DR-012 declared-vs-absent; mirrors the `pep`/`harness_version`
+    // absent-is-honest gate). A declared empty string is emitted as `role: ""`,
+    // distinct from absent.
+    if let (Some(role), Some(obj)) = (&agent.role, spawned_payload.as_object_mut()) {
+        obj.insert("role".to_string(), json!(role));
+    }
 
     // Register BEFORE the fact hits the fabric: a client that sees
     // agent.spawned must be able to attach without racing the registry.

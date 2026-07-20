@@ -700,6 +700,17 @@ impl McpCore {
             if let Some(intent) = &folded.intent {
                 obj.insert("allowed_tools".to_string(), json!(intent.allowed_tools));
             }
+            // DR-016 §Decision 2 (SP4a): inject the folded RBAC role as a permit
+            // input axis — PRESENT iff a role was declared (`Some`, even
+            // `Some("")`), OMITTED when genuinely ABSENT (`None`). Mirrors the
+            // DR-012 declared-vs-absent discipline the `allowed_tools` injection
+            // follows: a role-less run carries no `role` key, so a role-keyed
+            // policy sees no role axis and escalates (inconclusive → ask, I6),
+            // never a synthesized grant. The role is a content-pinned param, never
+            // live state (determinism BINDING).
+            if let Some(role) = &folded.role {
+                obj.insert("role".to_string(), json!(role));
+            }
             obj.insert(
                 "cumulative_spend_usd".to_string(),
                 json!(folded.permit_accumulators.cumulative_spend_usd),

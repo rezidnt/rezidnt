@@ -50,6 +50,16 @@ pub struct AgentSpec {
     /// allowed-tools verifier requires (DR-001: permission composition).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// SP4a permit input axis (DR-016 §Decision 2; ontology `agent.spawned.role?`):
+    /// the RBAC role the agent is authorized as, an opaque string the policy
+    /// interprets (rezidnt mints no role vocabulary). Recorded on `agent.spawned`
+    /// and injected into `decide_permit`'s content-pinned per-run params so a
+    /// role-keyed policy can decide on role + workspace + action. ABSENT = no role
+    /// declared — never synthesized to a default like `"contributor"` (DR-012
+    /// declared-vs-absent; mirrors `harness_version`). A declared empty string is
+    /// `Some("")`, distinct from absent (the policy interprets it, not rezidnt).
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// One `[gates.<name>]` table: the ordered verifier set a gate runs (S4).

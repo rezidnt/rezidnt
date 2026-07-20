@@ -42,6 +42,9 @@ fn agent_spec_toml_pins_the_exact_governed_preimage() {
         bare: true,
         harness_version: Some("2.1.191".to_string()),
         allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+        // SP4a additive field (DR-016): compile-only here — `agent_spec_toml`
+        // does not emit `role`, so the pinned preimage bytes are unchanged.
+        role: None,
     };
 
     let expected = "[agent]\n\
@@ -73,6 +76,7 @@ fn agent_spec_toml_omits_absent_optional_fields() {
         bare: false,
         harness_version: None,
         allowed_tools: vec![],
+        role: None,
     };
 
     let expected = "[agent]\n\
@@ -102,6 +106,7 @@ fn agent_spec_toml_escapes_quotes_and_backslashes() {
         bare: false,
         harness_version: None,
         allowed_tools: vec![],
+        role: None,
     };
 
     let expected = "[agent]\n\

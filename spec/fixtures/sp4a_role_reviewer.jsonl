@@ -1,0 +1,2 @@
+{"id":"01SP4AR0KEREVJEWER0000E100","ts":"2026-07-19T10:00:00Z","v":1,"source":"rezidnt-run","subject":"agent.spawned","correlation":"01SP4AR0KEREVJEWER0000CH00","payload":{"run":"01SP4AR0LEREVIEWER00RN0001","agent":"rev","harness":"claude-code","badge_id":"beadf00dcafe4a01","role":"reviewer"}}
+{"id":"01SP4AR0KEREVJEWER0000E200","ts":"2026-07-19T10:00:01Z","v":1,"source":"rezidnt-run","subject":"agent.status.changed","correlation":"01SP4AR0KEREVJEWER0000CH00","payload":{"run":"01SP4AR0LEREVIEWER00RN0001","from":"spawning","to":"running"}}

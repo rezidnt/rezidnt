@@ -251,6 +251,18 @@ pub struct AgentRunState {
     /// rebuild-stability). Read through [`AgentRunState::pep_enforced`].
     #[serde(default)]
     pub pep: Option<String>,
+    /// DR-016 §Decision 2 (SP4a): this run's RBAC role, folded from
+    /// `agent.spawned.role?` (ontology line 195). `Some(role)` iff the spawn
+    /// carried a role — taken VERBATIM (an opaque string the policy interprets;
+    /// rezidnt mints no role vocabulary). `None` = no role declared: ABSENT,
+    /// never synthesized to a default like `"contributor"` (DR-012 declared-vs-
+    /// absent; the honest "no role"). This is the permit input axis
+    /// `decide_permit` injects into its content-pinned per-run params so a
+    /// role-keyed policy can decide on role + workspace + action. `#[serde(default)]`
+    /// keeps every pre-DR-016 golden fixture parsing and comparing equal
+    /// unedited (I3 rebuild-stability), exactly as `pep` does.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 impl AgentRunState {
@@ -357,6 +369,13 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 // wired"). A pre-DR-014 spawn (no `pep`) folds edge-gated-only.
                 if let Some(pep) = event.payload()["pep"].as_str() {
                     state.pep = Some(pep.to_string());
+                }
+                // DR-016 §Decision 2 (SP4a): fold the RBAC role VERBATIM when
+                // present; ABSENT stays `None` — never synthesized to a default
+                // (DR-012; the honest "no role declared"). A pre-DR-016 spawn (no
+                // `role`) folds role-less, keeping rebuild stable (I3).
+                if let Some(role) = event.payload()["role"].as_str() {
+                    state.role = Some(role.to_string());
                 }
             }
         }

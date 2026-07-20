@@ -297,6 +297,8 @@ verifiers = [
 
 ## 15. Testing, oracles, and the benchmark seam
 
+> **Amended by [DR-022](decisions/DR-022-benchmark-harness-slice.md).** Slices the benchmark into an in-repo `bench/harness` collating three of the four locked metrics (task-completion, merge success, cost-per-verified-diff — all log-derived); gate precision/recall is structurally fenced behind the permanently-external held-out set (§17), exposed only as a seam that returns `inconclusive` when no labeled set is supplied.
+
 Ordered by the oracle principle that sequences the whole project — build where a deterministic judge exists:
 
 **Reducer determinism (Phase 1's oracle):** property tests assert `fold(log) == snapshot` under arbitrary event interleavings and that rebuild equals live state; golden log fixtures live in-repo and every release replays them. **Adapter contracts:** herdr and Omnigent adapters are tested against *recorded* socket/WebSocket transcripts (record/replay harness in `rezidnt-supervise` test utils); a substrate version bump that breaks the recording blocks the adapter, not the daemon. **Verifier conformance:** a suite that feeds exec verifiers malformed input, timeouts, and nondeterminism traps, asserting `inconclusive`-not-`pass` behavior. **Phase 3 oracles:** vttest/esctest conformance plus grid-snapshot comparison against a reference emulator, per the phase plan. **The benchmark (GTM-grade testing):** the harness is public in `bench/harness`; the held-out case set is private, full stop — you know exactly what contamination does to a measuring stick. Metrics locked now so the category argument is ours: orchestrated task completion rate, gate precision/recall against labeled defects, worktree merge success rate, cost per merged verified diff.
@@ -308,6 +310,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Amended by [DR-008](decisions/DR-008-permit-engine-pivot.md).** Adds a permit-engine phase (SP0–SP5) between gates (Phase 2) and terminal fidelity (Phase 3).
 >
 > **Amended by [DR-009](decisions/DR-009-match-omnigent-scope.md).** Folds four memo-001 capabilities into the permit phase — spend/rate limits (C1→SP1), intent-lock (C7→new SP-intent), layered admin/dev/session precedence (C8→SP4) — and adds a distinct later sole-chokepoint enforcement phase (C3), fenced behind its own design + DR.
+>
+> **Amended by [DR-022](decisions/DR-022-benchmark-harness-slice.md).** Gives the Phase-2 exit ("the benchmark harness runs end-to-end against rezidnt itself") its first defined acceptance criteria + exit demo — a headless in-repo dogfood harness over the completed S4 golden path.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -326,6 +330,8 @@ Sequencing law, restated because it is the project's most-violated invariant in 
 ## 17. Repository, licensing, and the commercial seam
 
 > **Amended by [DR-003](decisions/DR-003-retire-ip-memo-gate.md).** The employer-IP-memo gate is retired. Per [DR-001](decisions/DR-001-native-substrates.md), no third-party code is ported, so the NOTICE obligation described below does not arise.
+>
+> **Amended by [DR-022](decisions/DR-022-benchmark-harness-slice.md).** The permanently-excluded benchmark held-out set (below) is recorded as a slice-level boundary: gate precision/recall cannot be computed in-repo, so `bench/harness` carries only the seam and the labeled data lives external forever.
 
 Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apache-2.0` on `crates/*` libs, DCO enforced, NOTICE carrying Omnigent attributions for ported code, TRADEMARKS.md (mark owned by TwofoldTech LLC), SECURITY.md, CONTRIBUTING.md. Excluded from this repo permanently: `rezidnt-enterprise` (RBAC/SSO/audit-export, hosted control plane if ever), domain verifier judgment packs, and the benchmark held-out set. The seam is structural — separate repos, separate crates — so a future dual-license or paid tier requires zero untangling, exercised or not.
 
@@ -373,8 +379,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-019](decisions/DR-019-c8-layered-precedence-sp4c.md) | SP4c: C8 layered policy precedence via monotone concat | ACCEPTED | §8, §9, §16 |
 | [DR-020](decisions/DR-020-sp4c-wire-layered-permit-sourcing.md) | SP4c-wire: three-source layered permit wiring (admin outside the workspace spec) | ACCEPTED | §9, §16 |
 | [DR-021](decisions/DR-021-live-spend-cap-c1.md) | Live spend-cap (C1): spend measured post-action, off the permit fact (B2) | ACCEPTED | §8, §9 |
+| [DR-022](decisions/DR-022-benchmark-harness-slice.md) | Benchmark-harness slice: in-repo three-metric dogfood, precision/recall fenced external | ACCEPTED | §15, §16, §17 |
 
-*The next record is DR-022.*
+*The next record is DR-023.*
 
 ---
 

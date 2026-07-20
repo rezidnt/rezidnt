@@ -2,20 +2,15 @@
 //! accumulator. A decision fact bearing `cost_ms` (and no spend/risk) leaves
 //! `cumulative_spend_usd` and `risk_score` at zero.
 //!
-//! GREEN MODE (honest, and correct — the testing-oracles rule): unlike the
-//! rezidnt-mcp `permit_cost_ms.rs` suite (RED against the not-yet-built PDP
-//! timer), THIS test is GREEN NOW. The reducer at
-//! `crates/rezidnt-state/src/lib.rs:725-729` already reads ONLY
-//! `spend_delta_usd`/`risk_delta` and never touches `cost_ms`, so a
-//! `cost_ms`-only decision fact already folds to zero spend + zero risk. That is
-//! the intent: this test is a REGRESSION LOCK that PINS the reducer STAYS
-//! recorded-only — it turns RED the instant an edit makes `cost_ms` fold into an
-//! accumulator (design §10.2 / SP5 documented `cost_ms` recorded-only). This
-//! mirrors the SP0 `permit_ledger.rs` GREEN-by-design fold locks, and is NOT the
-//! honesty defect the oracle refuses (a would-be test of unbuilt behavior that
-//! passes vacuously) — it exercises a real, existing property whose invariant it
-//! guards. The behavior under construction (the PDP MEASURING and populating
-//! `cost_ms`) is oracle-tested RED in `rezidnt-mcp/tests/permit_cost_ms.rs`.
+//! REGRESSION-LOCK MODE: this test PINS that `cost_ms` folds into NO accumulator
+//! — it turns RED the instant an edit makes `cost_ms` fold into one (design
+//! §10.2 / SP5 documented `cost_ms` recorded-only). Per DR-021 the C1 spend fold
+//! source moved OFF the permit facts onto the post-action `action.metered` fact;
+//! the second test below seeds its measured spend there (the honest source),
+//! `cost_ms` still folds nowhere. This mirrors the SP0 `permit_ledger.rs`
+//! fold locks — it exercises a real property whose invariant it guards. The
+//! behavior under construction (the PDP MEASURING and populating `cost_ms`) is
+//! oracle-tested RED in `rezidnt-mcp/tests/permit_cost_ms.rs`.
 
 use rezidnt_state::{Materializer, fold};
 use rezidnt_types::{Event, SourceId, Subject};
@@ -96,13 +91,20 @@ fn cost_ms_never_perturbs_spend_or_risk_and_is_rebuild_safe() {
                    "policy_ref": {"hash": "co57m50n1y00000000000000000000000000000000000000000000000cost2", "bytes": 8, "mime": "application/octet-stream"},
                    "cost_ms": 7}),
         ),
-        // A spend+risk decision that ALSO carries cost_ms — the spend/risk fold,
-        // the cost_ms does not.
+        // A risk decision that ALSO carries cost_ms — the risk folds, the cost_ms
+        // does not. Spend NO LONGER rides the permit fact (DR-021 fold source
+        // moved); risk_delta STAYS (C6, untouched).
         ev(
             "permit.denied",
             json!({"run": RUN, "request_id": REQ_SPEND,
                    "policy_ref": {"hash": "co57m5w17h5p3nd000000000000000000000000000000000000000000cost3", "bytes": 8, "mime": "application/octet-stream"},
-                   "spend_delta_usd": 2.5, "risk_delta": 4.0, "cost_ms": 99}),
+                   "risk_delta": 4.0, "cost_ms": 99}),
+        ),
+        // The MEASURED spend rides the post-action `action.metered` fact (the C1
+        // fold source after DR-021), also carrying no cost_ms accumulator effect.
+        ev(
+            "action.metered",
+            json!({"run": RUN, "spend_delta_usd": 2.5, "input_tokens": 60u64, "output_tokens": 20u64}),
         ),
     ];
 

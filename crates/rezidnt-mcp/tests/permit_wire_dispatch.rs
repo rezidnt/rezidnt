@@ -218,9 +218,10 @@ async fn live_spend_cap_escalates_at_soft_cap_from_folded_accumulator() {
     let (_dir, core) = core_with_permit(&badge, config);
     const RUN: &str = "01SPWIRESPENDRUN000000R01";
 
-    // Seed prior granted decisions whose spend_delta_usd folds to cumulative 8.0
-    // (over the 5.0 soft cap, under the 20.0 hard cap) — the accumulator state
-    // the daemon folds and injects.
+    // Seed a POST-action `action.metered` fact whose measured spend_delta_usd
+    // folds to cumulative 8.0 (over the 5.0 soft cap, under the 20.0 hard cap) —
+    // the accumulator state the daemon folds and injects. Per DR-021 the C1 fold
+    // source is `action.metered`, NOT the pre-action permit fact.
     let spawned = Event::new(
         SourceId::new("rezidnt-run"),
         None,
@@ -232,22 +233,25 @@ async fn live_spend_cap_escalates_at_soft_cap_from_folded_accumulator() {
     )
     .expect("spawned envelope");
     core.fabric().publish(spawned).expect("publish spawned");
-    let granted = Event::new(
-        SourceId::new("rezidnt-gate"),
+    let metered = Event::new(
+        SourceId::new("rezidnt-run"),
         None,
-        Subject::new("permit.granted"),
+        Subject::new("action.metered"),
         Ulid::new(),
         None,
         1,
         json!({
             "run": RUN,
-            "request_id": "01SPWIRESPENDPRIORREQ00001",
-            "policy_ref": {"hash": "pr10rgr4n700000000000000000000000000000000000000000000000sp3nd1", "bytes": 40, "mime": "application/octet-stream"},
             "spend_delta_usd": 8.0,
+            "input_tokens": 4000,
+            "output_tokens": 1200,
+            "action_ref": {"hash": "pr10rm37r3d0000000000000000000000000000000000000000000000sp3nd1", "bytes": 16, "mime": "application/octet-stream"},
         }),
     )
-    .expect("prior granted envelope");
-    core.fabric().publish(granted).expect("publish prior grant");
+    .expect("prior metered envelope");
+    core.fabric()
+        .publish(metered)
+        .expect("publish prior metered");
 
     // projected = folded cumulative (8.0) + action_cost (1.0) = 9.0, in the soft
     // band (5.0 <= 9.0 < 20.0) → escalate.

@@ -832,6 +832,17 @@ impl McpCore {
                 "cumulative_spend_usd".to_string(),
                 json!(folded.permit_accumulators.cumulative_spend_usd),
             );
+            // DR-021 (C1): inject the per-run window action count so SpendCap's
+            // rate-limit leg can fire. `granted` is the deterministic, replayable
+            // count of granted actions this run — the folded window count the PDP
+            // owns (like `cumulative_spend_usd`). The caps + `rate_limit` ride the
+            // verifier's OWN spec params (merged over this base), so only the two
+            // folded-state axes are injected here. Content-pinned, never live state
+            // (determinism BINDING).
+            obj.insert(
+                "window_action_count".to_string(),
+                json!(folded.permit_accumulators.granted),
+            );
         }
 
         let input = rezidnt_gate::VerifierInput {

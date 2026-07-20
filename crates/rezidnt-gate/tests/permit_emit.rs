@@ -338,13 +338,21 @@ fn denied_fact_emits_only_present_deltas_and_omits_absent() {
     assert_eq!(payload["cost_ms"].as_u64(), Some(2));
 }
 
-/// The emitted delta-carrying decision is a payload the ALREADY-GREEN reducer
-/// folds identically: this is the producer↔consumer round-trip. Build the
-/// `permit.granted` payload with `decided_fact`, fold it through
-/// `rezidnt-state`, and assert the accumulators reflect the emitted deltas.
-/// This is the drift-closing test: emit and fold must agree on the keys.
+/// The emitted decision is a payload the reducer folds: this is the
+/// producer↔consumer round-trip. Build the `permit.granted` payload with
+/// `decided_fact`, fold it through `rezidnt-state`, and assert the accumulators.
+/// Per DR-021 (C1 fold source moved) the permit fact folds RISK but NO SPEND —
+/// even if a `spend_delta_usd` still rides the payload, the reducer must IGNORE
+/// it. The MEASURED spend is folded from a SEPARATE post-action `action.metered`
+/// fact. This is the drift-closing test: emit and fold must agree on the keys AND
+/// on which fact carries spend.
 ///
-/// COMPILE-RED until the new signature lands; then it exercises the real fold.
+/// RED today: the reducer still folds `spend_delta_usd` off the permit fact
+/// (crates/rezidnt-state/src/lib.rs:725-726). The permit fact carries a stray
+/// 8.0 and the metered fact carries the MEASURED 0.5; today cumulative folds
+/// 8.0 (permit) + 0.0 (metered arm absent) = 8.0 ≠ the asserted 0.5. Green only
+/// once the permit arm stops reading spend and only the metered fact folds (→
+/// 0.0 + 0.5 = 0.5). The divergent values make the fold-source move observable.
 #[test]
 fn emitted_deltas_fold_through_the_state_reducer() {
     use rezidnt_state::fold;
@@ -365,12 +373,16 @@ fn emitted_deltas_fold_through_the_state_reducer() {
         None,
         None,
         DecisionDeltas {
-            spend_delta_usd: Some(0.5),
+            // A stray spend delta on the permit fact — RETIRED as the C1 fold
+            // source (DR-021); the reducer must IGNORE it. Deliberately DIFFERENT
+            // from the metered delta so a lingering permit-fact fold is observable
+            // (it would fold 8.0, not the measured 0.5).
+            spend_delta_usd: Some(8.0),
             risk_delta: Some(2.0),
             cost_ms: Some(7),
         },
     );
-    let event = Event::new(
+    let granted = Event::new(
         SourceId::new("rezidnt-gate"),
         None,
         Subject::new(subject),
@@ -380,7 +392,20 @@ fn emitted_deltas_fold_through_the_state_reducer() {
         payload,
     )
     .expect("decision payload is a legal envelope");
-    let graph = fold(std::iter::once(&event));
+    // The MEASURED spend rides a POST-action `action.metered` fact — the C1 fold
+    // source after DR-021.
+    let metered = Event::new(
+        SourceId::new("rezidnt-run"),
+        None,
+        Subject::new("action.metered"),
+        Ulid::new(),
+        None,
+        1,
+        serde_json::json!({"run": RUN, "spend_delta_usd": 0.5, "input_tokens": 80, "output_tokens": 30}),
+    )
+    .expect("metering payload is a legal envelope");
+    let events = [granted, metered];
+    let graph = fold(events.iter());
     let acc = &graph
         .agent_runs
         .get(RUN)
@@ -388,11 +413,12 @@ fn emitted_deltas_fold_through_the_state_reducer() {
         .permit_accumulators;
     assert_eq!(
         acc.cumulative_spend_usd, 0.5,
-        "the emitted spend_delta_usd folds into cumulative spend — producer and consumer agree"
+        "cumulative spend = the MEASURED delta from action.metered ALONE (0.5); the stray \
+         spend_delta_usd on the permit fact folds ZERO (retired fold source, DR-021)"
     );
     assert_eq!(
         acc.risk_score, 2.0,
-        "the emitted risk_delta folds into the running risk score"
+        "the emitted risk_delta STILL folds off the permit fact — C6 untouched by DR-021"
     );
     assert_eq!(acc.granted, 1, "the grant is counted");
 }

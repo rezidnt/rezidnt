@@ -697,6 +697,27 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     .push(record);
             }
         }
+        // DR-021 B2 (C1): the post-action `action.metered` fact is the C1 spend
+        // fold source. Keyed by the payload `run`; folds the MEASURED
+        // `spend_delta_usd` into the SAME `cumulative_spend_usd` accumulator the
+        // permit path used to feed — only the SOURCE fact moved (off the
+        // pre-action permit decision, onto this measured post-action fact). A
+        // keyless fact (missing `run`) folds counters-only / no-op, never mints a
+        // run, never panics — the established permit-reducer discipline (I3, never
+        // guess a key). `input_tokens`/`output_tokens` are RECORDED-only: there is
+        // no cumulative-tokens accumulator, so they never fold.
+        "action.metered" => {
+            if let Some(run) = payload_run(event)
+                && let Some(spend) = event.payload()["spend_delta_usd"].as_f64()
+            {
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .permit_accumulators
+                    .cumulative_spend_usd += spend;
+            }
+        }
         _ => {} // every other subject: counters only (S0 scope)
     }
 }
@@ -722,9 +743,10 @@ fn apply_permit_decision(graph: &mut Graph, event: &Event, decision: &str) {
     // Accumulators: fold the optional per-session deltas + decision counters,
     // the state the contextual permit-verifiers read (C1/C6/C7).
     let acc = &mut state.permit_accumulators;
-    if let Some(spend) = payload["spend_delta_usd"].as_f64() {
-        acc.cumulative_spend_usd += spend;
-    }
+    // DR-021 B2 (C1): `spend_delta_usd` is RETIRED as the permit-path fold source;
+    // the permit fact now folds ZERO spend. Measured spend rides the post-action
+    // `action.metered` fact instead (the `action.metered` arm above). `risk_delta`
+    // (C6) is UNTOUCHED and stays on the permit path.
     if let Some(risk) = payload["risk_delta"].as_f64() {
         acc.risk_score += risk;
     }

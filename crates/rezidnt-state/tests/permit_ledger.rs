@@ -14,9 +14,12 @@
 //! emit path. This file pins the consumer those producers must match.
 //!
 //! Shapes asserted verbatim from `spec/ontology.md` "permit set" (payload
-//! schemas, lines 316-342): `permit.requested {run, request_id, action, ...}`;
+//! schemas): `permit.requested {run, request_id, action, ...}`;
 //! `permit.granted|denied|escalated {run, request_id, policy_ref: CasRef,
-//! reason?, spend_delta_usd?, risk_delta?, ...}`.
+//! reason?, risk_delta?, ...}`. Per DR-021 the C1 spend fold source moved OFF
+//! the permit facts: `spend_delta_usd?` is RETIRED from the permit payloads and
+//! now rides the post-action `action.metered` fact (folded there, not here).
+//! `risk_delta?` STAYS on the permit path (C6, untouched).
 
 use rezidnt_state::{Materializer, fold};
 use rezidnt_types::{Event, SourceId, Subject};
@@ -55,7 +58,14 @@ fn request_then_grant_folds_to_one_interrogable_ledger_entry() {
             "permit.granted",
             json!({"run": RUN, "request_id": REQ,
                    "policy_ref": {"hash": "po11cygranted00000000000000000000000000000000000000000000000001", "bytes": 64, "mime": "application/octet-stream"},
-                   "spend_delta_usd": 0.5, "risk_delta": 1.0}),
+                   "risk_delta": 1.0}),
+        ),
+        // The MEASURED spend for the granted action rides a POST-action
+        // `action.metered` fact — the C1 fold source after DR-021, no longer the
+        // permit fact.
+        ev(
+            "action.metered",
+            json!({"run": RUN, "spend_delta_usd": 0.5, "input_tokens": 100u64, "output_tokens": 40u64}),
         ),
     ];
     let graph = fold(events.iter());
@@ -203,7 +213,10 @@ mod props {
     // 0 = granted, 1 = denied, 2 = escalated
     const DECISIONS: [&str; 3] = ["permit.granted", "permit.denied", "permit.escalated"];
 
-    fn decision_ev(run: &str, req: &str, kind: usize, spend: f64, risk: f64) -> Event {
+    // The permit DECISION fact carries risk (C6, still on the permit path) and
+    // the decision outcome — but NO spend. Per DR-021 the C1 spend fold source
+    // moved off the permit fact.
+    fn decision_ev(run: &str, req: &str, kind: usize, risk: f64) -> Event {
         ev(
             DECISIONS[kind],
             json!({
@@ -211,9 +224,17 @@ mod props {
                 "request_id": req,
                 "policy_ref": {"hash": "po11cyprop000000000000000000000000000000000000000000000000prop", "bytes": 8, "mime": "application/octet-stream"},
                 "reason": "prop",
-                "spend_delta_usd": spend,
                 "risk_delta": risk,
             }),
+        )
+    }
+
+    // The MEASURED spend for an action rides a POST-action `action.metered` fact
+    // (the C1 fold source after DR-021), keyed on the run.
+    fn metered_ev(run: &str, spend: f64) -> Event {
+        ev(
+            "action.metered",
+            json!({"run": run, "spend_delta_usd": spend, "input_tokens": 10u64, "output_tokens": 5u64}),
         )
     }
 
@@ -232,13 +253,18 @@ mod props {
             )
         ) {
             // Each event gets a unique request_id so entries do not overwrite
-            // (independent decisions, not request→decision on one entry).
+            // (independent decisions, not request→decision on one entry). The
+            // permit decision fact folds risk + the outcome count; a PAIRED
+            // `action.metered` fact folds the measured spend (DR-021 fold source).
             let events: Vec<Event> = seq
                 .iter()
                 .enumerate()
-                .map(|(i, &(r, k, s, rk))| {
+                .flat_map(|(i, &(r, k, s, rk))| {
                     let req = format!("01SP0PROPREQ{i:015}");
-                    decision_ev(RUNS[r], &req, k, s as f64, rk as f64)
+                    [
+                        decision_ev(RUNS[r], &req, k, rk as f64),
+                        metered_ev(RUNS[r], s as f64),
+                    ]
                 })
                 .collect();
 

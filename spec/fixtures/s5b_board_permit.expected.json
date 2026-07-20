@@ -1,7 +1,8 @@
 {
-  "events_folded": 10,
+  "events_folded": 11,
   "last_event": "01S5BB0ARDPERMFXTRE0000EVA",
   "counts_by_subject": {
+    "action.metered": 1,
     "agent.spawned": 1,
     "permit.delegated": 2,
     "permit.denied": 1,

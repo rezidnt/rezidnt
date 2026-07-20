@@ -1,5 +1,5 @@
 rezidnt fleet board (read-only)
-events folded: 10   workspaces: 0 open / 0 closed
+events folded: 11   workspaces: 0 open / 0 closed
 
 runs
   run                         status      cost usd   in/out tokens  alarms

@@ -851,9 +851,16 @@ impl McpCore {
         //    an `await`ed subprocess through `ExecVerifier` — visible to the
         //    scheduler and the hot-path timeout, never `block_on`'d inside
         //    `spawn_blocking`.
+        // Time the AGGREGATE span ONLY (§10.2 decision latency): the monotonic
+        // clock wraps just the `aggregate_async` await — the deciding policy's
+        // latency — NOT the surrounding CAS pin or `publish_fact`, which would
+        // conflate policy cost with I/O. The timer wraps the call
+        // unconditionally, so even the empty-set escalate carries a `cost_ms`.
+        let agg_start = std::time::Instant::now();
         let outcome = rezidnt_gate::permit::aggregate_async(config.verifiers(), &input, &cas)
             .await
             .map_err(|e| PdpError::Internal(format!("permit aggregate: {e}")))?;
+        let cost_ms = agg_start.elapsed().as_millis() as u64;
 
         let decision = Decision::from(outcome.decision);
         let reason = outcome.evidence.first().map(|e| e.msg.clone());
@@ -900,7 +907,10 @@ impl McpCore {
             &policy_ref,
             evidence_ref.as_ref(),
             reason.as_deref(),
-            rezidnt_gate::permit::DecisionDeltas::default(),
+            rezidnt_gate::permit::DecisionDeltas {
+                cost_ms: Some(cost_ms),
+                ..Default::default()
+            },
         );
         self.publish_fact(subject, payload)
             .await

@@ -90,6 +90,20 @@ fn last_requested_payload(core: &McpCore) -> Value {
 /// `reason`/`request_id`/`run` are identical by input. A DIVERGENCE here is the
 /// fork DR-013 decision 1 forbids.
 ///
+/// ONE payload field is EXCLUDED from the byte-identity comparison: `cost_ms`
+/// (the design §10.2 decision-latency field the PDP now measures per emit). It
+/// is per-emit WALL-CLOCK TELEMETRY — the same volatility class as the envelope
+/// `ts` this test's `last_denied_payload` helper already strips (:62-65). Two
+/// separate `decide_permit` calls on two separate cores measure two different
+/// latencies, so `cost_ms` legitimately diverges; that divergence measures how
+/// long the decision TOOK, not what the decision WAS, and is NOT the PDP fork
+/// DR-013 forbids. Excluding it (like `ts`) is a principled refinement of "the
+/// same decision fact," not a weakening: the no-fork assertion still compares
+/// the full DECISION — verdict/policy_ref/evidence_ref/reason/request_id/run —
+/// byte-for-byte. cost_ms is the FIRST non-deterministic payload field (the CAS
+/// refs are content hashes; reason/request_id/run are input-fixed), so it is
+/// the first payload field that needed this treatment.
+///
 /// COMPILE-RED on `PermitRequest`/`decide_permit`; then ASSERT-RED until both
 /// callers share the one entrypoint.
 #[tokio::test]
@@ -166,9 +180,35 @@ async fn mcp_and_socket_entrypoints_emit_byte_identical_decision_facts() {
     let socket_fact = last_denied_payload(&core_b);
     let socket_requested = last_requested_payload(&core_b);
 
+    // Strip the per-emit `cost_ms` telemetry before the byte-identity comparison
+    // — its wall-clock divergence across two emits is not a fork, exactly as the
+    // envelope `ts` (already stripped in `last_denied_payload`) is not. Mirrors
+    // the `strip_badge` pattern below; the decision proper stays byte-compared.
+    let strip_cost_ms = |mut v: Value| -> Value {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("cost_ms");
+        }
+        v
+    };
+    // Both facts MUST carry cost_ms (the PDP measures every decision — the
+    // CRITERION 1/2 contract). Pin its presence before stripping it, so this
+    // exclusion can never silently mask a MISSING-key regression: the field is
+    // present-and-divergent (telemetry), not absent.
+    assert!(
+        mcp_fact.get("cost_ms").is_some_and(Value::is_u64),
+        "the MCP decision fact carries an integer cost_ms (present, then excluded as telemetry): {mcp_fact:#}"
+    );
+    assert!(
+        socket_fact.get("cost_ms").is_some_and(Value::is_u64),
+        "the socket decision fact carries an integer cost_ms (present, then excluded as telemetry): {socket_fact:#}"
+    );
+
     assert_eq!(
-        mcp_fact, socket_fact,
-        "MCP and socket decision facts must be BYTE-IDENTICAL — one decision path, no fork (I3, DR-013 decision 1)"
+        strip_cost_ms(mcp_fact.clone()),
+        strip_cost_ms(socket_fact.clone()),
+        "MCP and socket decision facts must be BYTE-IDENTICAL EXCEPT the per-emit \
+         cost_ms telemetry (excluded like the envelope ts) — one decision path, no fork \
+         (I3, DR-013 decision 1)"
     );
 
     // The paired `permit.requested` fact is NOT byte-identical: it legitimately

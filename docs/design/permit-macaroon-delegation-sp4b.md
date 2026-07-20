@@ -84,10 +84,10 @@ A delegation must be a **durable fact** so the capability chain replays (I3): wh
 - **Root-key lifetime.** A process-lifetime key means badges don't survive a daemon restart (a restart re-mints). State this: agent badges are run-scoped and short-lived anyway (DR-005 expiry); a restart invalidating in-flight badges is acceptable and honest (matches the operator-badge daemon-lifetime model).
 - **Scope (permit-engine §10.3, restated).** SP4b is the crypto slice; it's bounded because delegation rides the existing badge seam (`check_badge`, `SpawnPlan` injection) and adds no dependency.
 
-## 10. Open decisions the DR must ratify (owner sign-off)
+## 10. Decisions the DR ratifies (two owner-ratified 2026-07-19)
 
-1. **Macaroon impl (§3) — RECOMMENDED: hand-roll a first-party-caveat macaroon over blake3-keyed (zero new dep)**, having evaluated and rejected the stale `macaroon` crate (audit/maintenance) and the over-fit `biscuit-auth` (public-key + Datalog + I7 surface). The DR ratifies this + records the evaluation. *(This is the load-bearing decision — it touches the approved-dep set + I7.)*
-2. **Badge migration (§6)** — agent badges become macaroons; operator badge stays the DR-005 opaque class. Confirm.
-3. **Delegation fact (§7)** — a `permit.delegated` subject (recommended) vs an `agent.spawned` field — a warden `/subject`, gated.
-4. **Root-key lifetime (§9)** — process-lifetime (recommended; badges are run-scoped/short-lived) vs persisted.
-5. **Threat model** — the DR should state what SP4b defends against (a compromised sub-agent cannot widen its badge; a tampered macaroon fails verify) and what it does NOT (a compromised *daemon* holds the root key — out of scope, same as any root-of-trust).
+1. **Macaroon impl (§3) — RATIFIED: hand-roll a first-party-caveat macaroon over blake3-keyed (zero new dependency).** The `macaroon` crate was evaluated and rejected (stale Oct-2022 pre-1.0, fails the audit/maintenance bar for security crypto); `biscuit-auth` rejected (public-key rezidnt doesn't need + Datalog competing with SP3 exec policy + heavy I7 surface). The DR ratifies the hand-roll + records the evaluation. The crypto primitive stays a vetted crate (blake3 keyed-hash); only the ~80-line envelope is ours.
+2. **Delegation fact (§7) — RATIFIED: a new `permit.delegated` subject** (`{parent_badge_id, child_badge_id, added_caveats, run}`) + folding reducer — a delegation is a new event in time on the `permit.*` axis (contrast the SP4a role, a spawn-time field). Minted in a warden `/subject` session (gated).
+3. **Badge migration (§6) — direction:** agent badges become macaroons; the operator badge stays the DR-005 opaque daemon-lifetime class. Confirmed in the DR.
+4. **Root-key lifetime (§9) — recommended:** process-lifetime (badges are run-scoped/short-lived; a restart re-mints, matching the operator-badge model). Confirmed in the DR.
+5. **Threat model** — the DR states what SP4b defends against (a compromised sub-agent cannot widen its badge; a tampered/forged/reordered macaroon fails verify) and what it does NOT (a compromised *daemon* holds the root key — out of scope, same as any root-of-trust).

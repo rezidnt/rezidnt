@@ -128,3 +128,57 @@ async fn empty_seed_projects_to_an_empty_board() {
     assert_eq!(view.runs.len(), 0, "no runs before any event is ingested");
     assert_eq!(view.events_folded, 0);
 }
+
+/// S5b criterion 4 — the permit surface rides the WATCH-ONLY path. Feed a
+/// spawn + permit-decision log through `ingest_into_watch` and assert the
+/// RECEIVER-side projection reflects the new permit counts. This proves the
+/// permit column reads only `watch<Graph>` (derived state), never a raw
+/// `Event` — the I1 seam holds for the new surface exactly as for the S5 board.
+///
+/// RED: compile-fail until `RunRow` grows the permit fields the projection
+/// populates (`permit_granted` etc.); asserts the decision folded through the
+/// watch seam into the projected row.
+#[tokio::test]
+async fn watch_receiver_projects_permit_decision_counts() {
+    let events = [
+        ev("agent.spawned", json!({"run": RUN, "agent": "impl"})),
+        ev(
+            "permit.requested",
+            json!({"run": RUN, "request_id": "rq-watch-1", "action": "tool.invoke"}),
+        ),
+        ev(
+            "permit.granted",
+            json!({
+                "run": RUN,
+                "request_id": "rq-watch-1",
+                "policy_ref": {"hash": "deadbeef"},
+                "spend_delta_usd": 0.1,
+                "risk_delta": 1.0
+            }),
+        ),
+        // A second request left undecided -> a pending ledger entry.
+        ev(
+            "permit.requested",
+            json!({"run": RUN, "request_id": "rq-watch-2", "action": "tool.invoke"}),
+        ),
+    ];
+
+    let (tx, rx) = watch::channel(Graph::default());
+    ingest_into_watch(events.iter(), &tx);
+
+    // The render loop only ever reads the watch channel — never a raw Event.
+    let latest = rx.borrow().clone();
+    let view = project(&latest);
+
+    let row = run_row(&view, RUN).expect("the watch channel carried the run into view");
+    assert_eq!(
+        row.permit_granted, 1,
+        "the granted decision folded through the watch seam into the permit column"
+    );
+    assert_eq!(row.permit_denied, 0, "no denial folded");
+    assert_eq!(row.permit_escalated, 0, "no escalation folded");
+    assert_eq!(
+        row.permit_pending, 1,
+        "the undecided second request rode the watch seam as a pending entry"
+    );
+}

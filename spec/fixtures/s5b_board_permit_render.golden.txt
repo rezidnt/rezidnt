@@ -1,0 +1,13 @@
+rezidnt fleet board (read-only)
+events folded: 10   workspaces: 0 open / 0 closed
+
+runs
+  run                         status      cost usd   in/out tokens  alarms
+  01S5BB0ARDPERMFXTRE00  spawning       -               -/-       0
+
+permit
+  run                         granted/denied/escalated    pending   delegated
+  01S5BB0ARDPERMFXTRE00       1/1/1                       1         2
+
+worktrees
+  path                             status    last diff

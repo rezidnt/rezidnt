@@ -154,3 +154,87 @@ fn projection_is_pure_and_cannot_mutate_the_graph() {
         "the projected view must reflect the folded run (not an empty scaffold)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S5b oracle — the PERMIT column. Read-only projection of ALREADY-FOLDED permit
+// state (SP5 made the permit stream first-class); no new subject, no fabric
+// write (I1). These tests reference `RunRow` permit fields the implementer must
+// add — RED as compile-fail until the struct grows the fields AND `project`
+// populates them from `AgentRunState`.
+//
+// TARGET API the implementer must build (kept minimal, comment-pinned here):
+//   - extend `rezidnt_tui::RunRow` with permit fields:
+//       pub permit_granted: u64,     // <- AgentRunState.permit_accumulators.granted
+//       pub permit_denied: u64,      // <- permit_accumulators.denied
+//       pub permit_escalated: u64,   // <- permit_accumulators.escalated
+//       pub permit_pending: usize,   // <- count of permit_ledger entries whose decision == None
+//       pub delegated: usize,        // <- delegations.len()
+//   - populate them in `project` from the ALREADY-FOLDED `AgentRunState`
+//     (verbatim carry, I3 — the board re-interprets nothing).
+
+/// Criterion 1: `project` surfaces permit activity per run. The S5b fixture
+/// folds ONE run with granted=1 / denied=1 / escalated=1 (from the
+/// `permit_accumulators` counters), ONE requested-but-undecided ledger entry
+/// (pending=1), and a two-hop delegation chain (delegated=2). The RunRow must
+/// carry those five numbers verbatim from derived state.
+#[test]
+fn projects_permit_activity_counts_per_run() {
+    let graph = graph_from_fixture("s5b_board_permit.jsonl");
+    let view = project(&graph);
+
+    assert_eq!(view.runs.len(), 1, "s5b fixture folds to exactly one run");
+    let row = &view.runs[0];
+    assert_eq!(row.run, "01S5BB0ARDPERMFXTRE000RN01");
+
+    // Decision counts read straight off permit_accumulators (fold from real
+    // decision facts).
+    assert_eq!(
+        row.permit_granted, 1,
+        "granted count from permit_accumulators.granted"
+    );
+    assert_eq!(
+        row.permit_denied, 1,
+        "denied count from permit_accumulators.denied"
+    );
+    assert_eq!(
+        row.permit_escalated, 1,
+        "escalated count from permit_accumulators.escalated (never coerced to granted, I6)"
+    );
+
+    // Pending = permit_ledger entries with decision == None (requested but not
+    // yet decided). The fixture leaves RQ004 undecided.
+    assert_eq!(
+        row.permit_pending, 1,
+        "pending = ledger entries whose decision is None (requested-but-undecided)"
+    );
+
+    // Delegation depth = delegations.len() (the two-hop attenuation chain).
+    assert_eq!(
+        row.delegated, 2,
+        "delegation depth = AgentRunState.delegations.len()"
+    );
+}
+
+/// Criterion 2: a run with NO permit activity shows all-zero permit fields and
+/// never crashes/panics. The s1 fixture is a spawn->run->complete run with no
+/// permit facts at all: the accumulators default to 0 and the ledger/delegations
+/// default empty. I3 honest — absent permit facts project as zeros, never a
+/// synthesized value.
+#[test]
+fn spawn_only_run_projects_zero_permit_fields_without_panic() {
+    let graph = graph_from_fixture("s1_agent_run.jsonl");
+    let view = project(&graph);
+
+    assert_eq!(view.runs.len(), 1, "s1 fixture folds to exactly one run");
+    let row = &view.runs[0];
+    // The permit-free run: every permit field is the honest zero, not absent
+    // synthesized to a value.
+    assert_eq!(row.permit_granted, 0, "no permit facts -> zero granted");
+    assert_eq!(row.permit_denied, 0, "no permit facts -> zero denied");
+    assert_eq!(row.permit_escalated, 0, "no permit facts -> zero escalated");
+    assert_eq!(
+        row.permit_pending, 0,
+        "empty ledger -> zero pending (not a crash)"
+    );
+    assert_eq!(row.delegated, 0, "no delegation facts -> zero depth");
+}

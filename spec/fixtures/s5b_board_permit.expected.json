@@ -1,0 +1,83 @@
+{
+  "events_folded": 10,
+  "last_event": "01S5BB0ARDPERMFXTRE0000EVA",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "permit.delegated": 2,
+    "permit.denied": 1,
+    "permit.escalated": 1,
+    "permit.granted": 1,
+    "permit.requested": 4
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01S5BB0ARDPERMFXTRE000RN01": {
+      "status": "spawning",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {
+        "01S5BB0ARDPERMFXTRERQ001": {
+          "action": "tool.invoke",
+          "decision": "granted",
+          "policy_ref": "a11a2000000000000000000000000000000000000000000000000000gr4n7d",
+          "reason": null
+        },
+        "01S5BB0ARDPERMFXTRERQ002": {
+          "action": "tool.invoke",
+          "decision": "denied",
+          "policy_ref": "d3n1ed00000000000000000000000000000000000000000000000000den1ed",
+          "reason": "path outside allowed scope"
+        },
+        "01S5BB0ARDPERMFXTRERQ003": {
+          "action": "tool.invoke",
+          "decision": "escalated",
+          "policy_ref": "e5ca1a7ed000000000000000000000000000000000000000000000e5ca1a7e",
+          "reason": "cumulative spend crossed soft cap"
+        },
+        "01S5BB0ARDPERMFXTRERQ004": {
+          "action": "tool.invoke",
+          "decision": null,
+          "policy_ref": null,
+          "reason": null
+        }
+      },
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.25,
+        "risk_score": 6.0,
+        "granted": 1,
+        "denied": 1,
+        "escalated": 1
+      },
+      "intent": null,
+      "pep": null,
+      "role": null,
+      "delegations": [
+        {
+          "parent_badge_id": "b0ardf00d0000000",
+          "child_badge_id": "child001",
+          "added_caveats": [
+            {
+              "kind": "workspace",
+              "workspace": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            }
+          ]
+        },
+        {
+          "parent_badge_id": "child001",
+          "child_badge_id": "leaf0002",
+          "added_caveats": [
+            {
+              "kind": "role",
+              "role": "sub"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "worktrees": {}
+}

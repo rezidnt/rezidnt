@@ -66,6 +66,21 @@ pub struct RunRow {
     /// How many replay-divergence alarms are on this run (DR-006). Zero for a
     /// healthy run; the board surfaces a nonzero count.
     pub integrity_alarms: usize,
+    /// Permit decisions folded onto this run, carried verbatim from
+    /// [`rezidnt_state::AgentRunState::permit_accumulators`] (I3: no
+    /// re-interpretation). Grant count.
+    pub permit_granted: u64,
+    /// Permit denial count, from `permit_accumulators.denied`.
+    pub permit_denied: u64,
+    /// Permit escalation count, from `permit_accumulators.escalated`.
+    /// `escalated` is never coerced to `granted` (I6) — it surfaces on its own.
+    pub permit_escalated: u64,
+    /// Requested-but-undecided permits: ledger entries whose `decision` is
+    /// `None`. Honest zero when the ledger is empty.
+    pub permit_pending: usize,
+    /// Delegation-chain depth for this run, from
+    /// [`rezidnt_state::AgentRunState::delegations`] length.
+    pub delegated: usize,
 }
 
 /// One worktree's row in the fleet board.
@@ -113,6 +128,18 @@ pub fn project(graph: &Graph) -> BoardView {
             input_tokens: state.input_tokens,
             output_tokens: state.output_tokens,
             integrity_alarms: state.integrity_alarms.len(),
+            // Permit state, carried verbatim from the ALREADY-FOLDED run
+            // (I3 — the board re-derives nothing). `permit_pending` counts
+            // ledger entries still awaiting a decision.
+            permit_granted: state.permit_accumulators.granted,
+            permit_denied: state.permit_accumulators.denied,
+            permit_escalated: state.permit_accumulators.escalated,
+            permit_pending: state
+                .permit_ledger
+                .values()
+                .filter(|entry| entry.decision.is_none())
+                .count(),
+            delegated: state.delegations.len(),
         })
         .collect();
 
@@ -185,6 +212,41 @@ pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
         lines.push(line);
     }
 
+    // Permit section (S5b): a read-only PERMIT column carrying already-folded
+    // permit decision counts, pending requests, and delegation depth per run.
+    // Rendered ONLY when at least one run has permit activity, so a permit-free
+    // fleet (e.g. the pre-permit S5 contract) renders byte-identically to
+    // before. Every value is carried verbatim from the projected RunRow (I3).
+    let any_permit = view.runs.iter().any(run_has_permit_activity);
+    if any_permit {
+        lines.push(String::new());
+        lines.push("permit".to_string());
+        let mut p_header = String::new();
+        place(&mut p_header, 2, "run");
+        place(&mut p_header, 30, "granted/denied/escalated");
+        place(&mut p_header, 58, "pending");
+        place(&mut p_header, 68, "delegated");
+        lines.push(p_header);
+        for row in &view.runs {
+            if !run_has_permit_activity(row) {
+                continue;
+            }
+            let mut line = String::new();
+            place(&mut line, 2, truncate(&row.run, 21));
+            place(
+                &mut line,
+                30,
+                &format!(
+                    "{}/{}/{}",
+                    row.permit_granted, row.permit_denied, row.permit_escalated
+                ),
+            );
+            place(&mut line, 58, &row.permit_pending.to_string());
+            place(&mut line, 68, &row.delegated.to_string());
+            lines.push(line);
+        }
+    }
+
     lines.push(String::new());
 
     // Worktrees section.
@@ -232,6 +294,18 @@ fn truncate(s: &str, max: usize) -> &str {
 fn tokens(input: Option<u64>, output: Option<u64>) -> String {
     let cell = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
     format!("{}/{}", cell(input), cell(output))
+}
+
+/// Whether a run has any folded permit activity to surface: a decision
+/// (granted/denied/escalated), a pending request, or a delegation. A run with
+/// none reads as all-zero and is omitted from the permit section so a
+/// permit-free fleet renders byte-identically to the pre-permit board.
+fn run_has_permit_activity(row: &RunRow) -> bool {
+    row.permit_granted != 0
+        || row.permit_denied != 0
+        || row.permit_escalated != 0
+        || row.permit_pending != 0
+        || row.delegated != 0
 }
 
 /// Fold an event iterator into a `watch::Sender<Graph>`, publishing a fresh

@@ -366,8 +366,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-016](decisions/DR-016-permit-roles-sp4-slicing.md) | SP4 slicing + SP4a roles scope | ACCEPTED | §8, §9, §16 |
 | [DR-017](decisions/DR-017-permit-macaroon-delegation-sp4b.md) | SP4b macaroon-attenuated delegation (crypto + dep choice) | ACCEPTED | §12, §16 |
 | [DR-018](decisions/DR-018-delegation-edge-id-and-offline-boundary.md) | Delegation edge id from the running sig + offline-boundary defer (SP4b) | ACCEPTED | §12, §16 |
+| [DR-019](decisions/DR-019-c8-layered-precedence-sp4c.md) | SP4c: C8 layered policy precedence via monotone concat | ACCEPTED | §8, §9, §16 |
 
-*The next record is DR-019.*
+*The next record is DR-020.*
 
 ---
 

@@ -29,6 +29,42 @@ use crate::{Evidence, ExecVerifier, GateError, Verdict, VerifierInput, builtin_n
 /// a permit gate.
 pub const LIFECYCLE_POINT: &str = "permit";
 
+/// The policy LAYER a permit-verifier was sourced from (SP4c — C8 layered
+/// precedence, DR-019 Decision 3). Three layers compose by CONCATENATING their
+/// specs in the fixed `Admin → Dev → Session` order ([`compose_layers`]);
+/// stricter-wins is INHERITED from the existing monotone aggregate (no
+/// allow-override primitive exists, so a later layer can never un-Fail an
+/// earlier layer's deny). The layer is provenance ONLY — it rides each spec so
+/// the decision fact / `gate_explain` can name the deciding *layer*, not merely
+/// the deciding verifier (I6 interrogability). It changes no verdict logic.
+///
+/// `Session` is the LEAST-authority layer and the default the layer-agnostic
+/// [`PermitVerifierSpec::native`]/[`PermitVerifierSpec::exec`] constructors
+/// stamp, so pre-SP4c call sites keep their behavior unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermitLayer {
+    /// Host/daemon-sourced policy — the highest authority. An admin deny is
+    /// non-overridable by a later (dev/session) layer.
+    Admin,
+    /// Workspace-applied policy (`workspace.spec.applied`, I3).
+    Dev,
+    /// Run/agent-sourced policy — the least authority (and the default).
+    Session,
+}
+
+impl PermitLayer {
+    /// The stable string the decision fact / `gate_explain` carries for this
+    /// layer: `"admin"` / `"dev"` / `"session"` (I6 — "why blocked" answers with
+    /// the layer name).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermitLayer::Admin => "admin",
+            PermitLayer::Dev => "dev",
+            PermitLayer::Session => "session",
+        }
+    }
+}
+
 /// The authorization decision a permit-verifier's [`Verdict`] maps to. Carried
 /// by the fact SUBJECT (never a bare boolean), matching the house pattern of
 /// `gate.passed`/`gate.failed`/`gate.inconclusive` (I6).
@@ -205,29 +241,59 @@ pub struct PermitVerifierSpec {
     /// set through the [`Self::native`]/[`Self::exec`] constructors — a caller
     /// cannot mint a half-formed exec entry with no argv.
     kind: PermitVerifierKind,
+    /// The policy layer this spec was sourced from (SP4c — C8, DR-019 Decision
+    /// 3). Provenance only: it names the deciding LAYER on the outcome and
+    /// changes no verdict logic. Private so it is only set through a constructor;
+    /// the layer-agnostic [`Self::native`]/[`Self::exec`] default it to
+    /// [`PermitLayer::Session`] (least authority) so no pre-SP4c site regresses.
+    layer: PermitLayer,
 }
 
 impl PermitVerifierSpec {
     /// A native permit entry: a registry name + its pinned params (DR-015
     /// §Decision 1). Dispatched in-process by resolving `name` against
-    /// [`builtin_natives`].
+    /// [`builtin_natives`]. Its layer defaults to [`PermitLayer::Session`] (the
+    /// least-authority layer) — use [`Self::native_in_layer`] to stamp a
+    /// different provenance (SP4c, DR-019).
     pub fn native(name: impl Into<String>, params: Value) -> Self {
+        Self::native_in_layer(PermitLayer::Session, name, params)
+    }
+
+    /// A native permit entry STAMPED with its source layer (SP4c — C8, DR-019
+    /// Decision 3). Provenance-carrying sibling of [`Self::native`]; the layer is
+    /// surfaced as the deciding layer on the outcome and changes no verdict logic.
+    pub fn native_in_layer(layer: PermitLayer, name: impl Into<String>, params: Value) -> Self {
         Self {
             name: name.into(),
             params,
             kind: PermitVerifierKind::Native,
+            layer,
         }
     }
 
     /// An exec permit entry: a display name + the argv (interpreter + policy
     /// path + args) + its pinned params (DR-015 §Decision 1). Dispatched as an
     /// `await`ed subprocess through [`crate::ExecVerifier`] speaking the §8 JSON
-    /// contract — rezidnt ships the dispatch, never the engine (I7).
+    /// contract — rezidnt ships the dispatch, never the engine (I7). Its layer
+    /// defaults to [`PermitLayer::Session`] — use [`Self::exec_in_layer`] to
+    /// stamp a different provenance (SP4c, DR-019).
     pub fn exec(name: impl Into<String>, argv: Vec<String>, params: Value) -> Self {
+        Self::exec_in_layer(PermitLayer::Session, name, argv, params)
+    }
+
+    /// An exec permit entry STAMPED with its source layer (SP4c — C8, DR-019
+    /// Decision 3). Provenance-carrying sibling of [`Self::exec`].
+    pub fn exec_in_layer(
+        layer: PermitLayer,
+        name: impl Into<String>,
+        argv: Vec<String>,
+        params: Value,
+    ) -> Self {
         Self {
             name: name.into(),
             params,
             kind: PermitVerifierKind::Exec { argv },
+            layer,
         }
     }
 
@@ -235,6 +301,36 @@ impl PermitVerifierSpec {
     pub fn kind(&self) -> &PermitVerifierKind {
         &self.kind
     }
+
+    /// This entry's source policy layer (SP4c provenance, DR-019).
+    pub fn layer(&self) -> PermitLayer {
+        self.layer
+    }
+}
+
+/// Compose the three policy layers into one flat, ordered verifier set by
+/// CONCATENATING them in the fixed `admin → dev → session` order (SP4c — C8,
+/// DR-019 Decision 1). Each spec's layer provenance is preserved. This is the
+/// ONLY new merge: the aggregate ([`aggregate`]/[`aggregate_async`]) and the
+/// verdict→decision table are UNCHANGED. Stricter-wins is inherited from the
+/// existing monotone aggregate — because there is no allow-override primitive, a
+/// later (dev/session) layer can never un-Fail an earlier (admin) layer's deny;
+/// admin's specs simply run FIRST, so its first Fail short-circuits before any
+/// later layer runs.
+///
+/// An absent or empty layer contributes ZERO verifiers (an all-empty resolution
+/// yields the empty set, which the aggregate ESCALATES — never a synthesized
+/// allow, DR-011 §3 / DR-019 criterion 4).
+pub fn compose_layers(
+    admin: Vec<PermitVerifierSpec>,
+    dev: Vec<PermitVerifierSpec>,
+    session: Vec<PermitVerifierSpec>,
+) -> Vec<PermitVerifierSpec> {
+    let mut merged = Vec::with_capacity(admin.len() + dev.len() + session.len());
+    merged.extend(admin);
+    merged.extend(dev);
+    merged.extend(session);
+    merged
 }
 
 /// The aggregate outcome of dispatching a configured permit-verifier set: the
@@ -253,6 +349,14 @@ pub struct PermitOutcome {
     /// The deciding verifier's name (the first Fail, else the first Inconclusive,
     /// else the last passing verifier; empty for the empty configured set).
     pub deciding_verifier: String,
+    /// The policy LAYER of the deciding verifier (SP4c — C8, DR-019 Decision 3):
+    /// the first Fail's layer for a Deny, the escalating verifier's layer for an
+    /// Escalate, the last passing verifier's layer for a Grant. `None` ONLY for
+    /// the empty-set escalate (no verifier decided, so no layer to name). This is
+    /// provenance surfaced ALONGSIDE the existing decision — the verdict→decision
+    /// mapping is unchanged; `gate_explain` uses it to answer "why blocked" with
+    /// the deciding *layer*, not merely the verifier (I6).
+    pub deciding_layer: Option<PermitLayer>,
     /// The deciding verifier's merged params (request axis + its config) — the
     /// policy descriptor the caller pins to CAS as `policy_ref` so the decision
     /// stays replayable/interrogable (I3).
@@ -350,11 +454,14 @@ pub fn aggregate(
     let natives = builtin_natives();
 
     // Empty configured set: undecidable → Escalate, never a synthesized allow (I6).
+    // No verifier decided, so there is no deciding layer to name (DR-019: `None`
+    // is reserved for exactly this empty-set escalate).
     if set.is_empty() {
         return Ok(PermitOutcome {
             verdict: Verdict::Inconclusive,
             decision: decision_for(Verdict::Inconclusive),
             deciding_verifier: String::new(),
+            deciding_layer: None,
             deciding_params: Value::Null,
             evidence: Vec::new(),
             deciding_evidence_ref: None,
@@ -363,8 +470,9 @@ pub fn aggregate(
     }
 
     // The first inconclusive is the escalate-fallback deciding verifier; it is
-    // only promoted to the outcome if the scan completes without a Fail.
-    let mut first_inconclusive: Option<(String, Value, Vec<Evidence>)> = None;
+    // only promoted to the outcome if the scan completes without a Fail. Its
+    // LAYER rides alongside so an escalate names the escalating layer (DR-019).
+    let mut first_inconclusive: Option<(String, PermitLayer, Value, Vec<Evidence>)> = None;
     let mut verifiers_run = 0usize;
 
     for spec in set {
@@ -389,8 +497,12 @@ pub fn aggregate(
                     cas_ref: None,
                 }];
                 if first_inconclusive.is_none() {
-                    first_inconclusive =
-                        Some((spec.name.clone(), merged.clone(), evidence.clone()));
+                    first_inconclusive = Some((
+                        spec.name.clone(),
+                        spec.layer,
+                        merged.clone(),
+                        evidence.clone(),
+                    ));
                 }
                 continue;
             }
@@ -399,12 +511,14 @@ pub fn aggregate(
         match out.verdict {
             Verdict::Fail => {
                 // First Fail short-circuits → Deny carrying THIS verifier's
-                // evidence/params (Fail > any earlier Inconclusive, I6).
+                // evidence/params + its LAYER (Fail > any earlier Inconclusive,
+                // I6). The deciding layer is admin's when admin ran first (C8).
                 let deciding_evidence_ref = honest_evidence_ref(&out.evidence, cas);
                 return Ok(PermitOutcome {
                     verdict: Verdict::Fail,
                     decision: decision_for(Verdict::Fail),
                     deciding_verifier: spec.name.clone(),
+                    deciding_layer: Some(spec.layer),
                     deciding_params: merged,
                     evidence: out.evidence,
                     deciding_evidence_ref,
@@ -412,10 +526,11 @@ pub fn aggregate(
                 });
             }
             Verdict::Inconclusive => {
-                // Does NOT short-circuit; remember the first inconclusive as the
-                // fallback deciding verifier and keep scanning for a later Fail.
+                // Does NOT short-circuit; remember the first inconclusive (with
+                // its layer) as the fallback deciding verifier and keep scanning.
                 if first_inconclusive.is_none() {
-                    first_inconclusive = Some((spec.name.clone(), merged, out.evidence));
+                    first_inconclusive =
+                        Some((spec.name.clone(), spec.layer, merged, out.evidence));
                 }
             }
             Verdict::Pass => {}
@@ -423,14 +538,15 @@ pub fn aggregate(
     }
 
     // No Fail. If any Inconclusive was seen → Escalate carrying the FIRST one's
-    // evidence; else all passed → Grant.
+    // evidence + layer; else all passed → Grant.
     match first_inconclusive {
-        Some((name, params, evidence)) => {
+        Some((name, layer, params, evidence)) => {
             let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
             Ok(PermitOutcome {
                 verdict: Verdict::Inconclusive,
                 decision: decision_for(Verdict::Inconclusive),
                 deciding_verifier: name,
+                deciding_layer: Some(layer),
                 deciding_params: params,
                 evidence,
                 deciding_evidence_ref,
@@ -447,6 +563,7 @@ pub fn aggregate(
                 verdict: Verdict::Pass,
                 decision: decision_for(Verdict::Pass),
                 deciding_verifier: last.name.clone(),
+                deciding_layer: Some(last.layer),
                 deciding_params: merged,
                 evidence: Vec::new(),
                 deciding_evidence_ref: None,
@@ -509,11 +626,13 @@ pub async fn aggregate_async(
     cas: &Cas,
 ) -> Result<PermitOutcome, GateError> {
     // Empty configured set: undecidable → Escalate, never a synthesized allow (I6).
+    // No verifier decided, so there is no deciding layer to name (DR-019).
     if set.is_empty() {
         return Ok(PermitOutcome {
             verdict: Verdict::Inconclusive,
             decision: decision_for(Verdict::Inconclusive),
             deciding_verifier: String::new(),
+            deciding_layer: None,
             deciding_params: Value::Null,
             evidence: Vec::new(),
             deciding_evidence_ref: None,
@@ -522,8 +641,9 @@ pub async fn aggregate_async(
     }
 
     // The first inconclusive is the escalate-fallback deciding verifier; it is
-    // only promoted to the outcome if the scan completes without a Fail.
-    let mut first_inconclusive: Option<(String, Value, Vec<Evidence>)> = None;
+    // only promoted to the outcome if the scan completes without a Fail. Its
+    // LAYER rides alongside so an escalate names the escalating layer (DR-019).
+    let mut first_inconclusive: Option<(String, PermitLayer, Value, Vec<Evidence>)> = None;
     let mut verifiers_run = 0usize;
 
     for spec in set {
@@ -565,13 +685,14 @@ pub async fn aggregate_async(
         match verdict {
             Verdict::Fail => {
                 // First Fail short-circuits → Deny carrying THIS verifier's
-                // evidence/params (Fail > any earlier Inconclusive, across
-                // native+exec kinds, I6).
+                // evidence/params + its LAYER (Fail > any earlier Inconclusive,
+                // across native+exec kinds, I6).
                 let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
                 return Ok(PermitOutcome {
                     verdict: Verdict::Fail,
                     decision: decision_for(Verdict::Fail),
                     deciding_verifier: spec.name.clone(),
+                    deciding_layer: Some(spec.layer),
                     deciding_params: merged,
                     evidence,
                     deciding_evidence_ref,
@@ -579,10 +700,10 @@ pub async fn aggregate_async(
                 });
             }
             Verdict::Inconclusive => {
-                // Does NOT short-circuit; remember the first inconclusive as the
-                // fallback deciding verifier and keep scanning for a later Fail.
+                // Does NOT short-circuit; remember the first inconclusive (with
+                // its layer) as the fallback deciding verifier and keep scanning.
                 if first_inconclusive.is_none() {
-                    first_inconclusive = Some((spec.name.clone(), merged, evidence));
+                    first_inconclusive = Some((spec.name.clone(), spec.layer, merged, evidence));
                 }
             }
             Verdict::Pass => {}
@@ -590,14 +711,15 @@ pub async fn aggregate_async(
     }
 
     // No Fail. If any Inconclusive was seen → Escalate carrying the FIRST one's
-    // evidence; else all passed → Grant.
+    // evidence + layer; else all passed → Grant.
     match first_inconclusive {
-        Some((name, params, evidence)) => {
+        Some((name, layer, params, evidence)) => {
             let deciding_evidence_ref = honest_evidence_ref(&evidence, cas);
             Ok(PermitOutcome {
                 verdict: Verdict::Inconclusive,
                 decision: decision_for(Verdict::Inconclusive),
                 deciding_verifier: name,
+                deciding_layer: Some(layer),
                 deciding_params: params,
                 evidence,
                 deciding_evidence_ref,
@@ -613,6 +735,7 @@ pub async fn aggregate_async(
                 verdict: Verdict::Pass,
                 decision: decision_for(Verdict::Pass),
                 deciding_verifier: last.name.clone(),
+                deciding_layer: Some(last.layer),
                 deciding_params: merged,
                 evidence: Vec::new(),
                 deciding_evidence_ref: None,

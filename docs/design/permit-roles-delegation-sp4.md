@@ -40,6 +40,7 @@ A **macaroon** replaces the opaque token with a structured, HMAC-chained token: 
 
 - Three policy layers compose with **stricter-wins**: an admin-layer `[gates.permit]` deny cannot be overridden by a dev- or session-layer allow. Extends the config-resolution seam (`permit_config_for`, DR-011) to merge layers rather than read one.
 - **Precedence rule:** the aggregate already does first-`Fail`→Deny; layering means the admin layer's verifiers run first (or its denies are non-overridable). The exact composition (concatenate-ordered vs a lattice) is a design detail for the C8 slice.
+  > **Settled by [DR-019](../decisions/DR-019-c8-layered-precedence-sp4c.md):** concatenate-ordered (admin→dev→session); stricter-wins falls out of the existing monotone aggregate (no allow-override primitive), plus per-spec layer provenance so `gate_explain` names the deciding layer. Lattice rejected as premature.
 - C8 is **policy-resolution logic**, not crypto — it folds into the precedence-resolution slice, distinct from delegation.
 
 ## 6. Invariant fit

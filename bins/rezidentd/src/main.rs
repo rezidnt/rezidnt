@@ -51,6 +51,7 @@ mod unix_daemon {
     use anyhow::Context;
     use rezidnt_cas::Cas;
     use rezidnt_fabric::{EventLog, Fabric, RecvError, Subscriber};
+    use rezidnt_gate::permit::{PermitLayer, PermitVerifierSpec};
     use rezidnt_proto::{
         Hello, PROTO_VERSION, Reply, Request, decode_request, encode_hello, encode_reply,
         socket_path,
@@ -117,6 +118,65 @@ mod unix_daemon {
             .unwrap_or_else(|| PathBuf::from("cas"))
     }
 
+    /// The HOST-LEVEL admin permit layer (SP4c-wire, DR-020 §Decision 1): read
+    /// `REZIDNT_ADMIN_PERMIT` → a host TOML file with a top-level `[gates.permit]`
+    /// block (the SAME `verifiers = [{ native, params }]` shape a workspace uses),
+    /// living OUTSIDE any workspace spec — a dev physically cannot edit or reorder
+    /// it (the authority boundary). Parse each verifier into a
+    /// [`PermitVerifierSpec`] STAMPED [`PermitLayer::Admin`]. ABSENT env var ⇒ the
+    /// empty admin layer (no regression to the pre-SP4c single-source path). A set
+    /// env var pointing at a missing/malformed file is an honest startup error —
+    /// never a silently-empty admin layer that would drop the boundary.
+    fn admin_permit_layer() -> anyhow::Result<Vec<PermitVerifierSpec>> {
+        let Some(path) = std::env::var_os("REZIDNT_ADMIN_PERMIT") else {
+            return Ok(Vec::new());
+        };
+        let path = PathBuf::from(path);
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "read REZIDNT_ADMIN_PERMIT host admin permit file {}",
+                path.display()
+            )
+        })?;
+        let gate = rezidnt_run::spec::permit_gate_from_host_toml(&text).with_context(|| {
+            format!(
+                "parse [gates.permit] from host admin permit {}",
+                path.display()
+            )
+        })?;
+        // A file with no `[gates.permit]` block contributes zero admin verifiers
+        // (an admin surface that grants/denies nothing) — honest, not an error.
+        let Some(gate) = gate else {
+            return Ok(Vec::new());
+        };
+        let specs = gate
+            .verifiers
+            .iter()
+            // Same native/exec fork as the dev source (mcp.rs::permit_config_for),
+            // but STAMPED `PermitLayer::Admin` — the whole point of the boundary.
+            .filter_map(|v| {
+                if let Some(name) = &v.native {
+                    Some(PermitVerifierSpec::native_in_layer(
+                        PermitLayer::Admin,
+                        name.clone(),
+                        v.params.clone(),
+                    ))
+                } else if let Some(exec) = &v.exec {
+                    let name = v.name.clone().unwrap_or_else(|| exec.display().to_string());
+                    Some(PermitVerifierSpec::exec_in_layer(
+                        PermitLayer::Admin,
+                        name,
+                        vec![exec.display().to_string()],
+                        v.params.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(specs)
+    }
+
     pub fn run() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new().context("build tokio runtime")?;
         runtime.block_on(serve())
@@ -179,7 +239,15 @@ mod unix_daemon {
             .await
             .context("cas open task panicked")??
         };
-        let daemon = Arc::new(Daemon::new(fabric, cas, Arc::new(RunRegistry::default())));
+        // SP4c-wire (DR-020 §Decision 1): source the host-level admin permit
+        // layer from `REZIDNT_ADMIN_PERMIT` (a config file OUTSIDE any workspace
+        // spec) BEFORE serving, so `permit_config_for` merges it FIRST. Absent
+        // env var ⇒ empty admin layer ⇒ unchanged single-source behavior.
+        let admin_permit = admin_permit_layer().context("source host admin permit layer")?;
+        let daemon = Arc::new(
+            Daemon::new(fabric, cas, Arc::new(RunRegistry::default()))
+                .with_admin_permit(admin_permit),
+        );
 
         // S3-T1 remediation (I3): the open-workspace map is derived state —
         // rebuild it from log + CAS BEFORE any transport can serve a

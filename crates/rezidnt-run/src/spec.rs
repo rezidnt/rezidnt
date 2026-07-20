@@ -135,6 +135,24 @@ pub fn agent_spec_toml(spec: &AgentSpec) -> String {
     s
 }
 
+/// Parse a HOST-LEVEL permit config TOML (SP4c-wire, DR-020 §Decision 1): a file
+/// carrying ONLY a top-level `[gates.permit]` block (the same
+/// `verifiers = [{ native, params }]` shape a workspace `[gates.permit]` uses),
+/// sourced OUTSIDE any workspace spec. There is no `[project]`/`[[agent]]` here —
+/// this is the admin authority surface, not a project. Returns the `[gates.permit]`
+/// [`GateSpec`] if present, `None` if the file declares no `permit` gate. A TOML
+/// syntax error is an honest [`RunError::Spec`]; unknown tables are tolerated
+/// (serde ignores unknown fields).
+pub fn permit_gate_from_host_toml(input: &str) -> Result<Option<GateSpec>, RunError> {
+    #[derive(Deserialize)]
+    struct HostPermit {
+        #[serde(default)]
+        gates: std::collections::BTreeMap<String, GateSpec>,
+    }
+    let raw: HostPermit = toml::from_str(input).map_err(|e| RunError::Spec(e.to_string()))?;
+    Ok(raw.gates.get("permit").cloned())
+}
+
 impl ProjectSpec {
     /// Parse the §13 TOML. Unknown tables (e.g. `[[workspace.tab]]`,
     /// `[gates.*]`) are tolerated; a missing `[project]` name/repo is an

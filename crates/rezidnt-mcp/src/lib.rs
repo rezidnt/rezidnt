@@ -394,6 +394,27 @@ impl McpCore {
         self
     }
 
+    /// Wire THREE already-resolved permit layers (SP4c-wire, DR-020 §Decision 3):
+    /// the resolved `[gates.permit]` verifier set for each authority level
+    /// (admin/dev/session). Mirrors [`Self::with_permit_config`] but stores the
+    /// merged set as `PermitConfig::from_specs(compose_layers(admin, dev,
+    /// session))` — so a later (dev/session) layer can never un-Fail an earlier
+    /// (admin) layer's deny (the aggregate has no allow-override primitive, DR-019
+    /// Decision 1). The daemon-wired path resolves the three layers per-run via
+    /// the substrate (`permit_config_for`); this builder is the single-workspace /
+    /// test-double seam for injecting three pre-resolved layers.
+    pub fn with_layered_permit_config(
+        mut self,
+        admin: Vec<PermitVerifierSpec>,
+        dev: Vec<PermitVerifierSpec>,
+        session: Vec<PermitVerifierSpec>,
+    ) -> Self {
+        self.permit_config = Some(PermitConfig::from_specs(
+            rezidnt_gate::permit::compose_layers(admin, dev, session),
+        ));
+        self
+    }
+
     /// The CAS the permit natives run against: the wired one, or a
     /// lazily-opened ephemeral CAS under the OS temp dir. Opening the ephemeral
     /// store can fail (fs error); that surfaces as a decision refusal, never a
@@ -844,6 +865,13 @@ impl McpCore {
         let policy_bytes = json!({
             "gate": "permit",
             "verifier": outcome.deciding_verifier,
+            // The DECIDING LAYER (SP4c-wire, DR-020 §Decision 4): pins the
+            // authority that decided (`admin`/`dev`/`session`) alongside the
+            // (possibly ambiguous) verifier NAME, so `gate_explain` answers "why
+            // blocked" with the deciding layer — DR-019 criterion 2 made LIVE on
+            // the wire. `None` only for the empty-set escalate (no verifier
+            // decided, so no layer to name).
+            "layer": outcome.deciding_layer.map(|l| l.as_str()),
             "params": outcome.deciding_params,
         })
         .to_string();

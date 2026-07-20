@@ -401,6 +401,126 @@ pub fn start_daemon_prepared(prepare: impl FnOnce(&Path)) -> DaemonGuard {
     }
 }
 
+/// A daemon started with a HOST-LEVEL admin permit source wired OUTSIDE any
+/// workspace spec (SP4c-wire, DR-020 §Decision 1). This is the authority-boundary
+/// harness: `admin_permit_toml` is a host config file the daemon reads at startup,
+/// physically unreachable from the `spec_toml` an `open` request carries — so a
+/// dev cannot edit or reorder the admin layer. The CAS root is pinned to a
+/// returned path so the caller can read the pinned policy blob back and assert the
+/// emitted `deciding_layer` (DR-020 §Decision 4).
+///
+/// IMPLEMENTER-MUST-BUILD (the minimal host-admin surface this pins):
+///   - `rezidentd` reads env `REZIDNT_ADMIN_PERMIT` at startup; if set, it points
+///     at a host TOML file carrying a top-level `[gates.permit]` block (the SAME
+///     shape a workspace `[gates.permit]` uses — `verifiers = [{ native = ...,
+///     params = ... }]`). This is the admin layer's SOURCE, outside the
+///     workspace spec (DR-020 §Decision 1; the FORMAT is left to oracle+impl,
+///     this env+TOML shape is the minimal one these tests assume).
+///   - the daemon parses it into a `Vec<PermitVerifierSpec>` STAMPED
+///     `PermitLayer::Admin`, holds it on the `Daemon`/`McpBridge`, and
+///     `permit_config_for` returns
+///     `PermitConfig::from_specs(compose_layers(admin, dev, session))` where
+///     `dev` is the existing `workspace.spec.applied` `[gates.permit]` set
+///     (stamped `PermitLayer::Dev`) and `session` is the run/agent scope (empty
+///     here). ABSENT `REZIDNT_ADMIN_PERMIT` ⇒ empty admin layer (unchanged
+///     single-source behavior; no regression).
+///   - the emit path pins `deciding_layer` into the policy blob (DR-020
+///     §Decision 4), so the `permit.denied` fact's CAS-pinned policy carries
+///     `"layer": "admin"`.
+///
+/// RED: `REZIDNT_ADMIN_PERMIT` is not read today, so the admin layer is never
+/// sourced — the dev-layer allow decides `allow`, and no `"layer"` is pinned.
+/// This is a behavior-red harness (no new symbol needed to COMPILE it — the env
+/// var and TOML file are plain strings), so the daemon-side test is assert-red
+/// on `deny` / `layer == "admin"` until the three-source resolver lands.
+pub fn start_daemon_with_admin_permit(admin_permit_toml: &str) -> (DaemonGuard, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let cas = dir.path().join("cas");
+    // The host admin permit file lives OUTSIDE any workspace repo/spec — a
+    // sibling of the daemon's own state, set by whoever launches the daemon.
+    let admin = dir.path().join("admin-permit.toml");
+    std::fs::write(&admin, admin_permit_toml).expect("write host admin permit toml");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_rezidentd"))
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .env("REZIDNT_CAS", &cas)
+        .env("REZIDNT_ADMIN_PERMIT", &admin)
+        .spawn()
+        .expect("spawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (
+        DaemonGuard {
+            child,
+            socket,
+            db,
+            _dir: dir,
+        },
+        cas,
+    )
+}
+
+/// Attempt to start `rezidentd` with `REZIDNT_ADMIN_PERMIT` pointed at
+/// `admin_permit_path` (which may be missing or malformed) and report whether the
+/// daemon BECOMES READY — i.e. whether its socket appears within `deadline`.
+/// Returns `true` if the daemon came up (socket bound), `false` if it never did
+/// (startup aborted). Unlike [`start_daemon_with_admin_permit`], this NEVER
+/// panics on non-readiness — the whole point is to observe an honest startup
+/// FAILURE (DR-020 §Decision 1: a set-but-unreadable admin surface aborts start,
+/// never a silently-empty admin layer that drops the boundary).
+///
+/// The child is reaped before return (killed if somehow still alive), so a
+/// failing start leaks no process. `admin_permit_path` is taken as-is so the
+/// caller can point it at a nonexistent path (never written) or a file it wrote
+/// with malformed content.
+pub fn try_start_daemon_with_admin_permit_path(
+    admin_permit_path: &Path,
+    deadline: Duration,
+) -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let cas = dir.path().join("cas");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rezidentd"))
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .env("REZIDNT_CAS", &cas)
+        .env("REZIDNT_ADMIN_PERMIT", admin_permit_path)
+        .spawn()
+        .expect("spawn rezidentd");
+
+    let until = Instant::now() + deadline;
+    let mut became_ready = false;
+    loop {
+        if socket.exists() {
+            became_ready = true;
+            break;
+        }
+        // The daemon aborting startup is exactly what we want to observe: if the
+        // process has already exited it will never bind the socket.
+        if let Ok(Some(_status)) = child.try_wait() {
+            break;
+        }
+        if Instant::now() >= until {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Reap: kill if still running (a ready daemon, or a slow one), then wait so
+    // no zombie/leak survives the test.
+    let _ = child.kill();
+    let _ = child.wait();
+    became_ready
+}
+
 /// Append every line of a committed golden fixture to the event db at
 /// `db` (chain-honest: goes through the real EventLog).
 pub fn seed_db_from_fixture(db: &Path, fixture: &str) {

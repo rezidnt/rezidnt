@@ -23,20 +23,22 @@
 //! These tests pin the seam as `McpCore::with_permit_config(...)` — the MINIMAL
 //! ratified-consistent choice (a builder that injects a resolved permit-config +
 //! folded-state source, mirroring the existing `with_cas` / `with_substrate`
-//! builders and the `resources_read` fold-from-fabric idiom). They are
-//! **`#[ignore]`-gated** with this tracking note until the seam is ratified: the
-//! IMPLEMENTER MUST route to `/dr` to ratify the seam (name it: `McpSubstrate`
-//! permit-lookup method? a spec/state source keyed by run/workspace? a
-//! `with_permit_config` builder?) BEFORE un-ignoring and building. Un-ignoring
-//! without a DR is inventing an unratified BINDING seam.
+//! builders and the `resources_read` fold-from-fabric idiom). The seam is
+//! RATIFIED (DR-011, the `permit_config_for` config seam) and BUILT: all five
+//! tests below are LIVE `#[tokio::test]` and green in `/vet` — NONE is
+//! `#[ignore]`-gated. (This header formerly carried an ignore-until-ratified
+//! tracking note; DR-020 §Notes corrects it — the generic live-dispatch seam
+//! shipped in SP2/DR-013, and the three-source LAYERED wiring on top of it
+//! shipped in SP4c-wire/DR-020.)
 //! ==========================================================================
 //!
-//! RED MODE (once un-ignored): **compile-red** against `McpCore::with_permit_config`
-//! and `rezidnt_mcp::PermitConfig` (the resolved-config + folded-state injection
-//! shape), neither of which exists yet — then **assert-red** on the live
-//! multi-verifier behavior the hardcoded single-`ToolAllowlist` stub can never
-//! produce (an off-task tool escalating live, an out-of-scope path denying live,
-//! a spend-cap escalating/denying live).
+//! RED MODE (historical, now green): these were **compile-red** against
+//! `McpCore::with_permit_config` and `rezidnt_mcp::PermitConfig` (the
+//! resolved-config + folded-state injection shape) before the seam landed, then
+//! **assert-red** on the live multi-verifier behavior the earlier hardcoded
+//! single-`ToolAllowlist` stub could never produce (an off-task tool escalating
+//! live, an out-of-scope path denying live, a spend-cap escalating/denying live).
+//! The implementer turned them green; they now guard the shipped seam.
 
 mod util;
 

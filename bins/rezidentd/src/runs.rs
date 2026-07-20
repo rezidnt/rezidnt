@@ -15,6 +15,7 @@ use anyhow::Context;
 use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
 use rezidnt_gate::Verdict;
+use rezidnt_gate::permit::PermitVerifierSpec;
 use rezidnt_run::RunId;
 use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
 use rezidnt_run::badge::{Caveat, Macaroon, RootKey};
@@ -154,6 +155,14 @@ pub struct Daemon {
     /// re-mints — run-scoped agent badges never survive a restart, the accepted
     /// DR-017 §Decision 4/6 model.
     pub root_key: RootKey,
+    /// The HOST-LEVEL admin permit layer (SP4c-wire, DR-020 §Decision 1): the
+    /// resolved `[gates.permit]` verifier set sourced from a host config file
+    /// OUTSIDE any workspace spec (via `REZIDNT_ADMIN_PERMIT`), STAMPED
+    /// [`PermitLayer::Admin`]. `permit_config_for` merges it FIRST via
+    /// `compose_layers(admin, dev, session)`, so a dev cannot edit or reorder it
+    /// (the authority boundary). EMPTY when no admin source is wired — the
+    /// pre-SP4c single-source (dev-only) behavior, no regression.
+    pub admin_permit: Vec<PermitVerifierSpec>,
 }
 
 impl Daemon {
@@ -166,7 +175,18 @@ impl Daemon {
             // One key per Daemon instance = process-lifetime (a test that builds
             // a fresh Daemon gets its own key; the production daemon builds one).
             root_key: RootKey::mint(),
+            // No admin source unless `main.rs` wires one (DR-020): absent env var
+            // ⇒ empty admin layer ⇒ unchanged single-source path.
+            admin_permit: Vec::new(),
         }
+    }
+
+    /// Wire the host-level admin permit layer (SP4c-wire, DR-020 §Decision 1;
+    /// builder-style, `main.rs` calls it after reading `REZIDNT_ADMIN_PERMIT`).
+    /// The specs are already resolved + STAMPED [`PermitLayer::Admin`].
+    pub fn with_admin_permit(mut self, admin: Vec<PermitVerifierSpec>) -> Self {
+        self.admin_permit = admin;
+        self
     }
 }
 

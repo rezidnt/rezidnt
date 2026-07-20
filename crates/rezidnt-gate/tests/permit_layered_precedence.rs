@@ -44,29 +44,23 @@
 //! `PermitVerifierSpec::native`/`exec` may default their layer to `Session`
 //! (the least-authority layer) so no existing test regresses.
 //!
-//! ── DEFERRED: the LIVE three-source end-to-end (a future seam `/dr`) ────────
-//! DR-019 §"What this does NOT decide" leaves the daemon-side WIRING of the
+//! ── The LIVE three-source end-to-end (SHIPPED in SP4c-wire / DR-020) ────────
+//! DR-019 §"What this does NOT decide" left the daemon-side WIRING of the
 //! three sources (admin from host config, dev from `workspace.spec.applied`,
-//! session from the run/agent, merged in `permit_config_for`) to the
-//! implementer + a future seam `/dr` — the SAME live config-dispatch seam
-//! `crates/rezidnt-mcp/tests/permit_wire_dispatch.rs` already gates (it names
-//! the `McpCore::with_permit_config` builder question). SP4c's RATIFIED core is
-//! the composition + provenance pinned in THIS file (`compose_layers` /
-//! `PermitLayer` / `deciding_layer`), which is transport-agnostic and lives at
-//! the `rezidnt-gate` seam. The MCP-live proof (admin deny non-overridable
-//! THROUGH `request_permission`; the decision fact / `gate_explain` naming the
-//! deciding layer) is intentionally NOT written as a compiled test in this slice:
-//! it would reference a live builder (`with_layered_permit_config`) that does
-//! not exist and is out of DR-019's scope, and `#[ignore]` does not skip
-//! compilation — a compile-red MCP file would break the workspace test build /
-//! host `/vet`. When the live-seam `/dr` is drafted, the oracle work order for it
-//! is: (1) a live builder injecting three resolved layers into `McpCore`;
-//! (2) `live_admin_deny_not_overridable_by_session_allow` — same `Edit` request,
-//! admin denies, session would allow → live `deny`; (3) the emitted
-//! `permit.denied` fact + `gate_explain` surface the deciding `layer == "admin"`
-//! (two identically-named `tool-allowlist` verifiers disambiguated by authority,
-//! I6); (4) all-empty three layers → live `ask`, never `allow`. Those pin the
-//! wiring; this file pins the ratified composition they build on.
+//! session from the run/agent, merged in `permit_config_for`) to a future seam
+//! `/dr`. That `/dr` is now DR-020 (ACCEPTED), and the wiring is BUILT:
+//! `McpCore::with_layered_permit_config` injects three resolved layers,
+//! `permit_config_for` sources admin (host `REZIDNT_ADMIN_PERMIT`, outside the
+//! workspace spec) + dev (`workspace.spec.applied`) + session, and the emit path
+//! pins `deciding_layer` in the policy blob. SP4c's RATIFIED core is the
+//! composition + provenance pinned in THIS file (`compose_layers` / `PermitLayer`
+//! / `deciding_layer`), which is transport-agnostic and lives at the
+//! `rezidnt-gate` seam. The MCP-live proof (admin deny non-overridable THROUGH
+//! `request_permission`; the decision fact / `gate_explain` naming the deciding
+//! layer) now lives in `crates/rezidnt-mcp/tests/permit_layered_live.rs`, and the
+//! daemon-side authority-boundary proof (admin sourced OUTSIDE the workspace spec)
+//! in `bins/rezidentd/tests/permit_admin_layer_sourcing.rs`. This file pins the
+//! ratified composition those live tests build on.
 
 use std::collections::BTreeMap;
 

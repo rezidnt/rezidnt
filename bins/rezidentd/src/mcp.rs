@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use rezidnt_gate::permit::PermitVerifierSpec;
+use rezidnt_gate::permit::{PermitLayer, PermitVerifierSpec};
 use rezidnt_mcp::{BoxFuture, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes};
 use rezidnt_types::WorkspaceId;
 use ulid::Ulid;
@@ -145,11 +145,13 @@ impl McpSubstrate for McpBridge {
             let ws = run_workspace(&daemon, &run).await?;
 
             // 2. workspace → applied `[gates.permit]` verifier set. The registry
-            //    is derived state folded from `workspace.spec.applied` (I3).
+            //    is derived state folded from `workspace.spec.applied` (I3). This
+            //    is the DEV layer (SP4c-wire, DR-020 §Decision 1): the
+            //    dev-editable source, stamped `PermitLayer::Dev`.
             let workspaces = daemon.workspaces.lock().await;
             let entry = workspaces.get(&ws)?;
             let gate = entry.gates.get("permit")?;
-            let specs: Vec<PermitVerifierSpec> = gate
+            let dev: Vec<PermitVerifierSpec> = gate
                 .verifiers
                 .iter()
                 // SP3 (DR-015 §Decision 1/4): the permit axis dispatches BOTH
@@ -159,12 +161,21 @@ impl McpSubstrate for McpBridge {
                 // `aggregate_async` runs through `ExecVerifier` (§8 contract,
                 // network-off + scrubbed env). rezidnt dispatches the operator's
                 // argv; it never bundles a policy engine (I7).
+                //
+                // SP4c-wire (DR-020 §Decision 1): STAMPED `PermitLayer::Dev` — this
+                // source is the workspace spec, the middle authority. `permit.rs`
+                // constructors default to Session, so the layer is set explicitly.
                 .filter_map(|v| {
                     if let Some(name) = &v.native {
-                        Some(PermitVerifierSpec::native(name.clone(), v.params.clone()))
+                        Some(PermitVerifierSpec::native_in_layer(
+                            PermitLayer::Dev,
+                            name.clone(),
+                            v.params.clone(),
+                        ))
                     } else if let Some(exec) = &v.exec {
                         let name = v.name.clone().unwrap_or_else(|| exec.display().to_string());
-                        Some(PermitVerifierSpec::exec(
+                        Some(PermitVerifierSpec::exec_in_layer(
+                            PermitLayer::Dev,
                             name,
                             vec![exec.display().to_string()],
                             v.params.clone(),
@@ -174,7 +185,20 @@ impl McpSubstrate for McpBridge {
                     }
                 })
                 .collect();
-            Some(PermitConfig::from_specs(specs))
+
+            // 3. Compose the THREE sourced layers (SP4c-wire, DR-020 §Decision
+            //    1/2): ADMIN from the host source (outside the workspace spec,
+            //    already Admin-stamped on the `Daemon`), DEV from the workspace
+            //    spec above, SESSION from the run/agent scope (empty for now — the
+            //    future per-run session layer). `compose_layers` concatenates them
+            //    admin→dev→session; the flat aggregate consumer path is UNCHANGED
+            //    (frozen by DR-019 Decision 1). Only the RESOLUTION merges three
+            //    layers with provenance instead of reading one.
+            let admin = daemon.admin_permit.clone();
+            let session: Vec<PermitVerifierSpec> = Vec::new();
+            Some(PermitConfig::from_specs(
+                rezidnt_gate::permit::compose_layers(admin, dev, session),
+            ))
         })
     }
 }

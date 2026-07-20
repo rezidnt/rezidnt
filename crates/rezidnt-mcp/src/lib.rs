@@ -843,6 +843,18 @@ impl McpCore {
                 "window_action_count".to_string(),
                 json!(folded.permit_accumulators.granted),
             );
+            // DR-024 (C6): inject the folded running risk score so RiskCap can
+            // project (`cumulative_risk_score + this-action risk`) against its
+            // caps. `risk_score` is the deterministic, replayable accumulator the
+            // PDP owns (folded from prior GRANTED permit facts, I3) — mirror the
+            // `cumulative_spend_usd` injection above. RiskCap's caps + scorer table
+            // ride its OWN spec params (merged over this base), NOT injected here;
+            // this-action risk is COMPUTED by the verifier from the axis (DR-024
+            // Q4). Content-pinned, never live state (determinism BINDING).
+            obj.insert(
+                "cumulative_risk_score".to_string(),
+                json!(folded.permit_accumulators.risk_score),
+            );
         }
 
         let input = rezidnt_gate::VerifierInput {
@@ -911,6 +923,29 @@ impl McpCore {
         // evidence blob's size (I3 fact fidelity).
         let evidence_ref = outcome.deciding_evidence_ref.clone();
 
+        // DR-024 C6 (Q5 producer seam): stamp `risk_delta` onto a GRANTED fact
+        // ONLY (the granted-only fold source, Q3). The delta is the SHARED
+        // `risk_score` fn on the SAME content-pinned axis + table RiskCap used for
+        // its verdict, so the stamped scalar and the verdict CANNOT diverge (Q5
+        // option iii — no `VerifierOutput`/`PermitOutcome` risk field). A denied or
+        // escalated action never ran, so it carries no delta (nothing to fold).
+        // If no `risk-cap` verifier is configured (no table), no delta is stamped.
+        let risk_delta = if outcome.decision == rezidnt_gate::permit::PermitDecision::Grant {
+            config
+                .verifiers()
+                .iter()
+                .find(|spec| spec.name == "risk-cap")
+                .map(|spec| {
+                    // Reconstruct RiskCap's exact view: the request axis with the
+                    // verifier's own spec params (the `risk_table`) merged over it.
+                    let merged = rezidnt_gate::permit::merge_params(&input.params, &spec.params);
+                    let table = merged.get("risk_table").cloned().unwrap_or(Value::Null);
+                    rezidnt_gate::risk_score(&merged, &table)
+                })
+        } else {
+            None
+        };
+
         let (subject, payload) = rezidnt_gate::permit::decided_fact(
             outcome.verdict,
             &run,
@@ -920,6 +955,7 @@ impl McpCore {
             reason.as_deref(),
             rezidnt_gate::permit::DecisionDeltas {
                 cost_ms: Some(cost_ms),
+                risk_delta,
                 ..Default::default()
             },
         );

@@ -414,7 +414,11 @@ fn honest_evidence_ref(evidence: &[Evidence], cas: &Cas) -> Option<CasRef> {
 /// so we start from the request axis and overlay the verifier's keys (verifier
 /// config wins on a key collision — the config is the policy). Non-object
 /// verifier params are ignored (there is nothing to overlay).
-fn merge_params(request: &Value, verifier: &Value) -> Value {
+///
+/// `pub` so the emit site can reconstruct a verifier's EXACT pinned view (request
+/// axis ∪ its spec params) to stamp a delta the verdict cannot diverge from —
+/// DR-024 Q5's shared-input guarantee for the `risk-cap` producer seam.
+pub fn merge_params(request: &Value, verifier: &Value) -> Value {
     let mut merged = request.clone();
     if let (Some(target), Some(overlay)) = (merged.as_object_mut(), verifier.as_object()) {
         for (k, v) in overlay {

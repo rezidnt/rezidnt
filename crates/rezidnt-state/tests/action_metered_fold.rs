@@ -148,7 +148,8 @@ fn permit_granted_stray_spend_folds_zero_source_moved() {
                 "policy_ref": {"hash": "50urc3m0v3d0000000000000000000000000000000000000000000000000001", "bytes": 32, "mime": "application/octet-stream"},
                 // RETIRED as the C1 fold source (DR-021) — must be IGNORED.
                 "spend_delta_usd": 8.0,
-                // risk_delta STAYS on the permit path (C6, untouched).
+                // risk_delta rides the permit path; on the GRANTED arm it folds
+                // into the running score (DR-024 Q3 — granted-only fold).
                 "risk_delta": 2.0,
             }),
         )]
@@ -162,7 +163,8 @@ fn permit_granted_stray_spend_folds_zero_source_moved() {
     );
     assert_eq!(
         acc.risk_score, 2.0,
-        "risk_delta STILL folds off the permit fact — C6 is untouched by DR-021"
+        "a GRANTED action's risk_delta folds off the permit fact into the running score \
+         (DR-024 Q3 granted-only fold — this is the granted arm, so it counts)"
     );
     assert_eq!(acc.granted, 1, "the grant is still counted as a decision");
 }

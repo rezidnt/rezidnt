@@ -19,7 +19,9 @@
 //! reason?, risk_delta?, ...}`. Per DR-021 the C1 spend fold source moved OFF
 //! the permit facts: `spend_delta_usd?` is RETIRED from the permit payloads and
 //! now rides the post-action `action.metered` fact (folded there, not here).
-//! `risk_delta?` STAYS on the permit path (C6, untouched).
+//! `risk_delta?` rides the permit path but per DR-024 Q3 (C6) folds into the
+//! running score ONLY on the `permit.granted` arm — a denied/escalated action
+//! never ran, so its assessed risk folds ZERO (no phantom charge, I3).
 
 use rezidnt_state::{Materializer, fold};
 use rezidnt_types::{Event, SourceId, Subject};
@@ -127,7 +129,14 @@ fn deny_folds_reason_and_accumulates() {
         "the denial reason folds verbatim (I6)"
     );
     assert_eq!(run.permit_accumulators.denied, 1);
-    assert_eq!(run.permit_accumulators.risk_score, 3.0);
+    // DR-024 Q3 (C6): a DENIED action never ran, so its risk_delta folds ZERO —
+    // no phantom charge. The permit fact still RECORDS the pre-action assessment,
+    // but the accumulator COUNTS only granted risk (granted-only fold).
+    assert_eq!(
+        run.permit_accumulators.risk_score, 0.0,
+        "a denied action's risk_delta folds ZERO — the running score counts only actions that \
+         RAN (DR-024 Q3 granted-only fold)"
+    );
 }
 
 /// CRITERION 3 (fold leg) — an ESCALATE folds as `escalated`, NEVER coerced to
@@ -241,7 +250,9 @@ mod props {
     proptest! {
         /// For ARBITRARY interleavings of permit decisions across two runs:
         /// (a) each run's accumulators equal an independently computed model —
-        /// per-outcome counts and summed spend/risk deltas; and (b) incremental
+        /// per-outcome counts, summed spend (from action.metered), and summed
+        /// GRANTED-only risk deltas (DR-024 Q3: denied/escalated risk folds zero);
+        /// and (b) incremental
         /// Materializer application equals fold-from-zero (the release-blocking
         /// `fold(log) == snapshot` / rebuild family). `rebuild` is exactly
         /// fold-from-zero, so (b) is "rebuild reproduces the permit state."
@@ -276,7 +287,12 @@ mod props {
                 let m = model.entry(RUNS[r]).or_default();
                 match k { 0 => m.granted += 1, 1 => m.denied += 1, _ => m.escalated += 1 }
                 m.spend += s as f64;
-                m.risk += rk as f64;
+                // DR-024 Q3 (C6): risk folds on the GRANTED arm ONLY (kind 0). A
+                // denied/escalated action never ran, so its risk_delta folds ZERO
+                // — the model charges risk only for grants (granted-only fold).
+                if k == 0 {
+                    m.risk += rk as f64;
+                }
             }
 
             let folded = fold(events.iter());

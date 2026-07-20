@@ -745,13 +745,20 @@ fn apply_permit_decision(graph: &mut Graph, event: &Event, decision: &str) {
     let acc = &mut state.permit_accumulators;
     // DR-021 B2 (C1): `spend_delta_usd` is RETIRED as the permit-path fold source;
     // the permit fact now folds ZERO spend. Measured spend rides the post-action
-    // `action.metered` fact instead (the `action.metered` arm above). `risk_delta`
-    // (C6) is UNTOUCHED and stays on the permit path.
-    if let Some(risk) = payload["risk_delta"].as_f64() {
-        acc.risk_score += risk;
-    }
+    // `action.metered` fact instead (the `action.metered` arm above).
     match decision {
-        "granted" => acc.granted += 1,
+        // DR-024 Q3 (C6): fold `risk_delta` on the GRANTED arm ONLY. Only an
+        // action that ACTUALLY RAN contributes running risk; a denied or escalated
+        // action never ran, so folding its assessed risk would be a phantom charge
+        // — the exact I3 dishonesty DR-021 B2 refused for spend. The permit fact
+        // still RECORDS the pre-action assessment on every arm; the accumulator
+        // COUNTS only granted risk.
+        "granted" => {
+            if let Some(risk) = payload["risk_delta"].as_f64() {
+                acc.risk_score += risk;
+            }
+            acc.granted += 1;
+        }
         "denied" => acc.denied += 1,
         "escalated" => acc.escalated += 1,
         _ => {}

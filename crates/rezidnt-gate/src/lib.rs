@@ -745,6 +745,158 @@ impl NativeVerifier for SpendCap {
     }
 }
 
+/// The SHARED deterministic risk scorer (DR-024 C6, Q1/Q5). Scores THIS action's
+/// risk from the pinned request `axis` (`tool`/`paths`/`role`) against the config
+/// `table`, as the SUM of three independent factors:
+///
+/// - per-tool base risk: `table.base[tool]` (an unlisted tool → 0.0);
+/// - a path-sensitivity modifier: `table.path_modifier` added ONCE if ANY of the
+///   axis `paths` matches ANY glob in `table.sensitive_paths` (no match → 0.0);
+/// - a role modifier: `table.role_modifier[role]` (an unlisted role → 0.0).
+///
+/// Pure, deterministic, NO network/inference/IO (I6/I7): the SAME axis + table
+/// yield the SAME scalar, replayable from content-pinned params. The WEIGHTS live
+/// in the config `table` and are NEVER hardcoded (DR-024 "does NOT decide" — the
+/// numbers are tuning, the STRUCTURE is the contract). Both [`RiskCap::verify`]
+/// (for its soft/hard verdict) and the emit site (to stamp `risk_delta` on the
+/// `permit.granted` fact) call THIS fn on the identical content-pinned inputs, so
+/// the verdict and the folded delta CANNOT diverge (DR-024 Q5 option iii — the
+/// contract-free producer seam).
+pub fn risk_score(axis: &Value, table: &Value) -> f64 {
+    let base = axis
+        .get("tool")
+        .and_then(Value::as_str)
+        .and_then(|tool| table.pointer("/base").and_then(|b| b.get(tool)))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    let sensitive = glob_list(table, "sensitive_paths");
+    let touches_sensitive = axis
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|p| sensitive.iter().any(|g| glob_match(g, p)))
+        })
+        .unwrap_or(false);
+    let path_modifier = if touches_sensitive {
+        table
+            .get("path_modifier")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    let role_modifier = axis
+        .get("role")
+        .and_then(Value::as_str)
+        .and_then(|role| table.pointer("/role_modifier").and_then(|r| r.get(role)))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    base + path_modifier + role_modifier
+}
+
+/// Permit native (DR-024 C6): the running per-run RISK score vs. a soft/hard cap
+/// — the RISK analogue of [`SpendCap`]. THIS action's risk is COMPUTED inside the
+/// verifier by the shared [`risk_score`] fn from the pinned request axis
+/// (`tool`/`paths`/`role`) + the config `risk_table` (DR-024 Q4 — NOT injected).
+/// The folded `cumulative_risk_score` (prior GRANTED actions) arrives as a PINNED
+/// input the PDP injects from `PermitAccumulators` (I3, determinism BINDING — the
+/// native never touches live state).
+///
+/// Verdicts mirror [`SpendCap`] EXACTLY: projected (`cumulative_risk_score +
+/// this-action risk`) under the soft cap → Pass; soft ≤ projected < hard →
+/// **Inconclusive** (escalate to a human, NEVER coerced, I6, DR-008 §4);
+/// projected ≥ hard → Fail; caps MISSING → Inconclusive (cannot-run — garbage
+/// never coerces to a pass, I6). The soft-band/hard-cap evidence NAMES each
+/// contributing factor (per-tool base, path modifier, role modifier) so
+/// `gate_explain` answers "why this risk" (I6 interrogability, DR-024 crit 3).
+pub struct RiskCap;
+
+impl NativeVerifier for RiskCap {
+    fn name(&self) -> &'static str {
+        "risk-cap"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        let p = &input.params;
+        let num = |key: &str| p.get(key).and_then(Value::as_f64);
+        // The caps are the load-bearing inputs: absent caps are undecidable.
+        let (Some(soft), Some(hard)) = (num("soft_cap_risk"), num("hard_cap_risk")) else {
+            return Ok(cannot_run(
+                "no soft/hard risk cap in params — undecidable, not a pass (I6)",
+            ));
+        };
+        // The scorer table rides the verifier's own spec params (merged over the
+        // request axis). This-action risk is COMPUTED here (never injected) from
+        // the pinned axis + table via the SHARED fn — the same scalar the emit
+        // site stamps (DR-024 Q5).
+        let table = p.get("risk_table").cloned().unwrap_or(Value::Null);
+        let cumulative = num("cumulative_risk_score").unwrap_or(0.0);
+        let this_action = risk_score(p, &table);
+        let projected = cumulative + this_action;
+
+        // Name the request axis for interrogable evidence (I6, DR-024 crit 3).
+        let tool = p.get("tool").and_then(Value::as_str).unwrap_or("(none)");
+        let role = p.get("role").and_then(Value::as_str).unwrap_or("(none)");
+        let sensitive = glob_list(&table, "sensitive_paths");
+        let touched: Vec<String> = p
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|path| sensitive.iter().any(|g| glob_match(g, path)))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The three contributing factors, each NAMED (per-tool base, path
+        // modifier, role modifier), so `gate_explain` surfaces the breakdown.
+        let breakdown = format!(
+            "per-tool base tool={tool}; path modifier sensitive-paths=[{}]; role modifier role={role}",
+            touched.join(", ")
+        );
+
+        // Hard cap: at/over → deny. Evidence blob → CAS, ref carried (I2).
+        if projected >= hard {
+            return fail_evidence(
+                cas,
+                "hard-risk-cap-exceeded",
+                &format!("projected risk {projected:.2} at/over hard cap {hard:.2} ({breakdown})"),
+            );
+        }
+        // Soft band (soft ≤ projected < hard): escalate to a human. NEVER coerced
+        // to a pass or an auto-deny (I6, DR-008 §4). The evidence names the
+        // crossing AND each factor so the escalation is interrogable.
+        if projected >= soft {
+            let msg = format!(
+                "projected risk {projected:.2} crossed soft cap {soft:.2} (< hard {hard:.2}) — escalate ({breakdown})"
+            );
+            let ev = cas.put(msg.as_bytes(), "text/plain")?;
+            return Ok(VerifierOutput {
+                verdict: Verdict::Inconclusive,
+                evidence: vec![Evidence {
+                    kind: "soft-risk-cap-crossed".to_string(),
+                    msg,
+                    cas_ref: Some(format!("cas:blake3:{}", ev.hash)),
+                }],
+                cost_ms: 0,
+            });
+        }
+        // Under the soft cap: allow.
+        Ok(VerifierOutput {
+            verdict: Verdict::Pass,
+            evidence: vec![],
+            cost_ms: 0,
+        })
+    }
+}
+
 /// Permit native (SP-intent, DR-010 C7): the `intent-lock` run-intent check.
 /// The requested action's `tool` (a `params` scalar, same key
 /// [`ToolAllowlist`] uses) must be in the run's DECLARED, content-pinned intent
@@ -848,6 +1000,7 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(ToolAllowlist),
         Box::new(PathScope),
         Box::new(SpendCap),
+        Box::new(RiskCap),
         Box::new(IntentLock),
     ]
 }

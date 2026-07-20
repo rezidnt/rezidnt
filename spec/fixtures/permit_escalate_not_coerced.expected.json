@@ -25,7 +25,7 @@
       },
       "permit_accumulators": {
         "cumulative_spend_usd": 0.0,
-        "risk_score": 5.0,
+        "risk_score": 0.0,
         "granted": 0,
         "denied": 0,
         "escalated": 1

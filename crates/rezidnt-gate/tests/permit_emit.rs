@@ -300,14 +300,18 @@ fn granted_fact_emits_spend_risk_and_cost_deltas() {
     );
 }
 
-/// A DENY may still contribute risk (a denied sensitive attempt is signal, C6)
-/// while charging no spend and measuring cost. Only the PRESENT deltas appear;
-/// the absent `spend_delta_usd` is OMITTED, never null (the reducer's
-/// `payload["spend_delta_usd"].as_f64()` must see absence, not a null-that-is-0).
-///
-/// COMPILE-RED until the new signature lands.
+/// CONSTRUCTOR MECHANICS (not production policy) — `decided_fact` stamps ONLY
+/// the deltas it is handed and OMITS the absent ones (never a JSON `null`, so the
+/// reducer's `payload[...].as_f64()` sees absence, not a null-that-is-0). This
+/// exercises the constructor in isolation: it is agnostic to which decision
+/// carries which delta. It does NOT model the production emit policy — in
+/// production a DENY is handed NO spend and NO risk (the emit site stamps
+/// `risk_delta` only on a Grant, and the reducer folds risk granted-only, DR-024
+/// C6); so here the denied fact is handed spend=None AND risk=None, and only the
+/// measured `cost_ms` is present. The point pinned is the mechanical
+/// present-stamped / absent-omitted contract, on whatever fact.
 #[test]
-fn denied_fact_emits_only_present_deltas_and_omits_absent() {
+fn decided_fact_stamps_present_deltas_and_omits_absent_ones() {
     let policy = cas_ref(
         "po11c1000000000000000000000000000000000000000000000000000000d2",
         80,
@@ -324,8 +328,10 @@ fn denied_fact_emits_only_present_deltas_and_omits_absent() {
         Some(&evidence),
         Some("path outside allowed scope"),
         DecisionDeltas {
-            spend_delta_usd: None, // a denied action was never charged
-            risk_delta: Some(3.0),
+            // Production hands a DENY neither spend nor risk (risk is stamped only
+            // on a Grant, DR-024 C6). Only the measured cost rides.
+            spend_delta_usd: None,
+            risk_delta: None,
             cost_ms: Some(2),
         },
     );
@@ -334,7 +340,11 @@ fn denied_fact_emits_only_present_deltas_and_omits_absent() {
         payload.get("spend_delta_usd").is_none(),
         "an absent spend delta is OMITTED, never emitted as JSON null (I3 fold correctness)"
     );
-    assert_eq!(payload["risk_delta"].as_f64(), Some(3.0));
+    assert!(
+        payload.get("risk_delta").is_none(),
+        "an absent risk delta is OMITTED, never emitted as JSON null (I3 fold correctness)"
+    );
+    // The one PRESENT delta is stamped verbatim — the mechanical contract.
     assert_eq!(payload["cost_ms"].as_u64(), Some(2));
 }
 
@@ -418,7 +428,8 @@ fn emitted_deltas_fold_through_the_state_reducer() {
     );
     assert_eq!(
         acc.risk_score, 2.0,
-        "the emitted risk_delta STILL folds off the permit fact — C6 untouched by DR-021"
+        "the emitted risk_delta folds off the GRANTED permit fact; denied/escalated fold zero \
+         (DR-024 C6 granted-only fold) — this fact is a grant, so its risk counts"
     );
     assert_eq!(acc.granted, 1, "the grant is counted");
 }

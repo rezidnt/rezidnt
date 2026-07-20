@@ -91,11 +91,13 @@ fn cost_ms_never_perturbs_spend_or_risk_and_is_rebuild_safe() {
                    "policy_ref": {"hash": "co57m50n1y00000000000000000000000000000000000000000000000cost2", "bytes": 8, "mime": "application/octet-stream"},
                    "cost_ms": 7}),
         ),
-        // A risk decision that ALSO carries cost_ms — the risk folds, the cost_ms
-        // does not. Spend NO LONGER rides the permit fact (DR-021 fold source
-        // moved); risk_delta STAYS (C6, untouched).
+        // A GRANTED risk decision that ALSO carries cost_ms — the risk folds
+        // (granted arm, DR-024 Q3), the cost_ms does not. Spend NO LONGER rides
+        // the permit fact (DR-021 fold source moved). The fact is GRANTED so the
+        // risk_delta contributes: a denied/escalated risk would fold ZERO (Q3),
+        // which would not exercise "risk folds while cost_ms does not".
         ev(
-            "permit.denied",
+            "permit.granted",
             json!({"run": RUN, "request_id": REQ_SPEND,
                    "policy_ref": {"hash": "co57m5w17h5p3nd000000000000000000000000000000000000000000cost3", "bytes": 8, "mime": "application/octet-stream"},
                    "risk_delta": 4.0, "cost_ms": 99}),

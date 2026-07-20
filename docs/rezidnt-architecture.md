@@ -381,8 +381,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-021](decisions/DR-021-live-spend-cap-c1.md) | Live spend-cap (C1): spend measured post-action, off the permit fact (B2) | ACCEPTED | §8, §9 |
 | [DR-022](decisions/DR-022-benchmark-harness-slice.md) | Benchmark-harness slice: in-repo three-metric dogfood, precision/recall fenced external | ACCEPTED | §15, §16, §17 |
 | [DR-023](decisions/DR-023-shared-daemon-driving-client.md) | Extract shared `rezidnt-client` socket driver (unblocks DaemonDriver); fixtures stay dev-only test-support | ACCEPTED | §4 |
+| [DR-024](decisions/DR-024-running-risk-cap-c6.md) | Running-risk cap (C6): deterministic rule-table scorer, pre-action, granted-only fold, contract-free shared-scorer seam | ACCEPTED | §8, §9 |
 
-*The next record is DR-024.*
+*The next record is DR-025.*
 
 ---
 

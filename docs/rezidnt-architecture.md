@@ -364,8 +364,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-014](decisions/DR-014-permit-pep-hook.md) | Permit PEP hook binary + spawn injection (SP2 hook sub-slice) | ACCEPTED | §9, §16 |
 | [DR-015](decisions/DR-015-permit-exec-verifier.md) | Permit axis dispatches exec verifiers (SP3 bring-your-own policy DSL) | ACCEPTED | §8, §9, §16 |
 | [DR-016](decisions/DR-016-permit-roles-sp4-slicing.md) | SP4 slicing + SP4a roles scope | ACCEPTED | §8, §9, §16 |
+| [DR-017](decisions/DR-017-permit-macaroon-delegation-sp4b.md) | SP4b macaroon-attenuated delegation (crypto + dep choice) | ACCEPTED | §12, §16 |
 
-*The next record is DR-017.*
+*The next record is DR-018.*
 
 ---
 

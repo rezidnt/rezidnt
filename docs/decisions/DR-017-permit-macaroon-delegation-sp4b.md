@@ -1,0 +1,50 @@
+[← Decision records index](../rezidnt-architecture.md#20-decision-records) · [Architecture plan](../rezidnt-architecture.md)
+
+# Decision Record DR-017 — SP4b macaroon-attenuated delegation (crypto + dep choice)
+
+**Date:** 2026-07-19 · **Status:** ACCEPTED (owner) · **Amends:** §16 (roadmap — concretizes the DR-016 SP4b sub-slice as the SP4 crypto slice) / §12 (badge door — `check_badge` flips from id-equality to macaroon-verify + caveat-eval on state-mutating calls); no invariant text is rewritten. **Cites:** design sketch [`docs/design/permit-macaroon-delegation-sp4b.md`](../design/permit-macaroon-delegation-sp4b.md) (two decisions owner-ratified 2026-07-19: §10.1 hand-roll over blake3-keyed / zero dep, §10.2 new `permit.delegated` subject); [DR-016](DR-016-permit-roles-sp4-slicing.md) §Decision 3 (the SP4b direction this concretizes) + §Consequences (the monotonicity invariant recorded to govern SP4b); [DR-005](DR-005-badge-consolidation.md) (badge bundle — promotes its PROVISIONAL macaroon item; operator-badge boundary respected). **Builds on:** [permit-engine](../design/permit-engine.md) §7 (RBAC & delegation), §10.3 (dilution honesty); SP4a roles (DR-016), SP1–SP3 permit verifiers.
+
+## Context
+
+DR-016 §Decision 3 ratified the SP4b *direction* (agent badges become macaroons) but explicitly **deferred** the concrete crypto: *"a permissive Rust macaroon crate is evaluated against the approved-dep set FIRST, hand-rolling only as fallback if none clears the license/dep/audit bar … decidable only after evaluation, since it touches the approved-dep set + I7."* This record is that deferred decision. The evaluation is done (sketch §3); this DR ratifies the crypto, the construction, the badge migration, and the delegation fact.
+
+**Crate evaluation (the gating step DR-016 required — sketch §3):**
+
+| Candidate | License | Maintenance | Fit | Verdict |
+|---|---|---|---|---|
+| `macaroon` (macaroon-rs) | MIT ✓ | Stale — last release Oct 2022, pre-1.0 (0.3.0), ~46K downloads | true macaroon (HMAC, first-party caveats) | **Rejected** — fails the audit/maintenance bar for security-critical delegation crypto. |
+| `rusty-macaroon` | — | Alpha, "NOT READY FOR PRODUCTION" | v2 spec | Rejected (alpha). |
+| `libmacaroon-rs` | — | Deprecated | — | Rejected (deprecated). |
+| `biscuit-auth` | Apache-2.0 ✓ | Healthy — v6.0.0 Jul 2025, 10.3M downloads | Mismatch: public-key crypto + Datalog authz language | **Rejected (over-fit)** — public-key verification rezidnt doesn't need (the daemon is sole minter+verifier); its Datalog authz language competes with the SP3 exec-verifier policy model; Ed25519 + Datalog + protobuf is a heavy I7 surface. |
+
+**The clinching finding:** rezidnt **already vendors `blake3`**, and `blake3::keyed_hash` is a vetted keyed-MAC (BLAKE3's specified keyed mode — a PRF). A first-party-caveat macaroon over it is an ~80-line envelope; `rand` (already vendored) mints the root key + identifier. Hand-roll is **zero new dependency** — the DR-016 fallback, and the *better* option, not a compromise: the crypto **primitive** stays a vetted crate; only the thin caveat-chain envelope is ours (property-testable), decisively beating both the stale `macaroon` crate and the over-heavy `biscuit`.
+
+**Strongest counterargument (dissent — permit-engine §10.3, restated verbatim):** *"Strategic dilution (the strongest counterargument). rezidnt's defensible wedge (§18) is evidence-gates — 'none of which their model rewards.' Entering the permissions arena fights Omnigent head-on where they have a head start, and risks blurring the one thing nobody else does. Counter: the permit+verify unification on a single replayable log is itself novel, and the marginal build cost is bounded because the seam (vet + badges + verifier kinds) already exists."* **Applied to SP4b:** this is the crypto slice — the most tempting place to over-build (a full macaroon/discharge stack). It is bounded precisely because delegation **rides the existing badge seam** (`check_badge`, `SpawnPlan` injection under `REZIDNT_BADGE`) and **adds no dependency**; first-party caveats only (no third-party discharge — the daemon is the sole authority). The owner accepts this crypto scope knowingly.
+
+## Decision (ratify the SP4b crypto + dep + delegation fact)
+
+1. **Macaroon impl (sketch §3/§10.1) — LOAD-BEARING: hand-roll a first-party-caveat macaroon over the vendored `blake3::keyed_hash` MAC; ZERO new dependency (I7).** This is the DR-016 §Dec 3 fallback and the better option, not a compromise (evaluation above). The crypto primitive stays a vetted crate (blake3 keyed-hash); only the ~80-line caveat-chain envelope is ours. `rand` (already vendored) mints the root key + identifier. This touches the approved-dep set + I7 — exactly what DR-016 deferred here.
+
+2. **The construction (sketch §4) — first-party caveats only.** Daemon process-lifetime 256-bit root key (`rand`-minted at startup, never on the fabric). A caveat is a small structured first-party predicate serialized deterministically (`workspace` / `verb` / `expiry` / `role`). **Mint** at spawn: identifier binds the run, base caveats = the run's scope, serialized + injected under `REZIDNT_BADGE`. **Attenuate** (a lead agent, offline): append a narrowing caveat + re-key the running sig with blake3-keyed — **no root key needed** (the delegation property). **Verify** (`check_badge`): recompute the sig chain from the root key, constant-time compare, then evaluate every caveat against the request context; any unsatisfied caveat refuses. No third-party discharge macaroons — the daemon is the sole authority.
+
+3. **Monotonicity is the BINDING security invariant (I6, sketch §5).** Attenuation only NARROWS: `capability(verify(M+c)) ⊆ capability(verify(M))`; a widening bug is privilege escalation. Property-tested, plus forgery/tamper/reorder rejection (a removed, reordered, or edited caveat — or a forged sig — fails verify as the keyed-MAC chain breaks) and constant-time sig comparison (no timing oracle). **Expiry is a caveat evaluated against a passed-in timestamp — no ambient `now()` inside the verifier** (replayable, I6).
+
+4. **Badge migration (sketch §6/§10.3).** Agent badges become macaroons: `REZIDNT_BADGE` carries the serialized macaroon; `badge_id` stays `blake3(identifier)[..8]` (loggable, unchanged shape on `agent.spawned`). `check_badge` flips from id-equality to macaroon-verify + caveat-eval — the one behavioral change on the §12 state-mutating-call door. **The operator badge stays the DR-005 opaque daemon-lifetime class — untouched** (possession of the 0600 lockfile = capability; not per-run, needs no attenuation).
+
+5. **Delegation fact (sketch §7/§10.2) — a new `permit.delegated {parent_badge_id, child_badge_id, added_caveats, run}` subject + folding reducer (I3).** A delegation is a new event in time on the `permit.*` axis (a capability was narrowed and handed off) — it earns a row, unlike the SP4a spawn-time role field. **Requires a warden `/subject`** (named here as required SP4b work); this record does NOT design the taxonomy.
+
+6. **Root-key lifetime (sketch §9/§10.4) — process-lifetime.** Badges are run-scoped and short-lived (DR-005 expiry); a daemon restart re-mints and invalidates in-flight badges — acceptable and honest, matching the operator-badge daemon-lifetime model.
+
+7. **Threat model (sketch §9/§10.5).** SP4b **defends against** a compromised sub-agent widening its badge (monotonicity — a widening attempt breaks the MAC), and against tampered/forged/reordered macaroons (verify fails). It does **NOT** defend against a compromised *daemon* — the daemon holds the root key, out of scope, the same limit as any root-of-trust.
+
+## Consequences
+
+- **§16 roadmap delta:** SP4b (macaroon-attenuated delegation) is concretized as the **SP4 crypto sub-slice** — the DR-016 line "gated on its own dep-clearing DR" is now cleared by this record. permit-engine §7 (RBAC & delegation) advances from the SP4a role seam to attenuable capability.
+- **§12 badge-door delta:** `check_badge` changes from `badge_id`-equality to **macaroon-verify + caveat-eval** on state-mutating calls; read-class calls (`gate_explain`, `tail_events`, DR-005) stay unbadged.
+- **Approved-dep set:** **NO new dependency** — `blake3` and `rand` are already vendored; the hand-roll is the explicitly I7-clean outcome the evaluation reached. The `macaroon` and `biscuit-auth` crates are recorded rejected (above).
+- **Invariants touched vs untouched:** no invariant text is rewritten. **I7 upheld** — zero new dependency; the crypto primitive is a vetted crate, only the envelope is ours. **I6** — monotonicity is BINDING and property-tested; verify is deterministic (expiry evaluated against a passed-in timestamp, no ambient clock); `gate_explain` surfaces which caveat refused. **I3** — the delegation is a durable fact (`permit.delegated`); the capability chain replays. **I2** — a macaroon (identifier + a few caveats) is small, inline under `REZIDNT_BADGE`, never CAS. **I1/I4/I5** unchanged — verification stays behind `check_badge`, core/headless.
+- **Warden `/subject` required** — the new `permit.delegated` subject + reducer is gated; SP4b is not done until it is minted.
+- **Risk-register (§18) delta — scope-gravity / strategic dilution (permit-engine §10.3, restated verbatim above).** SP4b is the crypto slice, bounded because it rides the existing badge seam (`check_badge`, `SpawnPlan` injection) and adds no dependency; first-party caveats only.
+- **No existing test or acceptance criterion is weakened.** In plain words: the macaroon monotonicity property is a **tightening** to be property-tested (a widening bug that today's opaque token cannot even express is now a hard-fail); the badge door goes from a name-match to a cryptographic verify. Nothing existing is relaxed. New SP4b criteria arrive via the oracle.
+
+*Amendments to this record require DR-018.*

@@ -205,7 +205,15 @@ mod unix_daemon {
                 rezidnt_mcp::BadgeBook::new(),
             )
             .with_cas(Arc::clone(&daemon.cas))
-            .with_substrate(bridge),
+            .with_substrate(bridge)
+            // SP4b (DR-017 §Decision 6): verify agent macaroons against the SAME
+            // process-lifetime root key the daemon MINTS them with. A clone shares
+            // the 32-byte secret — the daemon (`launch_agent`) mints, this core
+            // (`check_badge` Path 2) verifies; both anchor to one key. Without this
+            // the production core was keyless — every agent macaroon on a mutating
+            // call would be `badge.invalid` (the open seam the auditor flagged).
+            // The key is NEVER on the fabric (I2/design §4).
+            .with_root_key(daemon.root_key.clone()),
         );
 
         // S3 (doc §9, I5): the loopback-HTTP MCP transport, requested via

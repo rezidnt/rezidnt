@@ -87,6 +87,25 @@ pub struct IntegrityAlarmRecord {
     pub replayed: String,
 }
 
+/// DR-017 §Decision 2 (SP4b): one folded `permit.delegated` fact — a capability
+/// edge where a lead agent's badge was attenuated (a narrowing caveat appended,
+/// re-keyed offline) into a child badge for a sub-agent spawn. Folded onto the
+/// run's dossier so the capability chain replays (I3). `added_caveats` is folded
+/// VERBATIM (the tagged `Caveat` JSON objects) — the reducer never re-derives
+/// the crypto; the log is truth. Rebuild-stable via the same `#[serde(default)]`
+/// discipline `integrity_alarms` / `permit_ledger` / `intent` use.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DelegationRecord {
+    /// Loggable badge id of the PARENT (lead-agent) badge that was attenuated
+    /// (`hex(blake3(sig)[..8])`, sig-derived — DR-018 §(a); never the token — I2/§12).
+    pub parent_badge_id: String,
+    /// Loggable badge id of the CHILD (sub-agent) badge minted by the attenuation.
+    pub child_badge_id: String,
+    /// The narrowing caveats appended at this step, folded verbatim (I3) — the
+    /// tagged first-party `Caveat` JSON objects the macaroon carries.
+    pub added_caveats: Vec<serde_json::Value>,
+}
+
 /// One entry in a run's permit ledger: an authorization request and, once a
 /// decision lands, its outcome (DR-008/DR-009 — the pre-hoc "may" axis). SP5
 /// REDUCER SCAFFOLD: the type + fields exist so the permit subjects have a
@@ -263,6 +282,15 @@ pub struct AgentRunState {
     /// unedited (I3 rebuild-stability), exactly as `pep` does.
     #[serde(default)]
     pub role: Option<String>,
+    /// DR-017 §Decision 2 (SP4b): this run's capability-delegation chain, folded
+    /// from `permit.delegated` facts (ontology). Each attenuation-and-handoff at
+    /// a sub-agent spawn earns one [`DelegationRecord`], in append (log) order so
+    /// the chain replays deterministically (I3). `#[serde(default)]` keeps every
+    /// pre-DR-017 golden fixture parsing (and comparing equal) unedited — the
+    /// exact rebuild-stability discipline `integrity_alarms` / `permit_ledger` /
+    /// `intent` / `role` already use.
+    #[serde(default)]
+    pub delegations: Vec<DelegationRecord>,
 }
 
 impl AgentRunState {
@@ -634,6 +662,39 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     allowed_tools,
                     intent_ref,
                 });
+            }
+        }
+        // DR-017 §Decision 2 (SP4b): the `permit.delegated` capability-chain
+        // fact. Keyed by the payload `run` (the lead agent's run under which the
+        // attenuation happened); appends one DelegationRecord in log order so the
+        // chain replays (I3). A keyless fact (missing `run`) folds counters-only
+        // / no-op, never panics — the established permit-reducer discipline
+        // (mirrors `apply_permit_decision`). `added_caveats` folds VERBATIM (the
+        // tagged Caveat JSON); an absent array folds empty, never chokes.
+        "permit.delegated" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let added_caveats = payload["added_caveats"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let record = DelegationRecord {
+                    parent_badge_id: payload["parent_badge_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    child_badge_id: payload["child_badge_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    added_caveats,
+                };
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .delegations
+                    .push(record);
             }
         }
         _ => {} // every other subject: counters only (S0 scope)

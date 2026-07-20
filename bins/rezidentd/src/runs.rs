@@ -17,7 +17,7 @@ use rezidnt_fabric::Fabric;
 use rezidnt_gate::Verdict;
 use rezidnt_run::RunId;
 use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
-use rezidnt_run::badge::Badge;
+use rezidnt_run::badge::{Caveat, Macaroon, RootKey};
 use rezidnt_run::capture::{DEFAULT_CHUNK_BYTES, DEFAULT_RING_BYTES, RingBuffer, chunk_into_cas};
 use rezidnt_run::spawner::SpawnPlan;
 use rezidnt_run::spec::{AgentSpec, GateSpec, ProjectSpec};
@@ -146,6 +146,14 @@ pub struct Daemon {
     /// Opened workspaces by ULID (tokio mutex: held across the spawn await
     /// so same-key `spawn_agent` retries can never double-spawn).
     pub workspaces: tokio::sync::Mutex<HashMap<Ulid, OpenedWorkspace>>,
+    /// DR-017 §Decision 6 (SP4b): the daemon's process-lifetime macaroon root
+    /// key — minted ONCE at construction, held for the process, NEVER on the
+    /// fabric (design §4: like the operator-badge secret). The daemon MINTS
+    /// agent badges against it (`launch_agent`); the shared `McpCore` VERIFIES
+    /// them against a clone of it (`main.rs` → `with_root_key`). A restart
+    /// re-mints — run-scoped agent badges never survive a restart, the accepted
+    /// DR-017 §Decision 4/6 model.
+    pub root_key: RootKey,
 }
 
 impl Daemon {
@@ -155,6 +163,9 @@ impl Daemon {
             cas,
             registry,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
+            // One key per Daemon instance = process-lifetime (a test that builds
+            // a fresh Daemon gets its own key; the production daemon builds one).
+            root_key: RootKey::mint(),
         }
     }
 }
@@ -687,19 +698,56 @@ pub async fn launch_agent(
     //    `REZIDNT_SOCKET` in the env and a `PreToolUse` hook config naming
     //    `rezidnt permit-hook`, written into the worktree's `.claude/settings.json`.
     //    A non-permit agent spawns exactly as today (no injection).
-    let badge = Badge::mint().context("mint badge")?;
+    //
+    //    SP4b (DR-017): the badge is now a MACAROON, not a DR-005 opaque token.
+    //    The BASE run capability (the "lead" badge) is minted against the daemon
+    //    root key over the run's SCOPE — `base_caveats` = workspace + expiry, both
+    //    deterministic from the run (permissive enough that the run's own governed
+    //    spawn/open/merge calls verify; NARROWING verbs/roles is attenuation's job,
+    //    not the base mint). When the spec declares an RBAC `role` (SP4a — the
+    //    sub-agent narrowing signal, DR-016 §Decision 3), the injected badge is the
+    //    base ATTENUATED with a `Role` caveat, and the daemon records the
+    //    capability edge as a `permit.delegated` fact (I3, the replayable chain).
+    //    The token INJECTED under REZIDNT_BADGE is `.to_wire()` — inline, never CAS
+    //    (I2). `badge_id` on agent.spawned is `hex(blake3(sig)[..8])`
+    //    (`macaroon.badge_id()`, DR-018 §Decision (a)), the unchanged loggable
+    //    shape (8-byte hex prefix) over a sig-derived pre-image.
+    let base_expiry = rezidnt_run::badge::expiry_from_now(rezidnt_run::badge::DEFAULT_BADGE_TTL);
+    let base_caveats = rezidnt_run::badge::base_caveats(&workspace.ulid().to_string(), base_expiry);
+    let base_badge = Macaroon::mint(&daemon.root_key, run_str.clone(), base_caveats);
+    // The badge the sub-agent actually runs under: the base, narrowed by the
+    // declared role if any, via a TRUE OFFLINE ATTENUATION (DR-018 §Decision (a)).
+    // The child SHARES the base's identifier — `attenuate` appends the `Role`
+    // caveat and re-keys the running sig with NO root key, NO fresh identifier.
+    // Distinct ends of the capability edge come from the sig-derived `badge_id`
+    // (`hex(blake3(sig)[..8])`), which re-keys per hop, NOT from a different
+    // identifier — so parent ≠ child while the offline property (the reason
+    // SP4b exists) is preserved and the child caveat set is a strict superset
+    // of the base (monotone narrowing — I6). A roleless spawn injects the base
+    // badge directly (no delegation, no fact).
+    let role_delegation = agent.role.as_ref().map(|role| {
+        let added = Caveat::Role { role: role.clone() };
+        let child = base_badge.attenuate(added.clone());
+        (child, added)
+    });
+    let injected_badge = role_delegation
+        .as_ref()
+        .map(|(child, _)| child)
+        .unwrap_or(&base_badge);
+    let badge_wire = injected_badge.to_wire();
+
     let pep_enforced = agent.gates.iter().any(|g| g == "permit");
     let plan = if pep_enforced {
         let socket = rezidnt_proto::socket_path();
         SpawnPlan::for_claude_code_permit(
             agent,
-            &badge,
+            &badge_wire,
             std::env::vars(),
             &run_str,
             &socket.to_string_lossy(),
         )
     } else {
-        SpawnPlan::for_claude_code(agent, &badge, std::env::vars())
+        SpawnPlan::for_claude_code(agent, &badge_wire, std::env::vars())
     };
     // Write the PreToolUse hook settings into the worktree so claude-code loads
     // them (design §3(2)). Best-effort surface: a settings-write failure must
@@ -730,7 +778,10 @@ pub async fn launch_agent(
         "run": run,
         "agent": agent.name,
         "harness": agent.harness,
-        "badge_id": badge.id(),
+        // SP4b: the loggable id of the badge the agent actually runs under (the
+        // role-narrowed child when a role was declared, else the base),
+        // `hex(blake3(sig)[..8])` — the sig-derived shape (DR-018 §Decision (a)).
+        "badge_id": injected_badge.badge_id(),
     });
     if let (Some(pid), Some(obj)) = (child.id(), spawned_payload.as_object_mut()) {
         obj.insert("pid".to_string(), json!(pid));
@@ -771,6 +822,38 @@ pub async fn launch_agent(
     // distinct from absent.
     if let (Some(role), Some(obj)) = (&agent.role, spawned_payload.as_object_mut()) {
         obj.insert("role".to_string(), json!(role));
+    }
+
+    // SP4b (DR-017 §Decision 2): the capability-chain fact. When the injected
+    // badge is a role-NARROWED child of the run's base (lead) badge, record the
+    // delegation edge as a durable `permit.delegated` fact BEFORE `agent.spawned`
+    // — the reducer folds it onto the run's dossier so the chain replays (I3).
+    // `parent_badge_id`/`child_badge_id` are the two `hex(blake3(sig)[..8])`
+    // sig-derived ends of the edge — distinct because `attenuate` re-keys the
+    // sig, under a SHARED identifier (DR-018 §Decision (a); NEVER the token —
+    // I2/§12); `added_caveats` folds VERBATIM
+    // the tagged first-party `Caveat` JSON. A roleless spawn has no delegation
+    // and emits no fact (no consumer-less noise).
+    if let Some((child, added)) = &role_delegation {
+        let added_caveats = vec![serde_json::to_value(added).unwrap_or(serde_json::Value::Null)];
+        publish(
+            &daemon.fabric,
+            Event::new(
+                SourceId::new("rezidnt-run"),
+                Some(workspace),
+                Subject::new("permit.delegated"),
+                correlation,
+                Some(allocated_id),
+                1,
+                json!({
+                    "run": run,
+                    "parent_badge_id": base_badge.badge_id(),
+                    "child_badge_id": child.badge_id(),
+                    "added_caveats": added_caveats,
+                }),
+            )?,
+        )
+        .await?;
     }
 
     // Register BEFORE the fact hits the fabric: a client that sees

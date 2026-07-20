@@ -333,6 +333,13 @@ pub struct McpCore {
     /// single-workspace seam. `None` here AND no substrate ⇒ no config ⇒
     /// escalate/deny, never a synthesized allow (I6, DR-011 §3).
     permit_config: Option<PermitConfig>,
+    /// DR-017 (SP4b): the daemon's process-lifetime macaroon root key — the
+    /// trust anchor `check_badge` verifies agent macaroons against. `None` on a
+    /// bare/keyless core, in which case NO agent macaroon can verify (an agent
+    /// badge presented to a keyless core is `badge.invalid`). The daemon wires
+    /// its minted key via [`McpCore::with_root_key`]; the opaque operator badge
+    /// path (DR-005) does not use it.
+    root_key: Option<rezidnt_run::badge::RootKey>,
 }
 
 impl McpCore {
@@ -350,7 +357,17 @@ impl McpCore {
             cas: None,
             ephemeral_cas: OnceLock::new(),
             permit_config: None,
+            root_key: None,
         }
+    }
+
+    /// Wire the daemon's macaroon root key (builder-style; the daemon mints one
+    /// at startup and wires it here, DR-017 §Decision 6). A core with no root key
+    /// verifies no agent macaroon — an agent badge presented to a keyless core is
+    /// `badge.invalid`. Mirrors [`McpCore::with_substrate`].
+    pub fn with_root_key(mut self, root: rezidnt_run::badge::RootKey) -> Self {
+        self.root_key = Some(root);
+        self
     }
 
     /// Wire the mutating-tool substrate (builder-style; the daemon calls this,
@@ -463,29 +480,108 @@ impl McpCore {
 
     /// §12 door for mutating tools: the badge is checked BEFORE any parsing
     /// or side effect. Returns the loggable badge id on success.
-    fn check_badge(&self, args: &Value) -> Result<String, Value> {
-        let Some(token) = args.get("badge").and_then(Value::as_str) else {
+    ///
+    /// DR-017 §Decision 4 — DUAL-PATH. The opaque operator badge (DR-005
+    /// `BadgeBook`, token-equality) is tried FIRST and left completely
+    /// unchanged. If it is not an admitted operator token, the presented value
+    /// is parsed as an agent MACAROON and verified against the daemon root key
+    /// under a request context (this `verb`, and the `workspace`/`now` args).
+    /// A violated caveat, a broken MAC chain, a foreign root key, or a keyless
+    /// core all yield `badge.invalid` with no side effect. Success yields the
+    /// loggable `badge_id` (`hex(blake3(sig)[..8])`, sig-derived — DR-018 §(a)).
+    ///
+    /// `verb` is DERIVED from the tool by the caller (`spawn_agent` → "spawn",
+    /// `open_project` → "open", `merge` → "merge") — the request's action for
+    /// the macaroon's `Verb` caveat.
+    fn check_badge(&self, args: &Value, verb: &str) -> Result<String, Value> {
+        let Some(presented) = args.get("badge").and_then(Value::as_str) else {
             return Err(tool_refused(
                 codes::BADGE_REQUIRED,
                 "mutating tools require a badge argument (doc §12)",
             ));
         };
-        let book = self
-            .badges
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match book.id_for(token) {
-            Some(id) => Ok(id.to_string()),
-            None => Err(tool_refused(
+
+        // Path 1 — the opaque operator badge (DR-005), UNCHANGED. Token-equality
+        // against the BadgeBook. An admitted operator token passes the door here.
+        {
+            let book = self
+                .badges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(id) = book.id_for(presented) {
+                return Ok(id.to_string());
+            }
+        }
+
+        // Path 2 — the agent macaroon (DR-017). Verify against the daemon root
+        // key + caveat-eval. A keyless core cannot verify any macaroon.
+        use rezidnt_run::badge::{Macaroon, RequestContext, verify};
+        let Some(root) = &self.root_key else {
+            return Err(tool_refused(
                 codes::BADGE_INVALID,
-                "badge token is not one this daemon issued",
+                "badge is not an issued operator token and this core holds no macaroon root key",
+            ));
+        };
+        let macaroon = match Macaroon::from_wire(presented) {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(tool_refused(
+                    codes::BADGE_INVALID,
+                    "badge is neither an issued operator token nor a parseable agent macaroon",
+                ));
+            }
+        };
+        // The request context: workspace + now are caller args; verb is derived.
+        // Absent workspace/now leave that axis unconstrained on the request side
+        // — a caveat present on the macaroon still refuses if the request cannot
+        // satisfy it (a Workspace caveat with no request workspace passes, matching
+        // verify's "if the request declares one" semantics; the door callers that
+        // require a workspace enforce presence separately).
+        // HONESTY NOTE (DR-018 §Consequences 1): this context carries NO
+        // `.role(...)`. A `Role` caveat on a child (attenuated) badge is therefore
+        // INERT at this §12 door — `verify` never refuses on role here. Role
+        // narrowing is enforced by the SP4a permit PDP, NOT the badge door. Do
+        // NOT read a `permit.delegated` fact as "the door refuses a wrong-role
+        // child"; the door does not. (Wiring role into the door is out of SP4b
+        // scope — it would change the enforcement surface.)
+        let mut ctx = RequestContext::new().verb(verb);
+        if let Some(ws) = args.get("workspace").and_then(Value::as_str) {
+            ctx = ctx.workspace(ws);
+        }
+        // The door supplies the timestamp (I6): `verify` never reads an ambient
+        // clock; the ENFORCEMENT decision — what "now" is — is made HERE. A
+        // caller-supplied `now` (the pinned tool arg) wins so a decision stays
+        // replayable from the exact inputs; ABSENT, the daemon reads real
+        // wall-clock time at the door so an expiry caveat is ALWAYS evaluated
+        // (a missing `now` must not silently skip expiry — that would let an
+        // expired badge through). Reading the clock at the edge and passing it
+        // in is I6-clean (an enforcement input, not a replayed verifier).
+        //
+        // HONESTY NOTE (DR-018 §Consequences 2): when `args["now"]` is ABSENT the
+        // daemon reads wall-clock `now_rfc3339()` here. That injected clock read
+        // is not recorded on any fact, so a `debrief` replay of THIS call cannot
+        // reproduce its exact expiry evaluation from log inputs alone. Acceptable
+        // as an enforcement-edge read (a missing `now` must not silently skip
+        // expiry), but flagged so replayability is not overclaimed for the
+        // absent-`now` path.
+        let now = args
+            .get("now")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(rezidnt_run::badge::now_rfc3339);
+        ctx = ctx.now(now);
+        match verify(&macaroon, root, &ctx) {
+            Ok(_cap) => Ok(macaroon.badge_id()),
+            Err(_) => Err(tool_refused(
+                codes::BADGE_INVALID,
+                "agent macaroon failed verify (tampered/forged/foreign-root) or a caveat was unsatisfied",
             )),
         }
     }
 
     async fn call_open_project(&self, args: Value) -> RpcOutcome {
         // Ordering pinned by the board: badge → spec parse → substrate.
-        let _badge_id = match self.check_badge(&args) {
+        let _badge_id = match self.check_badge(&args, "open") {
             Ok(id) => id,
             Err(refusal) => return Ok(refusal),
         };
@@ -514,7 +610,7 @@ impl McpCore {
     }
 
     async fn call_spawn_agent(&self, args: Value) -> RpcOutcome {
-        let _badge_id = match self.check_badge(&args) {
+        let _badge_id = match self.check_badge(&args, "spawn") {
             Ok(id) => id,
             Err(refusal) => return Ok(refusal),
         };
@@ -555,7 +651,7 @@ impl McpCore {
         // The socket transport skips this door (0600 UDS is the identity, DR-013
         // decision 3) by calling `decide_permit` directly; the shared PDP flow
         // never re-checks the badge, so the door lives here at the MCP edge.
-        let _badge_id = match self.check_badge(&args) {
+        let _badge_id = match self.check_badge(&args, "permit") {
             Ok(id) => id,
             Err(refusal) => return Ok(refusal),
         };

@@ -2352,6 +2352,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "libc",
+ "proptest",
  "rand",
  "rezidnt-cas",
  "rezidnt-types",
@@ -2359,6 +2360,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "toml",
  "ulid",

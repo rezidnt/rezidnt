@@ -75,7 +75,7 @@ fn permit_gated_plan_injects_run_and_socket_env() {
     // implementer chooses the exact signature; the behavior below is the pin.
     let plan = SpawnPlan::for_claude_code_permit(
         &permit_agent(),
-        &badge,
+        &badge.token_hex(),
         std::iter::empty(),
         RUN_ID,
         SOCKET,
@@ -119,7 +119,7 @@ fn permit_gated_plan_carries_a_pretooluse_hook_config_naming_permit_hook() {
     let badge = Badge::mint().expect("mint");
     let plan = SpawnPlan::for_claude_code_permit(
         &permit_agent(),
-        &badge,
+        &badge.token_hex(),
         std::iter::empty(),
         RUN_ID,
         SOCKET,
@@ -156,7 +156,7 @@ fn non_permit_plan_carries_no_pep_wiring() {
     let badge = Badge::mint().expect("mint");
     let plan = SpawnPlan::for_claude_code_permit(
         &plain_agent(),
-        &badge,
+        &badge.token_hex(),
         std::iter::empty(),
         RUN_ID,
         SOCKET,

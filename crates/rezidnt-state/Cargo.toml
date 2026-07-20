@@ -8,9 +8,13 @@ description = "rezidnt pure reducers, materialized graph, snapshots (doc §6)"
 [dependencies]
 rezidnt-types.workspace = true
 serde.workspace = true
+# serde_json: DR-017 `DelegationRecord.added_caveats: Vec<serde_json::Value>`
+# folds the tagged Caveat JSON VERBATIM (I3). Already a workspace member and
+# a transitive dep via rezidnt-types' `payload: serde_json::Value` — promoted
+# from dev-dep to a real dep here (no new crate; ZERO new dependency, I7).
+serde_json.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-serde_json.workspace = true
 time.workspace = true

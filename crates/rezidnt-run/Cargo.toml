@@ -26,6 +26,12 @@ tokio = { workspace = true, features = ["process", "time", "io-util"] }
 toml = "0.8"
 rand = "0.9"
 ulid = { workspace = true }
+# time: the SP4b macaroon expiry caveat is an RFC3339 UTC timestamp; the daemon
+# supplies a real wall-clock `now` at mint (expiry base) and at the check_badge
+# door (expiry eval) — verify itself stays pure/clock-free (I6). Already vendored
+# at the workspace root (rezidnt-types owns the envelope `ts` in the same crate)
+# — ZERO new dependency (I7), same crate, new consumer.
+time = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -33,3 +39,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# proptest (dev): SP4b macaroon monotonicity/forgery property tests
+# (testing-oracles skill). Already vendored at the workspace root (used by
+# rezidnt-state) — ZERO new dependency (I7), same crate, new dev consumer.
+proptest = { workspace = true }

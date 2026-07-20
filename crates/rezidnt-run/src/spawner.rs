@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 
-use crate::badge::Badge;
 use crate::spec::AgentSpec;
 
 /// A fully resolved spawn: argv + scrubbed env, ready for `tokio::process`.
@@ -26,12 +25,17 @@ pub struct SpawnPlan {
 impl SpawnPlan {
     /// Build the claude-code headless invocation for one agent (DR-001):
     /// `claude -p --output-format stream-json --verbose`, honoring
-    /// `bin_override`, env scrubbed with the badge injected. No PEP wiring — a
-    /// non-permit spawn (see [`SpawnPlan::for_claude_code_permit`] for the
+    /// `bin_override`, env scrubbed with the badge token injected. No PEP wiring
+    /// — a non-permit spawn (see [`SpawnPlan::for_claude_code_permit`] for the
     /// permit-gated variant).
+    ///
+    /// SP4b (DR-017): `badge_token` is the value injected under `REZIDNT_BADGE`.
+    /// The env seam is unchanged; only the token VALUE flips from a DR-005
+    /// opaque hex token to a serialized agent macaroon
+    /// ([`crate::badge::Macaroon::to_wire`]) — inline under the 32 KiB cap (I2).
     pub fn for_claude_code(
         agent: &AgentSpec,
-        badge: &Badge,
+        badge_token: &str,
         parent_env: impl Iterator<Item = (String, String)>,
     ) -> Self {
         Self {
@@ -43,7 +47,7 @@ impl SpawnPlan {
                 .into_iter()
                 .map(String::from)
                 .collect(),
-            env: crate::badge::scrubbed_env(parent_env, badge),
+            env: crate::badge::scrubbed_env(parent_env, badge_token),
             permit_hook_config: None,
         }
     }
@@ -62,12 +66,12 @@ impl SpawnPlan {
     /// injection is keyed on the spec's `gates` list containing `"permit"`.
     pub fn for_claude_code_permit(
         agent: &AgentSpec,
-        badge: &Badge,
+        badge_token: &str,
         parent_env: impl Iterator<Item = (String, String)>,
         run_id: &str,
         socket: &str,
     ) -> Self {
-        let mut plan = Self::for_claude_code(agent, badge, parent_env);
+        let mut plan = Self::for_claude_code(agent, badge_token, parent_env);
         if !agent.gates.iter().any(|g| g == "permit") {
             return plan; // no permit gate → spawns exactly as today (design §3)
         }

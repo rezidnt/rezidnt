@@ -365,8 +365,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-015](decisions/DR-015-permit-exec-verifier.md) | Permit axis dispatches exec verifiers (SP3 bring-your-own policy DSL) | ACCEPTED | §8, §9, §16 |
 | [DR-016](decisions/DR-016-permit-roles-sp4-slicing.md) | SP4 slicing + SP4a roles scope | ACCEPTED | §8, §9, §16 |
 | [DR-017](decisions/DR-017-permit-macaroon-delegation-sp4b.md) | SP4b macaroon-attenuated delegation (crypto + dep choice) | ACCEPTED | §12, §16 |
+| [DR-018](decisions/DR-018-delegation-edge-id-and-offline-boundary.md) | Delegation edge id from the running sig + offline-boundary defer (SP4b) | ACCEPTED | §12, §16 |
 
-*The next record is DR-018.*
+*The next record is DR-019.*
 
 ---
 

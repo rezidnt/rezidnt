@@ -26,9 +26,14 @@ fn badge_id_is_not_the_token() {
 
 /// Spawn env discipline: denylisted secrets are dropped, boring vars survive,
 /// and exactly one badge var is injected carrying the token.
+///
+/// SP4b (DR-017): `scrubbed_env` now takes the badge TOKEN string (the value
+/// carried under `REZIDNT_BADGE` — a serialized agent macaroon in production),
+/// not a `&Badge`. The env SEAM is unchanged; this pins scrubbing + exactly-once
+/// injection independent of the token's shape, so a token string stands in.
 #[test]
 fn scrubbed_env_drops_secrets_keeps_boring_injects_badge() {
-    let badge = Badge::mint().expect("mint");
+    let badge_token = "run-macaroon-wire-token";
     let parent = vec![
         ("PATH".to_string(), "/usr/bin".to_string()),
         ("HOME".to_string(), "/home/u".to_string()),
@@ -45,7 +50,7 @@ fn scrubbed_env_drops_secrets_keeps_boring_injects_badge() {
         ),
         ("LANG".to_string(), "C.UTF-8".to_string()),
     ];
-    let child = scrubbed_env(parent.into_iter(), &badge);
+    let child = scrubbed_env(parent.into_iter(), badge_token);
 
     let names: Vec<&str> = child.iter().map(|(k, _)| k.as_str()).collect();
     assert!(names.contains(&"PATH"));
@@ -62,5 +67,8 @@ fn scrubbed_env_drops_secrets_keeps_boring_injects_badge() {
     }
     let badges: Vec<_> = child.iter().filter(|(k, _)| k == BADGE_ENV_VAR).collect();
     assert_eq!(badges.len(), 1, "exactly one badge var");
-    assert_eq!(badges[0].1, badge.token_hex());
+    assert_eq!(
+        badges[0].1, badge_token,
+        "the injected value is the token verbatim"
+    );
 }

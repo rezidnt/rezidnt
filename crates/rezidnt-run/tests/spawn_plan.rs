@@ -1,4 +1,9 @@
 //! S1 oracle: the spawn plan is pure and pinned — argv, bin override, env.
+//!
+//! SP4b (DR-017): `for_claude_code` now takes the badge TOKEN string (the value
+//! injected under `REZIDNT_BADGE` — a serialized agent macaroon in production),
+//! not a `&Badge`. This S1 board pins the argv/env SEAM, unchanged; a token
+//! string (here the mint's `token_hex()`) stands in for the injected value.
 
 use rezidnt_run::badge::{BADGE_ENV_VAR, Badge};
 use rezidnt_run::spawner::SpawnPlan;
@@ -21,7 +26,7 @@ fn agent(bin_override: Option<&str>) -> AgentSpec {
 #[test]
 fn claude_code_argv_is_pinned() {
     let badge = Badge::mint().expect("mint");
-    let plan = SpawnPlan::for_claude_code(&agent(None), &badge, std::iter::empty());
+    let plan = SpawnPlan::for_claude_code(&agent(None), &badge.token_hex(), std::iter::empty());
     assert_eq!(plan.bin, std::path::Path::new("claude"));
     assert_eq!(
         plan.args,
@@ -36,7 +41,7 @@ fn bin_override_redirects_executable_only() {
     let badge = Badge::mint().expect("mint");
     let plan = SpawnPlan::for_claude_code(
         &agent(Some("/opt/harness/claude-2.1.191")),
-        &badge,
+        &badge.token_hex(),
         std::iter::empty(),
     );
     assert_eq!(
@@ -57,7 +62,7 @@ fn plan_env_is_scrubbed_with_badge() {
         ("PATH".to_string(), "/usr/bin".to_string()),
         ("GITHUB_TOKEN".to_string(), "ghp_secret".to_string()),
     ];
-    let plan = SpawnPlan::for_claude_code(&agent(None), &badge, parent.into_iter());
+    let plan = SpawnPlan::for_claude_code(&agent(None), &badge.token_hex(), parent.into_iter());
     assert!(plan.env.iter().any(|(k, _)| k == "PATH"));
     assert!(!plan.env.iter().any(|(k, _)| k == "GITHUB_TOKEN"));
     assert!(

@@ -1,11 +1,12 @@
-# Handoff — 2026-07-19 (session 8/9: SP1–SP3 COMPLETE; SP4 sliced, SP4a roles in build)
+# Handoff — 2026-07-19 (session 8/9: SP1–SP3 + SP4a COMPLETE; SP4b/SP4c remain)
 
 ## State of play
-Permit core (SP1 *decides* → SP2 *enforces mid-run* → SP3 *any DSL decides*) is **feature-complete**
-(all done this session, every `/vet` + `/debrief` **pass**, pushed ≤`2d3d239`). **SP4 is now sliced
-and ratified:** design sketch (`5a042dd`) → **DR-016 ACCEPTED** (owner) splits SP4 into SP4a roles →
-SP4b macaroon delegation → SP4c C8 precedence. **SP4a (roles) is in build** (owner said "ratify it,
-then start SP4a"): warden `/subject` → `/oracle` → implementer. Pointer = **SP4** (SP4a immediate).
+Permit core (SP1 *decides* → SP2 *enforces mid-run* → SP3 *any DSL decides*) is **feature-complete**,
+and **SP4a (roles) is DONE** — every slice this session passed `/vet` + `/debrief`. SP4 was sliced by
+**DR-016 ACCEPTED** into SP4a roles → SP4b macaroon delegation → SP4c C8 precedence; **SP4a shipped**:
+warden `/subject` (`role?` field `961997c`) → oracle → implementer → vet pass → debrief **pass**
+(first try) → **committed `381854a`**. Pointer = **SP4** (SP4a done; SP4b/SP4c remain).
+**`main` ahead 2 of origin** (`961997c`, `381854a`) — auto-push classifier-gated, **ask before pushing.**
 
 ## What SP3 shipped (committed `f07b86b`, green host+WSL)
 An external policy (OPA/Rego, Cedar, or ANY argv speaking the §8 JSON contract) decides a permit as
@@ -25,23 +26,28 @@ bundled engine (I7).
 SP2 (all pushed ≤`e6ed589`): DR-013/socket-PDP/hook-note/DR-014/pep-subject/hook-sub-slice.
 SP3: `830276a` sketch · `f77cc07` DR-015 (both pushed) · **`f07b86b` SP3 slice — NOT pushed (ahead 1).**
 
-## Next action — build SP4a (roles), DR-016 §Decision 2 is the spec
-Sequence (owner-directed, autonomous through the loop):
-  1. Warden **`/subject`** — `role` on `agent.spawned` (additive field, mirroring `pep`/`bare`;
-     no new subject; drift-guard stays green since subject list is unchanged).
-  2. **`/oracle`** — failing tests: `role: Option<String>` on `AgentSpec` parses; recorded on
-     `agent.spawned`; folded to `AgentRunState`; injected into `decide_permit` per-run params; a
-     role-keyed policy (native or exec reference) decides a permit DIFFERENTLY by role (the headline).
-  3. **Implementer:** add `role` to `AgentSpec` + emit on `agent.spawned` + fold + inject into
-     `decide_permit`'s content-pinned params (DR-011 §2 discipline) as a new input axis.
-  4. **`/vet`** → **`/debrief`** → commit.
-Then SP4b/SP4c are separate later slices (SP4b needs its OWN DR — macaroon crate/dep choice +
-badge migration + monotonicity property; SP4c = C8 layered precedence). **Reminder: `/vet` is
-host-side** ([[vet-is-host-side-wsl-insufficient]]).
+## Next action — SP4a done; choose direction (owner priority)
+SP4a (roles) shipped. Remaining SP4 sub-slices + roadmap options:
+- **SP4b — macaroon-attenuated delegation.** Needs its OWN DR first (DR-016 §Dec 3 recorded only the
+  direction): evaluate a permissive Rust macaroon crate vs hand-roll (approved-dep set + I7),
+  badge→macaroon migration, `permit.delegated`-vs-`agent.spawned`-field (`/subject`), and the
+  monotonicity property `verify(M+c) ⊆ verify(M)` (a widening bug = privilege escalation). The crypto
+  slice — the biggest remaining permit work. Sequence: crate-eval → design → /dr → /subject → oracle.
+- **SP4c — C8 layered precedence** (admin/dev/session, stricter-wins) in the `permit_config_for`
+  resolution seam. Policy logic, no crypto. Its own design→/dr→oracle.
+- **Exec debrief-replay wiring** (SP3 `#[ignore]` deferral) · **decision fast-path cache**
+  (permit-engine §10.2) · **concrete OPA/Cedar adapter** — each a focused follow-on with its own DR.
+- **C3 — sole-chokepoint enforcement** (DR-009 fenced; own sketch + DR).
+- **Carried cleanup** instead of a new slice.
+**Reminder: `/vet` is host-side** ([[vet-is-host-side-wsl-insufficient]]).
 
 ## Open /debrief residuals & carried notes (non-blocking)
-- SP1–SP3 all auditor **pass**; SP3 residual coverage gap (resolver un-filter) was CLOSED before commit.
+- SP1–SP3 + SP4a all auditor **pass**; SP3 resolver-un-filter gap CLOSED before its commit.
 - Exec debrief-replay is the one honest SP3 deferral (see Next action) — `#[ignore]` panics, not faked.
+- **SP4a reference-policy nit (auditor note, non-blocking):** `spec/fixtures/policies/permit_role_policy.sh`
+  matches on the SUBSTRING `"role":"reviewer"` in the serialized VerifierInput rather than the
+  structured `params.role` — robust for SP4a's fixed inputs, but prefer keying on the structured field
+  if that policy ever grows. Test-fixture only, not production code.
 
 ## Decisions still needing a /dr (permit stream + beyond)
 - **SP4b (macaroon delegation)** — its OWN DR: permissive macaroon crate vs hand-roll (approved-dep
@@ -62,7 +68,8 @@ daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never c
 error 740, [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask first.
 
 ---
-**NEXT ACTION → Build SP4a (roles), DR-016 §Decision 2. Warden `/subject` (role on `agent.spawned`)
-→ `/oracle` (role parses + folds + injects; a role-keyed policy decides differently by role) →
-implementer (`role` on `AgentSpec` + emit + fold + inject into `decide_permit` params) → `/vet` →
-`/debrief`. SP4b (macaroon, own DR) + SP4c (C8) are later slices.**
+**NEXT ACTION → SP4a COMPLETE (committed `381854a`, auditor pass). Choose the next direction with
+the owner — SP4b (macaroon delegation; crate-eval → own DR → crypto slice), SP4c (C8 layered
+precedence), exec debrief-replay, the decision cache, an OPA/Cedar adapter, C3 (fenced), or carried
+cleanup. SP4b is the biggest remaining permit work and needs its own DR before build.
+ALSO PENDING: owner ok to push (`main` ahead 2).**

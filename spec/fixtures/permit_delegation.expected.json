@@ -1,0 +1,54 @@
+{
+  "events_folded": 3,
+  "last_event": "01SP4BDE7EGAT10N000000EV03",
+  "counts_by_subject": {
+    "agent.spawned": 1,
+    "permit.delegated": 2
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01SP4BDE7EGAT10N000000RN01": {
+      "status": "spawning",
+      "total_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "session_id": null,
+      "gates": {},
+      "integrity_alarms": [],
+      "permit_ledger": {},
+      "permit_accumulators": {
+        "cumulative_spend_usd": 0.0,
+        "risk_score": 0.0,
+        "granted": 0,
+        "denied": 0,
+        "escalated": 0
+      },
+      "intent": null,
+      "pep": null,
+      "role": null,
+      "delegations": [
+        {
+          "parent_badge_id": "root0000",
+          "child_badge_id": "mid00000",
+          "added_caveats": [
+            {
+              "kind": "workspace",
+              "workspace": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            }
+          ]
+        },
+        {
+          "parent_badge_id": "mid00000",
+          "child_badge_id": "leaf0000",
+          "added_caveats": [
+            {
+              "kind": "role",
+              "role": "sub"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "worktrees": {}
+}

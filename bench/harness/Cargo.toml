@@ -1,0 +1,24 @@
+[package]
+name = "rezidnt-bench-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt public benchmark harness — headless golden-path orchestrator + log-replay metrics collator (DR-022)"
+
+# DR-022 §Decision + CRITERION 5 (I7): NO `criterion`/`iai`/other bench
+# dependency. The collator is hand-rolled log-replay — it folds recorded facts
+# and counts; it does NOT micro-benchmark hot loops. Adding a bench crate here
+# is a manifest-level violation the `no_bench_dependency` test pins. The metrics
+# read ALREADY-SHIPPED cost fields off the log (I3) — this crate mints no new
+# event field/subject (that call is a deferred warden /subject, DR-022).
+[dependencies]
+# The three in-repo metrics fold from the recorded event log exactly like the
+# rezidnt-state reducer folds state (I3): parse envelopes, read payload fields.
+rezidnt-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Fixtures are read from spec/fixtures/*.jsonl (the same golden corpus the
+# reducer replay uses). No proptest yet — the load-bearing property here is
+# replay-stability (fold twice → identical), asserted directly, not generated.

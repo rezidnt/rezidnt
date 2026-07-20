@@ -2269,6 +2269,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rezidnt-bench-harness"
+version = "0.0.1"
+dependencies = [
+ "rezidnt-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rezidnt-cas"
 version = "0.0.1"
 dependencies = [

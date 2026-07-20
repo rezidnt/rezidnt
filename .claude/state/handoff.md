@@ -1,75 +1,70 @@
-# Handoff — 2026-07-19 (session 8/9: SP1–SP3 + SP4a COMPLETE; SP4b/SP4c remain)
+# Handoff — 2026-07-19 (session 8/9: SP2+SP3+SP4a shipped; SP4b DR ratified, build pending)
 
 ## State of play
-Permit core (SP1 *decides* → SP2 *enforces mid-run* → SP3 *any DSL decides*) is **feature-complete**,
-and **SP4a (roles) is DONE** — every slice this session passed `/vet` + `/debrief`. SP4 was sliced by
-**DR-016 ACCEPTED** into SP4a roles → SP4b macaroon delegation → SP4c C8 precedence; **SP4a shipped**:
-warden `/subject` (`role?` field `961997c`) → oracle → implementer → vet pass → debrief **pass**
-(first try) → **committed `381854a`**. Pointer = **SP4** (SP4a done; SP4b/SP4c remain).
-**`main` ahead 2 of origin** (`961997c`, `381854a`) — auto-push classifier-gated, **ask before pushing.**
+Marathon session. The permit "may" axis went **decides (SP1) → enforces mid-run (SP2) → any DSL
+decides (SP3) → role-keyed (SP4a)**, and the **crypto delegation slice (SP4b) is spec'd + ratified,
+not yet built.** Four slices closed this session (SP2 socket-PDP, SP2 hook, SP3, SP4a), each `/vet`
++ `/debrief` **pass**; five DRs ratified (DR-013..017). **All pushed to origin/main** through
+`f7c1376`; tree clean. Pointer = **SP4** (SP4a done; **SP4b is the next build**).
 
-## What SP3 shipped (committed `f07b86b`, green host+WSL)
-An external policy (OPA/Rego, Cedar, or ANY argv speaking the §8 JSON contract) decides a permit as
-an exec permit-verifier — reusing the existing `ExecVerifier`, no new machinery/vocabulary, no
-bundled engine (I7).
-- `PermitVerifierSpec` gains a `kind` (Native | Exec{argv}) + `::native`/`::exec`/`kind()`.
-- New async `permit::aggregate_async` — natives sync (extracted `native_verdict`, keeps `dyn
-  NativeVerifier` off the Send future), exec via `ExecVerifier::run().await`; ordered first-`Fail`→
-  Deny short-circuit across kinds preserved; sync `aggregate` kept for native tests.
-- `decide_permit` lifts aggregation to the async layer (no `block_on`).
-- `permit_config_for` un-filtered — exec entries dispatched, not dropped; two resolver tests walk
-  the real `begin_open`→resolver seam.
-- Determinism BINDING (I6): exec sealed (network-off + scrubbed), policy pinned as `policy_ref`.
-  Never-coerce: nonzero/malformed/timeout → `ask`. Reference policies = local shell argv.
+## What shipped this session (all committed + pushed)
+- **SP2 (DR-013/014):** the PEP enforces mid-run — `decide_permit` (one PDP path, byte-identical
+  facts), socket un-stubbed, `rezidnt permit-hook` CLI subcommand (fail-closed→ask, 250ms), socket
+  `paths` wire, `agent.spawned.pep` + `gate_explain` enforcement visibility.
+- **SP3 (DR-015):** permit axis dispatches **exec verifiers** — any argv/OPA/Cedar policy decides via
+  `aggregate_async`; determinism-pinned; no vendored engine (I7); reference policies are local sh.
+- **SP4a (DR-016):** **roles** — `AgentSpec.role` → `agent.spawned.role` → `AgentRunState` → injected
+  into `decide_permit` params; a role-keyed policy decides differently by role.
+- **SP4b SPEC (DR-017 ACCEPTED):** macaroon-attenuated delegation, ready to build — see Next action.
 
-## Commits this session (`770c228..f07b86b`) — push state
-SP2 (all pushed ≤`e6ed589`): DR-013/socket-PDP/hook-note/DR-014/pep-subject/hook-sub-slice.
-SP3: `830276a` sketch · `f77cc07` DR-015 (both pushed) · **`f07b86b` SP3 slice — NOT pushed (ahead 1).**
+## SP4b is READY TO BUILD (DR-017 §Decision is the spec)
+Crate eval done: **hand-roll a first-party-caveat macaroon over the already-vendored
+`blake3::keyed_hash` MAC — ZERO new dependency (I7)** (rejected: stale `macaroon` crate, over-fit
+`biscuit-auth`). Design sketch `docs/design/permit-macaroon-delegation-sp4b.md`. Ratified:
+- Construction: process-lifetime root key (`rand`); caveats = workspace/verb/expiry/role predicates;
+  mint at spawn under `REZIDNT_BADGE`; attenuate = append caveat + re-key sig (offline, no root key);
+  verify in `check_badge` = recompute chain + constant-time compare + eval caveats. First-party only.
+- **Monotonicity is BINDING (I6): `verify(M+c) ⊆ verify(M)`; widening = privilege escalation** —
+  the most-tested surface (property test + forgery/tamper/reorder rejection + constant-time compare).
+- Agent badges → macaroons; `check_badge` flips id-equality → crypto-verify on the §12 door;
+  operator badge stays the DR-005 opaque class. Expiry as a caveat vs a passed-in timestamp (no
+  ambient `now()`, replayable).
+- **New `permit.delegated {parent_badge_id, child_badge_id, added_caveats, run}` subject + reducer.**
 
-## Next action — SP4a done; choose direction (owner priority)
-SP4a (roles) shipped. Remaining SP4 sub-slices + roadmap options:
-- **SP4b — macaroon-attenuated delegation.** Needs its OWN DR first (DR-016 §Dec 3 recorded only the
-  direction): evaluate a permissive Rust macaroon crate vs hand-roll (approved-dep set + I7),
-  badge→macaroon migration, `permit.delegated`-vs-`agent.spawned`-field (`/subject`), and the
-  monotonicity property `verify(M+c) ⊆ verify(M)` (a widening bug = privilege escalation). The crypto
-  slice — the biggest remaining permit work. Sequence: crate-eval → design → /dr → /subject → oracle.
-- **SP4c — C8 layered precedence** (admin/dev/session, stricter-wins) in the `permit_config_for`
-  resolution seam. Policy logic, no crypto. Its own design→/dr→oracle.
-- **Exec debrief-replay wiring** (SP3 `#[ignore]` deferral) · **decision fast-path cache**
-  (permit-engine §10.2) · **concrete OPA/Cedar adapter** — each a focused follow-on with its own DR.
-- **C3 — sole-chokepoint enforcement** (DR-009 fenced; own sketch + DR).
-- **Carried cleanup** instead of a new slice.
-**Reminder: `/vet` is host-side** ([[vet-is-host-side-wsl-insufficient]]).
+## Next action — build SP4b (owner-directed slice; owner-only gates already cleared)
+Sequence: (1) warden **`/subject`** — mint `permit.delegated` (a real event in time → its own
+subject + folding reducer; NOT a field). (2) **`/oracle`** — property tests FIRST: monotonicity
+(`verify(M+c) ⊆ verify(M)`), forgery/tamper/reorder rejection, constant-time verify, mint/attenuate/
+verify round-trip, expiry-as-caveat against a passed-in ts, `check_badge` crypto-verify on a
+mutating call, delegation logged. (3) Implementer: the ~80-line macaroon over `blake3::keyed_hash`
+in `rezidnt-run` (`badge.rs`), `check_badge` verify, `SpawnPlan` mint/inject, `permit.delegated`
+emit + reducer. (4) `/vet` → `/debrief` → commit. **`/vet` is host-side** ([[vet-is-host-side-wsl-insufficient]]).
 
 ## Open /debrief residuals & carried notes (non-blocking)
-- SP1–SP3 + SP4a all auditor **pass**; SP3 resolver-un-filter gap CLOSED before its commit.
-- Exec debrief-replay is the one honest SP3 deferral (see Next action) — `#[ignore]` panics, not faked.
-- **SP4a reference-policy nit (auditor note, non-blocking):** `spec/fixtures/policies/permit_role_policy.sh`
-  matches on the SUBSTRING `"role":"reviewer"` in the serialized VerifierInput rather than the
-  structured `params.role` — robust for SP4a's fixed inputs, but prefer keying on the structured field
-  if that policy ever grows. Test-fixture only, not production code.
+- SP2–SP4a all auditor **pass**; no open findings.
+- SP4a reference policy `permit_role_policy.sh` matches SUBSTRING `"role":"reviewer"` not structured
+  `params.role` — fine for fixed inputs; tighten if it grows (test-fixture only).
+- SP3 exec debrief-replay is a named `#[ignore]` deferral (`replay()` reports exec as `replayed:None`).
 
 ## Decisions still needing a /dr (permit stream + beyond)
-- **SP4b (macaroon delegation)** — its OWN DR: permissive macaroon crate vs hand-roll (approved-dep
-  set + I7), badge→macaroon migration, `permit.delegated`-vs-`agent.spawned`-field (`/subject`),
-  monotonicity property. DR-016 §Decision 3 records the direction; the concrete choice is SP4b's DR.
-- **SP4c (C8 layered precedence)** — its own slice (admin/dev/session, stricter-wins).
-- **C3 / concrete OPA-Cedar adapter / exec-replay wiring** — each its own spec + DR before build.
-- Any memo-001-motivated change needs its own DR (DR-002 rule 3).
+- **SP4c — C8 layered precedence** (admin/dev/session, stricter-wins, in `permit_config_for`) — own slice.
+- **Exec debrief-replay wiring** · **decision fast-path cache** (permit §10.2) · **concrete OPA/Cedar
+  adapter** — each a focused follow-on with its own DR.
+- **C3 — sole-chokepoint enforcement** (DR-009 fenced; own sketch + DR).
 - Pre-permit carried debt: DR-007 GitError→associated-type; `badge.issued` emitter / `badge_id` on
   other mutations; release items (root README, crates.io `cargo login`); Phase 3 demand-gated.
 
 ## Environment
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`
-**(WSL-ONLY — never export on host/Git-Bash cargo)**. Vet hook host-side (`bash .claude/hooks/vet.sh`);
-daemon/gate tests WSL. **Run host vet.sh and WSL workspace SEQUENTIALLY, never concurrent**
-([[vet-concurrency-flake]]). **`/vet` is host-side; WSL-green is NOT sufficient for platform-cfg code**
-([[vet-is-host-side-wsl-insufficient]]). Host test/bin names must avoid substring `update` (UAC os
-error 740, [[windows-test-binary-update-uac]]). Auto-push to `main` is classifier-gated — ask first.
+**(WSL-ONLY)**. Vet hook host-side (`bash .claude/hooks/vet.sh`); daemon/gate tests WSL. **Host vet.sh
+and WSL workspace SEQUENTIAL, never concurrent** ([[vet-concurrency-flake]]). **`/vet` is host-side;
+WSL-green is NOT sufficient for platform-cfg code** ([[vet-is-host-side-wsl-insufficient]]). Host
+test/bin names avoid substring `update` (UAC 740, [[windows-test-binary-update-uac]]). Auto-push to
+`main` classifier-gated — ask first.
 
 ---
-**NEXT ACTION → SP4a COMPLETE (committed `381854a`, auditor pass). Choose the next direction with
-the owner — SP4b (macaroon delegation; crate-eval → own DR → crypto slice), SP4c (C8 layered
-precedence), exec debrief-replay, the decision cache, an OPA/Cedar adapter, C3 (fenced), or carried
-cleanup. SP4b is the biggest remaining permit work and needs its own DR before build.
-ALSO PENDING: owner ok to push (`main` ahead 2).**
+**NEXT ACTION → Build SP4b (macaroon delegation, DR-017 ACCEPTED). Warden `/subject`
+(`permit.delegated`) → `/oracle` (monotonicity `verify(M+c) ⊆ verify(M)` + forgery/tamper rejection
+FIRST — this is the security-critical slice) → implementer (hand-roll macaroon over
+`blake3::keyed_hash` in `badge.rs`, `check_badge` crypto-verify, `SpawnPlan` mint/inject,
+`permit.delegated` emit+reducer) → `/vet` → `/debrief`. No owner gate outstanding.**

@@ -2385,6 +2385,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tracing",
  "ulid",
 ]
 

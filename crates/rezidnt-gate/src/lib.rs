@@ -667,6 +667,119 @@ impl NativeVerifier for PathScope {
     }
 }
 
+/// Permit native (C3a — DR-025; design `permit-sole-chokepoint-c3.md` §5): the
+/// deterministic "is this path INSIDE the sandbox confinement?" decision — the
+/// sibling of [`PathScope`]/[`ForbiddenPath`] that the OS sandbox
+/// (`SandboxSubstrate`, in `rezidnt-run`) makes UNBYPASSABLE. The VERDICT is
+/// native/pure/interrogable (I6); the sandbox is only the mechanism enforcing it.
+///
+/// Reads the target `params.paths` (the action's touched paths) against the
+/// folded confinement `params.binds` (the allowed binds, injected by the PDP from
+/// FOLDED AUTHORITY — never a self-declared request arg; the C6/DR-024 lesson).
+/// A path covered by a bind → Pass; a path outside every bind → Fail naming the
+/// FIRST offender (deterministic, I6); binds ABSENT → Inconclusive (cannot-run —
+/// undecidable is never a synthesized pass, I6).
+///
+/// ORACLE STUB (C3a): `verify` is `todo!()` so the C3a board is assert-red, not
+/// compile-red (the S4 gate-skeleton precedent). The implementer writes the
+/// containment scan (the `PathScope` glob shape) and registers this in
+/// [`builtin_natives`].
+pub struct PathConfinement;
+
+impl NativeVerifier for PathConfinement {
+    fn name(&self) -> &'static str {
+        "path-confinement"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        // binds key ABSENT ⇒ undecidable → Inconclusive (cannot-run). The
+        // discriminator is key-presence, NOT emptiness: a present-but-empty
+        // `binds: []` is a DECLARED lockdown (every path out of bounds), not
+        // an absence — mirrors IntentLock's declared-empty allowlist (I6).
+        let Some(binds_val) = input.params.get("binds") else {
+            return Ok(cannot_run(
+                "no confinement binds in params — undecidable, not a pass (I6)",
+            ));
+        };
+        let binds = parse_binds(binds_val);
+
+        // The action's touched paths (request axis). Absent ⇒ nothing to
+        // confine; treat as no offender → Pass (an empty action set is not a
+        // violation — the binds-absence above is the undecidable case).
+        let paths = input
+            .params
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        // Deterministic scan: the FIRST path outside every bind in list order
+        // is the named offender (same params → same verdict AND same evidence,
+        // I6). An EMPTY bind set confines nothing → every path is out of bounds.
+        let offender = paths
+            .iter()
+            .find(|p| !binds.iter().any(|b| path_within(&b.host_path, p)));
+        match offender {
+            None => Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            }),
+            Some(path) => fail_evidence(
+                cas,
+                "path-outside-confinement",
+                &format!("path {path} outside every sandbox bind — DENIED"),
+            ),
+        }
+    }
+}
+
+/// One folded confinement bind parsed from the `params.binds` axis.
+struct ConfinementBind {
+    host_path: String,
+    #[allow(dead_code)]
+    writable: bool,
+}
+
+/// Parse the `params.binds` array (`[{host_path, writable}]`) into binds,
+/// skipping entries missing a `host_path` (a malformed entry confines nothing,
+/// never widens — the deny-by-default posture).
+fn parse_binds(val: &Value) -> Vec<ConfinementBind> {
+    val.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    let host_path = b.get("host_path").and_then(Value::as_str)?.to_string();
+                    let writable = b.get("writable").and_then(Value::as_bool).unwrap_or(false);
+                    Some(ConfinementBind {
+                        host_path,
+                        writable,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Is `path` inside the confinement `bind` — equal to it or a descendant? A
+/// pure, deterministic, SEGMENT-boundary prefix check (so `/opt/toolchain`
+/// covers `/opt/toolchain/bin/rustc` but NOT `/opt/toolchain-evil`). This is
+/// the containment predicate the `PathConfinement` verdict and the sandbox
+/// mechanism agree on (DR-025 design §5). No canonicalization / filesystem
+/// touch — the inputs are content-pinned strings (determinism BINDING, I6).
+fn path_within(bind: &str, path: &str) -> bool {
+    let bind = bind.trim_end_matches('/');
+    // Exact match, or a `/`-boundary descendant. An empty bind ("/" trimmed to
+    // "") is not treated as covering everything — a bind must name a path.
+    if bind.is_empty() {
+        return false;
+    }
+    if path == bind {
+        return true;
+    }
+    path.strip_prefix(bind)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Permit native (SP1, DR-009 C1): the running per-session spend + rate vs. a
 /// soft/hard cap. The running totals arrive as PINNED INPUTS in `params` (the
 /// daemon folds `PermitAccumulators` from the log, I3, and passes the snapshot
@@ -999,6 +1112,7 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(AllowedTools),
         Box::new(ToolAllowlist),
         Box::new(PathScope),
+        Box::new(PathConfinement),
         Box::new(SpendCap),
         Box::new(RiskCap),
         Box::new(IntentLock),

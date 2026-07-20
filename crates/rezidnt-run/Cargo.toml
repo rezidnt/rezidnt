@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "time", "io-util"] }
+tracing = { workspace = true }
 toml = "0.8"
 rand = "0.9"
 ulid = { workspace = true }

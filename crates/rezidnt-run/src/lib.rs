@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod badge;
 pub mod capture;
 pub mod reaper;
+pub mod sandbox;
 pub mod spawner;
 pub mod spec;
 

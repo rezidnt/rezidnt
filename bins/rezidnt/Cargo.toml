@@ -15,6 +15,11 @@ rezidnt-cas.workspace = true
 rezidnt-gate.workspace = true
 rezidnt-fabric.workspace = true
 rezidnt-proto.workspace = true
+# rezidnt-client (DR-023): the shared socket-driving client — connect, check the
+# hello, send a Request, tail/read facts. The CLI's former private
+# `connect_and_request` moved here; the CLI now consumes it (pure move, no
+# behavior change). Also consumed by bench/harness's DaemonDriver.
+rezidnt-client.workspace = true
 # rezidnt-run: `open` parses the §13 spec locally (success line needs
 # [project].name; bad specs fail fast with the path named) — S1 CLI verbs.
 rezidnt-run.workspace = true

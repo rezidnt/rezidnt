@@ -28,6 +28,11 @@ tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+# rezidnt-testkit (DR-023 §Decision (C)): the daemon fixture builders + socket
+# helpers, relocated from tests/common/mod.rs. DEV-ONLY — the integration tests
+# consume it via the `mod common` re-export shim; it never enters production
+# [dependencies] (I7, testkit_dev_only.rs guard).
+rezidnt-testkit.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 # S3 oracle board: the gate_explain daemon test PRE-SEEDS the event db with a

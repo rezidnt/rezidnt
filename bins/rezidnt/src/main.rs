@@ -204,32 +204,16 @@ fn rebuild(db: &std::path::Path, compact: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Unix socket client plumbing shared by `tail`/`open`/`attach`: connect,
-/// consume + check the hello, send the request line, hand back the reader.
+/// Unix socket client plumbing shared by `tail`/`open`/`attach`/`debrief`:
+/// connect, consume + check the hello, send the request line, hand back the
+/// reader. Relocated to `rezidnt-client` (DR-023) — this thin wrapper preserves
+/// the CLI's `anyhow` edge (the shared client returns its own `ClientError`,
+/// which `?` folds into `anyhow` unchanged behavior).
 #[cfg(unix)]
 fn connect_and_request(
     request: &rezidnt_proto::Request,
 ) -> anyhow::Result<std::io::BufReader<std::os::unix::net::UnixStream>> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
-    use rezidnt_proto::{check_hello, decode_hello, encode_request, socket_path};
-
-    let sock = socket_path();
-    let stream = UnixStream::connect(&sock)
-        .with_context(|| format!("connect to daemon at {}", sock.display()))?;
-    let mut reader = BufReader::new(stream);
-
-    let mut hello_line = String::new();
-    reader.read_line(&mut hello_line).context("read hello")?;
-    let hello = decode_hello(hello_line.trim_end()).context("decode hello")?;
-    check_hello(&hello).context("proto check")?;
-
-    let frame = encode_request(request).context("encode request")?;
-    let stream = reader.get_mut();
-    stream.write_all(frame.as_bytes()).context("send request")?;
-    stream.write_all(b"\n").context("send request newline")?;
-    Ok(reader)
+    Ok(rezidnt_client::connect_and_request(request)?)
 }
 
 #[cfg(unix)]

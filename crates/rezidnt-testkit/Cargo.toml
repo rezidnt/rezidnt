@@ -1,0 +1,19 @@
+[package]
+name = "rezidnt-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt DEV-ONLY test-support: daemon fixture builders + socket helpers (DR-023, consumed ONLY as a [dev-dependency])"
+
+# DR-023 §Decision (C): this is TEST-SUPPORT — the fixture staging (git init,
+# stub scripts, chmod) and daemon-driving socket helpers relocated from
+# `bins/rezidentd/tests/common/mod.rs`. It is consumed ONLY as a
+# `[dev-dependency]` (never in any shipped crate's `[dependencies]`); the
+# `testkit_dev_only.rs` guard pins that it never leaks into bench/harness's
+# production deps. It stages real fixtures, so it legitimately carries tempfile
+# + the fabric/types/cas crates the fixtures seed.
+[dependencies]
+rezidnt-fabric.workspace = true
+rezidnt-types.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

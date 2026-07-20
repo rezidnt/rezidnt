@@ -204,26 +204,24 @@ pub fn run_cases(cases: &[Case], driver: &dyn Driver) -> Vec<CaseOutcome> {
 /// integration test (`tests/real_driver.rs`, `#[cfg(unix)]`, WSL-only) exercises
 /// it against an actual fixture spec reaching a verified merge.
 ///
-/// IMPLEMENTER-OWNED STUB: `todo!()`, zero logic.
+/// The production wiring: orchestrate the golden path with the real
+/// [`DaemonDriver`]. Same orchestration LOOP as [`run_cases`], over the
+/// production driver — now UNBLOCKED (DR-023): `DaemonDriver::drive` drives the
+/// real daemon via the shared `rezidnt-client` seam.
 pub fn run_cases_default(cases: &[Case]) -> Vec<CaseOutcome> {
-    // Wiring is trivial ONCE `DaemonDriver::drive` is real; it is the same
-    // orchestration loop as `run_cases`, over the production driver. It stays a
-    // `todo!()` only because `DaemonDriver::drive` is FLAGGED as an architecture
-    // boundary (see below) — building the real driver requires extracting
-    // test-only daemon-driving scaffolding into a shared library, which is a
-    // decision owner/warden call, not an implementer one.
-    let _ = cases;
-    todo!(
-        "DR-022 CRITERION 1: blocked on DaemonDriver::drive (FLAGGED boundary — see DaemonDriver::drive doc)"
-    )
+    run_cases(cases, &DaemonDriver::default())
 }
 
 /// The production [`Driver`]: drives a case's golden path against the real
 /// daemon (open→vet→spawn→…→diff.merged→debrief) and reads the verified-merge
-/// terminal facts off the log. This is the seam whose REAL behavior the
-/// `#[cfg(unix)]` WSL-only integration test pins; the unit orchestration test
-/// uses a fake `Driver` instead so the loop logic is host-testable and
-/// deterministic. Constructing/driving it is implementer-owned.
+/// terminal facts off the log. Its REAL behavior is pinned by the
+/// `#[cfg(unix)]` WSL-only integration test (`tests/real_driver.rs`); the unit
+/// orchestration test uses a fake `Driver` so the loop logic is host-testable.
+///
+/// DR-023: the daemon-driving is done through the shared `rezidnt-client`
+/// socket seam (I5 — the existing wire) and the `rezidentd`/`rezidnt` binaries
+/// resolved at runtime; NO test-only scaffolding and NO `tempfile`/fixture
+/// crate enter the harness's production dep graph (I7, testkit_dev_only guard).
 #[derive(Debug, Default)]
 pub struct DaemonDriver {
     /// Implementer-owned: socket/db wiring, timeouts, spec staging. Left opaque
@@ -232,45 +230,301 @@ pub struct DaemonDriver {
 }
 
 impl Driver for DaemonDriver {
-    fn drive(&self, _case: &Case) -> CaseOutcome {
-        // ── FLAGGED ARCHITECTURE BOUNDARY (DR-022 Part 3) ──────────────────
-        // A real `drive` must reproduce, as PRODUCTION code, the entire S4
-        // golden-path orchestration that `bins/rezidentd/tests/golden_path.rs`
-        // performs: spawn `rezidentd` (env REZIDNT_SOCKET/REZIDNT_DB), stage a
-        // gated project (git init+commit, a diff-writing stub harness, an exec
-        // pass-verifier, a §13 spec wiring `gates = ["vet","pre_merge"]`), run
-        // the `rezidnt` CLI `open`, connect the Unix-socket tail, `read_until`
-        // `diff.merged`, and read the run's terminal facts (pre_merge
-        // `gate.passed` → `diff.merged`) to set `reached_verified_merge`.
-        //
-        // EVERY one of those primitives currently lives in TEST-ONLY code:
-        //   - `start_daemon`, `make_gated_project`, `connect`, `send_line`,
-        //     `read_until`, `run_cli`, `gated_stub_harness`, `exec_pass_verifier`
-        //     are in `bins/rezidentd/tests/common/mod.rs` (`#![cfg(unix)]`,
-        //     `#[allow(dead_code)]`) — a bin's test scaffolding, exported
-        //     nowhere;
-        //   - the CLI's own socket-driving (`connect_and_request`, `open`) is
-        //     private to `bins/rezidnt/src/main.rs` (a bin, no lib crate);
-        //   - `rezidentd` is a BIN with NO lib crate to depend on.
-        //
-        // `rezidnt-proto` gives the wire `Request`/`Hello` types (a lib), but
-        // NOT the process-spawn + project-staging + tail-and-read orchestration.
-        // Making `drive` real is therefore NOT additive wiring: it requires
-        // EXTRACTING that test-only daemon-driving scaffolding (the `common`
-        // harness, or the CLI's socket-client) into a NEW shared library the
-        // harness can depend on as production code. Per the DR-022 work order,
-        // that extraction is an architecture decision (possibly its own DR),
-        // not the implementer's to make unilaterally — so this is left as a
-        // documented `todo!()` and reported as a boundary.
-        //
-        // Host `/vet` stays green regardless: `tests/real_driver.rs` is
-        // `#[cfg(unix)]` and compiles to zero tests on the Windows host; it is
-        // the WSL-side proof that turns green only once the extraction lands.
-        todo!(
-            "DR-022 Part 3 FLAGGED: real daemon-driving needs test-only scaffolding \
-             (bins/rezidentd/tests/common) extracted into a shared lib — an architecture \
-             decision, not additive wiring; reported to the owner, not built here"
-        )
+    fn drive(&self, case: &Case) -> CaseOutcome {
+        // On unix the real drive runs; anywhere else the UDS path does not
+        // exist, so the case scores a MISS (the WSL-only `real_driver.rs` is the
+        // proof, and it is `#[cfg(unix)]`). A MISS is a scored zero, never a
+        // panic (CRITERION 3 / I6).
+        #[cfg(unix)]
+        {
+            match unix_drive::drive_case(case) {
+                Ok(outcome) => outcome,
+                // A driving fault (daemon fault, timeout, a genuinely-failing
+                // run) is a scored MISS — never a batch-aborting crash. The
+                // orchestrator's own `catch_unwind` is the belt; this is the
+                // braces (we prefer an explicit miss to an unwind). The failure
+                // is surfaced (not silently dropped) so a miss is diagnosable.
+                Err(e) => {
+                    eprintln!(
+                        "rezidnt-bench: case {:?} scored a MISS — drive failed: {e}",
+                        case.name
+                    );
+                    CaseOutcome {
+                        name: case.name.clone(),
+                        reached_verified_merge: false,
+                        run: None,
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            CaseOutcome {
+                name: case.name.clone(),
+                reached_verified_merge: false,
+                run: None,
+            }
+        }
+    }
+}
+
+/// The real, unix-only golden-path driving for [`DaemonDriver`]. Kept in its
+/// own module so the whole UDS/process-spawn path is `#[cfg(unix)]` (the host
+/// compile-skips it — the WSL run is the real gate,
+/// [[vet-is-host-side-wsl-insufficient]]).
+#[cfg(unix)]
+mod unix_drive {
+    use std::io::BufRead;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    use rezidnt_types::Event;
+
+    use crate::{Case, CaseOutcome};
+
+    /// How long to wait for the whole verified-merge chain to land on the tail.
+    /// Mirrors `golden_path.rs`'s 45 s deadline for the same flow.
+    const MERGE_DEADLINE: Duration = Duration::from_secs(45);
+
+    /// Any drive failure — a MISS, never a panic. The harness lib's error
+    /// surface is this one internal enum; the public contract is `CaseOutcome`.
+    /// `Display` reads every payload so a swallowed drive failure is legible
+    /// (surfaced on the miss path, not silently dropped).
+    #[derive(Debug)]
+    pub(crate) enum DriveError {
+        Io(std::io::Error),
+        /// The daemon/CLI did not produce the expected observable (no run id on
+        /// `open`, no verified-merge chain within the deadline, etc.).
+        Protocol(String),
+        Client(rezidnt_client::ClientError),
+    }
+
+    impl std::fmt::Display for DriveError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DriveError::Io(e) => write!(f, "io: {e}"),
+                DriveError::Protocol(msg) => write!(f, "protocol: {msg}"),
+                DriveError::Client(e) => write!(f, "client: {e}"),
+            }
+        }
+    }
+
+    impl From<std::io::Error> for DriveError {
+        fn from(e: std::io::Error) -> Self {
+            DriveError::Io(e)
+        }
+    }
+    impl From<rezidnt_client::ClientError> for DriveError {
+        fn from(e: rezidnt_client::ClientError) -> Self {
+            DriveError::Client(e)
+        }
+    }
+
+    /// The cargo profile dir the running (test) binary lives under — the parent
+    /// of `deps/`, where the built `rezidentd`/`rezidnt` sit. Resolved from
+    /// `current_exe()` because `env!("CARGO_BIN_EXE_…")` is unavailable in a lib
+    /// (and this is production code, not a test).
+    fn target_bin_dir() -> Result<PathBuf, DriveError> {
+        let exe = std::env::current_exe()?;
+        let parent = exe
+            .parent()
+            .ok_or_else(|| DriveError::Protocol("current_exe has no parent".into()))?;
+        let dir = if parent.file_name().map(|n| n == "deps").unwrap_or(false) {
+            parent
+                .parent()
+                .ok_or_else(|| DriveError::Protocol("deps dir has no parent".into()))?
+                .to_path_buf()
+        } else {
+            parent.to_path_buf()
+        };
+        Ok(dir)
+    }
+
+    fn workspace_bin(name: &str) -> Result<PathBuf, DriveError> {
+        let path = target_bin_dir()?.join(name);
+        if !path.exists() {
+            return Err(DriveError::Protocol(format!(
+                "{name} binary not found at {} — build the workspace bins first \
+                 (`cargo build -p rezidentd -p rezidnt`)",
+                path.display()
+            )));
+        }
+        Ok(path)
+    }
+
+    /// A temp working dir under the system temp root (no `tempfile` dep — that
+    /// is a fixture-staging crate the production harness must not carry, I7).
+    /// Removed on drop (best-effort). Also owns the daemon child so a dropped
+    /// guard never leaks the process.
+    struct DaemonGuard {
+        child: Child,
+        socket: PathBuf,
+        dir: PathBuf,
+    }
+
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Create a fresh unique temp dir (pid + a monotonic-ish nonce), spawn
+    /// `rezidentd` over it (REZIDNT_SOCKET/REZIDNT_DB, CAS defaults db-relative
+    /// exactly as `golden_path.rs` relies on), and wait for the socket to bind.
+    fn start_daemon() -> Result<DaemonGuard, DriveError> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("rezidnt-bench-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let socket = dir.join("rezidnt.sock");
+        let db = dir.join("events.db");
+
+        let child = Command::new(workspace_bin("rezidentd")?)
+            .env("REZIDNT_SOCKET", &socket)
+            .env("REZIDNT_DB", &db)
+            .spawn()
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&dir);
+            })?;
+
+        // The guard owns the child + dir + socket; dropping it kills the daemon
+        // and removes the temp dir even if the readiness wait below fails.
+        let guard = DaemonGuard { child, socket, dir };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !guard.socket.exists() {
+            if Instant::now() >= deadline {
+                return Err(DriveError::Protocol(
+                    "daemon socket never appeared within 5s".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(guard)
+    }
+
+    /// Drive ONE case's golden path against a freshly-spawned daemon, reading
+    /// the verified-merge terminal facts (pre_merge `gate.passed` FOLLOWED by
+    /// `diff.merged`) off the tail, and return the run ULID the daemon spawned.
+    pub(crate) fn drive_case(case: &Case) -> Result<CaseOutcome, DriveError> {
+        let daemon = start_daemon()?;
+
+        // A `Case` names an EXISTING §13 spec on disk — the target repo's
+        // `rezidnt.toml`. Production `drive` OPENS that repo; it NEVER constructs
+        // one (DR-023 §(C): fixture construction — git init, harness/verifier
+        // scripts, chmod, spec synthesis — is dev-only test-support in
+        // `rezidnt-testkit`, never in shipped code). A missing spec is a DRIVE
+        // FAULT → a scored MISS (a deterministic judge does not invent a repo).
+        if !case.spec_path.exists() {
+            return Err(DriveError::Protocol(format!(
+                "case spec does not exist: {} — a benchmark Case must point at a \
+                 real repo's rezidnt.toml; the driver does not stage a fixture",
+                case.spec_path.display()
+            )));
+        }
+
+        // `rezidnt open <spec>` against the daemon's socket/db. The pinned shape
+        // is exactly one stdout line `opened <name> run <run-ulid>`.
+        let spec = case
+            .spec_path
+            .to_str()
+            .ok_or_else(|| DriveError::Protocol("spec path is not utf-8".into()))?;
+        let open = Command::new(workspace_bin("rezidnt")?)
+            .args(["open", spec])
+            .env("REZIDNT_SOCKET", &daemon.socket)
+            .env("REZIDNT_DB", daemon.dir.join("events.db"))
+            .output()?;
+        if !open.status.success() {
+            return Err(DriveError::Protocol(format!(
+                "open failed (exit {:?}): {}",
+                open.status.code(),
+                String::from_utf8_lossy(&open.stderr)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&open.stdout);
+        let run = stdout
+            .split_whitespace()
+            .last()
+            .filter(|tok| tok.len() == 26)
+            .ok_or_else(|| {
+                DriveError::Protocol(format!(
+                    "open did not print the pinned `opened <name> run <ulid>` line: {stdout:?}"
+                ))
+            })?
+            .to_string();
+
+        // Tail the daemon socket (shared client — the EXISTING wire, I5) and
+        // read until `diff.merged` for THIS run. The verified-merge test is a
+        // pre_merge `gate.passed` for the run FOLLOWED by a `diff.merged` for it.
+        let reached = tail_for_verified_merge(&daemon.socket, &run)?;
+
+        Ok(CaseOutcome {
+            name: case.name.clone(),
+            reached_verified_merge: reached,
+            run: Some(run),
+        })
+    }
+
+    /// Connect via `rezidnt-client`, tail from seq 0, and return `true` iff a
+    /// pre_merge `gate.passed` for `run` is observed BEFORE a `diff.merged` for
+    /// `run` within the deadline. Reads the finding off the LOG's facts — never
+    /// an echo of any declared intent.
+    fn tail_for_verified_merge(socket: &std::path::Path, run: &str) -> Result<bool, DriveError> {
+        // The tail is the existing `Request::Tail { subject: None }` op — replay
+        // from seq 0 then live. `rezidnt-client` does the connect + hello check
+        // + request send against THIS daemon's explicit socket (never a racy
+        // process-global REZIDNT_SOCKET mutation); we read fact frames off the
+        // returned reader.
+        let mut reader = rezidnt_client::connect_and_request_at(
+            socket,
+            &rezidnt_client::Request::Tail { subject: None },
+        )?;
+
+        let deadline = Instant::now() + MERGE_DEADLINE;
+        let mut pre_merge_passed = false;
+        let mut line = String::new();
+        while Instant::now() < deadline {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                break; // daemon closed the stream
+            }
+            let frame = line.trim_end();
+            if frame.is_empty() {
+                continue;
+            }
+            let Ok(event) = Event::from_json_line(frame) else {
+                continue; // non-fact frame (e.g. a reply ack) — skip
+            };
+            let payload = event.payload();
+            let ev_run = payload.get("run").and_then(|r| r.as_str());
+            if ev_run != Some(run) {
+                continue;
+            }
+            let subject = event.subject.as_str();
+            let gate = payload.get("gate").and_then(|g| g.as_str());
+            match subject {
+                "gate.passed" if gate == Some("pre_merge") => {
+                    pre_merge_passed = true;
+                }
+                "diff.merged" => {
+                    // Verified merge iff the pre_merge pass preceded this merge
+                    // for the run (the exact terminal-facts test the collator
+                    // and `real_driver.rs` pin).
+                    return Ok(pre_merge_passed);
+                }
+                _ => {}
+            }
+        }
+        Err(DriveError::Protocol(format!(
+            "no diff.merged for run {run} within {}s",
+            MERGE_DEADLINE.as_secs()
+        )))
     }
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "rezidnt-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rezidnt shared socket-driving client: connect over UDS, check the hello, send a Request, tail/read facts (DR-023)"
+
+# DR-023 §Invariant-fit I7: NO new external dependency. The client sits on the
+# existing wire types (`rezidnt-proto`) + `rezidnt-types` (fact decode) + std
+# UDS ONLY. `serde_json` is the already-approved wire-serde (workspace approved
+# set), carried transitively via proto/types; used here to read the machine-
+# readable open/record-alarms reply frames off the tail. The
+# `client_deps_hygiene.rs` guard pins this closure (internal rezidnt-* crates +
+# serde/serde_json only) — no thiserror/ulid/etc. direct deps.
+[dependencies]
+rezidnt-proto.workspace = true
+rezidnt-types.workspace = true
+serde_json.workspace = true

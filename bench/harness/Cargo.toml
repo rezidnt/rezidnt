@@ -17,8 +17,17 @@ description = "rezidnt public benchmark harness — headless golden-path orchest
 rezidnt-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# rezidnt-client (DR-023): the shared socket-driving client the production
+# DaemonDriver runs the golden path on (connect → hello check → Tail → read
+# facts). The ONE new internal PRODUCTION dep DR-023 sanctions here (I5 — the
+# existing wire, not a parallel protocol; testkit_dev_only.rs allow-lists it).
+rezidnt-client.workspace = true
 
 [dev-dependencies]
+# rezidnt-testkit (DR-023 §Decision (C)): the fixture builders `real_driver.rs`
+# stages its gated project with. DEV-ONLY — it NEVER appears in [dependencies]
+# above (testkit_dev_only.rs guard); the production DaemonDriver stages nothing.
+rezidnt-testkit.workspace = true
 # Fixtures are read from spec/fixtures/*.jsonl (the same golden corpus the
 # reducer replay uses). No proptest yet — the load-bearing property here is
 # replay-stability (fold twice → identical), asserted directly, not generated.

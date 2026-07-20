@@ -5,6 +5,8 @@ members = [
     "crates/rezidnt-fabric",
     "crates/rezidnt-state",
     "crates/rezidnt-proto",
+    "crates/rezidnt-client",
+    "crates/rezidnt-testkit",
     "crates/rezidnt-cas",
     "crates/rezidnt-run",
     "crates/rezidnt-adapters/git",
@@ -27,6 +29,8 @@ rezidnt-types = { path = "crates/rezidnt-types" }
 rezidnt-fabric = { path = "crates/rezidnt-fabric" }
 rezidnt-state = { path = "crates/rezidnt-state" }
 rezidnt-proto = { path = "crates/rezidnt-proto" }
+rezidnt-client = { path = "crates/rezidnt-client" }
+rezidnt-testkit = { path = "crates/rezidnt-testkit" }
 rezidnt-cas = { path = "crates/rezidnt-cas" }
 rezidnt-run = { path = "crates/rezidnt-run" }
 rezidnt-adapter-git = { path = "crates/rezidnt-adapters/git" }

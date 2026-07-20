@@ -2219,6 +2219,7 @@ dependencies = [
  "rezidnt-mcp",
  "rezidnt-proto",
  "rezidnt-run",
+ "rezidnt-testkit",
  "rezidnt-types",
  "serde_json",
  "tempfile",
@@ -2236,6 +2237,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "rezidnt-cas",
+ "rezidnt-client",
  "rezidnt-fabric",
  "rezidnt-gate",
  "rezidnt-proto",
@@ -2272,6 +2274,8 @@ dependencies = [
 name = "rezidnt-bench-harness"
 version = "0.0.1"
 dependencies = [
+ "rezidnt-client",
+ "rezidnt-testkit",
  "rezidnt-types",
  "serde",
  "serde_json",
@@ -2286,6 +2290,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "rezidnt-client"
+version = "0.0.1"
+dependencies = [
+ "rezidnt-proto",
+ "rezidnt-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -2385,6 +2398,16 @@ dependencies = [
  "serde_json",
  "time",
  "ulid",
+]
+
+[[package]]
+name = "rezidnt-testkit"
+version = "0.0.1"
+dependencies = [
+ "rezidnt-fabric",
+ "rezidnt-types",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

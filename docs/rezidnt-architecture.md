@@ -231,6 +231,8 @@ Verifier packs are separate crates/repos. The generic packs are open; domain jud
 
 ## 9. Command surfaces
 
+> **The permit-config resolution seam (`permit_config_for`) is amended by [DR-011](decisions/DR-011-permit-pdp-config-seam.md) (the seam itself) and [DR-020](decisions/DR-020-sp4c-wire-layered-permit-sourcing.md) (three-source admin/dev/session layering, admin sourced outside the workspace spec).**
+
 **MCP (primary, per I5).** Server via the official Rust SDK (`rmcp` — moderate confidence on crate name and API maturity; verify at Slice 3 and be prepared to write a thin JSON-RPC layer if it disappoints). Transports: stdio (spawned by local clients like Claude Code) and streamable HTTP on `127.0.0.1` (DEFAULT port 0/announced via lockfile, not a fixed port). Resources: workspace graph nodes, dossiers, event ranges by ULID, gate definitions. Tools: `open_project`, `spawn_agent`, `vet`, `debrief`, `gate_explain`, `tail_events`, `alloc_worktree`, `arrange_layout` (PROVISIONAL). Every tool is idempotent or carries an idempotency key; every tool's JSON Schema is generated from `rezidnt-types` via `schemars`, so the MCP surface and the npm-published types can never drift.
 
 **Socket protocol.** UDS at `$XDG_RUNTIME_DIR/rezidnt.sock` (fallback `~/.local/state/rezidnt/`); Windows named pipe `\\.\pipe\rezidnt`. JSONL frames; first frame is a versioned hello `{proto: 1, schema: <ontology hash>, daemon: <semver>}`; mismatched proto majors disconnect with a machine-readable upgrade hint. The CLI, TUI, and future Tauri client are all just consumers of this protocol — no privileged in-process clients (I1).
@@ -367,8 +369,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-017](decisions/DR-017-permit-macaroon-delegation-sp4b.md) | SP4b macaroon-attenuated delegation (crypto + dep choice) | ACCEPTED | §12, §16 |
 | [DR-018](decisions/DR-018-delegation-edge-id-and-offline-boundary.md) | Delegation edge id from the running sig + offline-boundary defer (SP4b) | ACCEPTED | §12, §16 |
 | [DR-019](decisions/DR-019-c8-layered-precedence-sp4c.md) | SP4c: C8 layered policy precedence via monotone concat | ACCEPTED | §8, §9, §16 |
+| [DR-020](decisions/DR-020-sp4c-wire-layered-permit-sourcing.md) | SP4c-wire: three-source layered permit wiring (admin outside the workspace spec) | ACCEPTED | §9, §16 |
 
-*The next record is DR-020.*
+*The next record is DR-021.*
 
 ---
 

@@ -232,6 +232,8 @@ Verifier packs are separate crates/repos. The generic packs are open; domain jud
 ## 9. Command surfaces
 
 > **The permit-config resolution seam (`permit_config_for`) is amended by [DR-011](decisions/DR-011-permit-pdp-config-seam.md) (the seam itself) and [DR-020](decisions/DR-020-sp4c-wire-layered-permit-sourcing.md) (three-source admin/dev/session layering, admin sourced outside the workspace spec).**
+>
+> **Spend (C1) — amended by [DR-021](decisions/DR-021-live-spend-cap-c1.md):** the `SpendCap` verifier becomes live (caps injected via this seam), and spend attribution moves OFF the pre-action permit decision fact onto a post-action metering fact (B2, I3-honest) — so `spend_delta_usd` retires from the `permit.*` reducer fold source. Implies a downstream warden `/subject` (`action.metered`).
 
 **MCP (primary, per I5).** Server via the official Rust SDK (`rmcp` — moderate confidence on crate name and API maturity; verify at Slice 3 and be prepared to write a thin JSON-RPC layer if it disappoints). Transports: stdio (spawned by local clients like Claude Code) and streamable HTTP on `127.0.0.1` (DEFAULT port 0/announced via lockfile, not a fixed port). Resources: workspace graph nodes, dossiers, event ranges by ULID, gate definitions. Tools: `open_project`, `spawn_agent`, `vet`, `debrief`, `gate_explain`, `tail_events`, `alloc_worktree`, `arrange_layout` (PROVISIONAL). Every tool is idempotent or carries an idempotency key; every tool's JSON Schema is generated from `rezidnt-types` via `schemars`, so the MCP surface and the npm-published types can never drift.
 
@@ -370,8 +372,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-018](decisions/DR-018-delegation-edge-id-and-offline-boundary.md) | Delegation edge id from the running sig + offline-boundary defer (SP4b) | ACCEPTED | §12, §16 |
 | [DR-019](decisions/DR-019-c8-layered-precedence-sp4c.md) | SP4c: C8 layered policy precedence via monotone concat | ACCEPTED | §8, §9, §16 |
 | [DR-020](decisions/DR-020-sp4c-wire-layered-permit-sourcing.md) | SP4c-wire: three-source layered permit wiring (admin outside the workspace spec) | ACCEPTED | §9, §16 |
+| [DR-021](decisions/DR-021-live-spend-cap-c1.md) | Live spend-cap (C1): spend measured post-action, off the permit fact (B2) | ACCEPTED | §8, §9 |
 
-*The next record is DR-021.*
+*The next record is DR-022.*
 
 ---
 

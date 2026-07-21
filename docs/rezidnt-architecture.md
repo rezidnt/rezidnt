@@ -314,6 +314,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Amended by [DR-022](decisions/DR-022-benchmark-harness-slice.md).** Gives the Phase-2 exit ("the benchmark harness runs end-to-end against rezidnt itself") its first defined acceptance criteria + exit demo — a headless in-repo dogfood harness over the completed S4 golden path.
 >
 > **Amended by [DR-025](decisions/DR-025-c3a-linux-sandbox.md).** Slices the DR-009 sole-chokepoint (C3) phase: **C3a** — a Linux `bwrap`-backed `SandboxSubstrate` (I4) wrapping the S1 spawn seam, confinement from folded policy, loud `sandbox.unavailable` degrade when absent — ships first with its own acceptance criteria + exit demo. C3b (egress proxy), C3c (credential brokering), and the macOS/Windows backends stay fenced, each behind its own DR; the Windows tier is coupled to the deferred native-Windows Platform phase.
+>
+> **Amended by [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md).** Folds **C3b+c** into one slice — the full L7 egress chokepoint: a TLS-terminating `EgressProxy` (I4) that is the sole, inescapable route out of C3a's sealed netns (`pasta` connector, transparent TCP+DNS interception), a process-lifetime rezidnt CA (`rustls`/`rcgen`), and credential brokering (secrets injected upstream, never held by the agent, logged by-ref-never-value). Degrades CLOSED. First C3 slice to add linked deps (App. A). macOS/Windows egress backends stay fenced behind the same trait; Windows coupled to the deferred Platform phase.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -385,8 +387,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-023](decisions/DR-023-shared-daemon-driving-client.md) | Extract shared `rezidnt-client` socket driver (unblocks DaemonDriver); fixtures stay dev-only test-support | ACCEPTED | §4 |
 | [DR-024](decisions/DR-024-running-risk-cap-c6.md) | Running-risk cap (C6): deterministic rule-table scorer, pre-action, granted-only fold, contract-free shared-scorer seam | ACCEPTED | §8, §9 |
 | [DR-025](decisions/DR-025-c3a-linux-sandbox.md) | C3a Linux OS-sandbox: bwrap-backed `SandboxSubstrate` (I4), folded-policy binds, loud degrade when absent, `PathConfinement` verdict stays a permit-verifier | ACCEPTED | §16, §18 |
+| [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md) | C3b+c full L7 egress MITM + credential brokering: `EgressProxy` (I4) sole inescapable route out of C3a's netns, rezidnt CA (rustls/rcgen), secrets injected upstream/never-held, logged by-ref-never-value, degrade CLOSED; first C3 linked deps | ACCEPTED | §16, §18, App. A |
 
-*The next record is DR-026.*
+*The next record is DR-027.*
 
 ---
 
@@ -409,6 +412,8 @@ BINDING items change only through a dated decision record. Records live one per 
 | portable-pty | Phase 3 PTY (incl. ConPTY) | MIT | high |
 | libghostty-vt (FFI) or alacritty_terminal | Phase 3 VT kernel | MIT / Apache-2.0 | high / moderate — verify |
 | ratatui | S5 TUI board | MIT | high |
+| rustls | TLS termination (C3b+c egress MITM, DR-026) | MIT/Apache/ISC | high |
+| rcgen | rezidnt CA + per-destination leaf certs (C3b+c, DR-026) | MIT/Apache | high |
 
 ## Appendix B — subject taxonomy v0 (excerpt; canonical copy lives in `spec/ontology.md`)
 

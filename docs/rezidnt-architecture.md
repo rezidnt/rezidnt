@@ -397,8 +397,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-027](decisions/DR-027-c3bc-split-decide-enforce.md) | C3b+c split decide→enforce: land the egress governance/type-safety/CA-scaffold layer ENFORCEMENT-INERT; sequence DR-026's full-MITM dataplane (inescapability + real injection, crit 3/4 + exit demo) into its own next slice. DR-026 not weakened — criteria partitioned | ACCEPTED | §16, §18 |
 | [DR-028](decisions/DR-028-c3-wire.md) | C3 run-loop wiring (c3-wire): compose C3a bwrap + c3bc egress dataplane into the live rezidnt open/spawn over ONE shared netns (pasta-outer, sealed-before-agent), daemon-owned composed child (S1), folded-from-spec first source (C6 preserved), three composed degrade facts. No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
 | [DR-029](decisions/DR-029-c3-egress-fold.md) | Real egress fold (c3-egress-fold): source a non-empty egress allowlist + brokered secrets from a project-spec `[egress]` block + a daemon-side `SecretSource` I4 seam (host-file MVP now, 1Password op-CLI backend fenced next) so a shipped run reaches the run-loop Mediated arm end-to-end (DR-026 crit 4 at run-loop level). C6 preserved; no invariant/posture/dep change; egress.*/credential.* subjects minted in a paired /subject | ACCEPTED | §16, §18 |
+| [DR-030](decisions/DR-030-c3-op-secrets.md) | 1Password op SecretSource backend (c3-op-secrets): a headless `OpSecretSource` behind the DR-029 seam resolving `op://vault/item/field` refs via exec'd `op read` (not linked, I7), authed by a vault-scoped service account (`OP_SERVICE_ACCOUNT_TOKEN`, env-only, never facted); `CompositeSecretSource` scheme-dispatch (op:// → op, else host-file); resolution daemon-side at fold time; op absent/token unset/read-fail ⇒ loud credential.dropped, never a fake secret. "1Password for Claude" connector explicitly OUT (wrong layer). No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
 
-*The next record is DR-030.*
+*The next record is DR-031.*
 
 ---
 

@@ -1,5 +1,5 @@
 //! Subject taxonomy v0 — transcription of `spec/ontology.md` (the canonical
-//! copy; edited only via `/subject`). 42 subjects, all payload `v = 1`.
+//! copy; edited only via `/subject`). 47 subjects, all payload `v = 1`.
 //!
 //! Sync discipline: when the warden changes the ontology, this list changes in
 //! the same commit. (An automated ontology↔const drift test is implementer
@@ -69,4 +69,11 @@ pub const SUBJECTS_V0: &[&str] = &[
     "run.intent.declared",
     // action (DR-021 — the post-action metering axis; C1 live spend-cap fold source)
     "action.metered",
+    // egress (DR-029 — the C3 egress-mediation axis; composed posture + off-allowlist denial)
+    "egress.mediated",
+    "egress.unavailable",
+    "egress.denied",
+    // credential (DR-029 — the brokered-credential axis; by-ref, never the value)
+    "credential.injected",
+    "credential.dropped",
 ];

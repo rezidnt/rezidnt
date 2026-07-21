@@ -1,83 +1,86 @@
-# Handoff — 2026-07-21 (session 16: c3-wire DONE — sandbox+egress wired into the live spawn; next = real egress fold)
+# Handoff — 2026-07-21 (session 17: c3-egress-fold DONE — live run actually mediates + brokers; next = 1Password op SecretSource backend)
 
 ## State of play
-**`c3-wire` is DONE.** A real `rezidnt open` governed run now spawns through the COMPOSED path —
-`pasta → bwrap → agent` over ONE shared netns — so it is filesystem-confined AND (when the fold carries
-an allowlist) egress-mediated, with the daemon owning + reaping the composed child (S1). DR-028 ratified
-and landed, implementation landed and audited. Host `/vet` PASS, the WSL `#[cfg(unix)]` composed suites
-green (I re-ran them myself — the auditor can't reach the box), `/debrief` PASS. High autonomy ON
-([[autonomy-high-trust]]). Pushed to `origin/main` at **`e6cb3fc`** (see push note at bottom). `current-slice`
-= `c3-wire` (**done**).
+**`c3-egress-fold` is DONE.** A real `rezidnt open` governed run now ACTUALLY mediates egress and brokers a
+token the agent never holds — **DR-026 crit 4 at the run-loop level**, not just the substrate suite. This
+activated the Mediated arm that DR-028's honestly-minimal empty deny-all fold left dead. DR-029 ratified,
+warden `/subject` minted the real fact taxonomy, implementation landed + audited. Host `/vet` PASS, WSL
+live-mediated suite 2/2 (re-run by me), `/debrief` PASS (no blocking defects). High autonomy ON
+([[autonomy-high-trust]]). `current-slice` = `c3-egress-fold` (**done**). NOT yet pushed at time of writing —
+push is the last step of this handoff.
 
 ## Current slice & criteria
-`c3-wire` — DONE. DR-028's five criteria: (1) spawn goes through confinement not the raw
-`tokio::process::Command` — the `runs.rs` bypass is gone; (3) binds/allowlist/secrets fold ONLY via
-`from_folded_authority` (C6/DR-024 preserved end-to-end, no-widening test fails-first on a plan door);
-(5) daemon owns the composed `tokio::process::Child`. All host-provable → GREEN (11 host tests + full
-gauntlet `{"verdict":"pass"}`). (2) shared-netns inescapability under composition + (4) live degrade arm →
-WSL `#[cfg(unix)]`: `compose_shared_netns_c3_wire` 2/2, `spawn_composed_c3_wire` 2/2, `egress_mediation_c3bc`
-4/4 (no enforce regression), C3a + golden_path green. `/debrief` = PASS (auditor cleared the posture
-relaxations + the manufactured-green risk with cited evidence; 3 non-blocking advisory nits, below).
+`c3-egress-fold` — DONE. DR-029's five criteria: (1) `[egress]` block parses, absent⇒deny-all, malformed⇒honest
+error; (2) `SecretSource` host-file backend resolves, absent⇒empty, missing/malformed⇒honest error,
+unresolvable⇒drop with a loud `credential.dropped` fact (never a fake/empty secret); (3) fold folded-only,
+C6/DR-024 preserved end-to-end (`from_folded_authority` sole door). All host-provable → GREEN (26 host tests).
+(4) live mediated run reaches the run-loop Mediated arm end-to-end (`egress.mediated`/`egress_enforceable=true`,
+`credential.injected` by-ref, **token value in NO log fact**) → WSL `#[cfg(unix)]` `egress_fold_mediated_run_c3_wire`
+2/2. (5) facts ride the real minted subjects (paired warden `/subject`) → done. Enforce 4/4, composed +
+spawn_composed + open_flow green (no regressions). `/debrief` = PASS.
 
-## What changed this session (git log since the C3-mechanism handoff `7741785`)
-- `a4b3265` **DR-028** (c3-wire): the composition/wiring DR — pasta-outer shared netns, daemon-owned composed
-  child (S1), folded-from-spec first source (C6), the product of the two asymmetric degrades. Rides ratified
-  DR-025/026/027; no invariant/posture/dep/ontology change. Ratified under the standing high-autonomy grant.
-- `e6cb3fc` **c3-wire impl**: NEW `crates/rezidnt-run/src/compose.rs` (`composed_argv`, `ComposedDegrade`/
-  `compose_degrade`/`degrade_fact`, `ComposedChild`, `start_composed_dataplane`, `confined_program_binds`);
-  `sandbox.rs` (`bwrap_argv_shared_netns` — shared-netns posture drops `--unshare-net`+`--unshare-user` so
-  pasta's netns owner keeps CAP_NET_ADMIN; `--dev`/`--proc` added, both arms); `egress.rs` (`start_composed`/
-  `run_confined` splice + CA-pem ro-bind into the confined mount-ns); `runs.rs` (`fold_c3_policies` +
-  `compose_spawn` replacing the raw spawn). 5 new test files (2 WSL-only). No new linked dep, no ontology minted.
+## What changed this session (git log since c3-wire handoff `2e43ef3`)
+- `7737b8e` **DR-029** (c3-egress-fold): `[egress]` block + `SecretSource` I4 seam; host-file MVP now, **1Password
+  `op`-CLI backend fenced as the next backend**. Rides DR-026 posture + DR-020 host-authority-file precedent.
+- `f2c7fc9` **/subject mint**: 5 real subjects — `egress.mediated`/`egress.unavailable`/`egress.denied`/
+  `credential.injected`/`credential.dropped` (sandbox posture folded INTO `egress.*` as a field; `credential.*`
+  its own noun, facts structurally value-free). 4 folding reducers named (DR-006), wired by the impl.
+- `a9e443d` **c3-egress-fold impl**: NEW `crates/rezidnt-run/src/secret.rs` (`SecretSource` + `HostFileSecretSource`
+  reading `REZIDNT_EGRESS_SECRETS`); `spec.rs` (`EgressSpec` on `ProjectSpec`); `egress.rs` (`fold_egress_policy`,
+  `CredentialDrop`, `denied_fact`/`dropped_fact`, `injected_refs`); `compose.rs` (placeholder→real-subject swap);
+  `rezidnt-state` (4 `AgentRunState` fields + 5 apply arms); `runs.rs` (`fold_c3_policies` real fold, Mediated arm
+  activated, `credential.injected`/`credential.dropped` emission); testkit helpers. No new linked dep. 6 new test
+  files (1 WSL-only).
 
-## THE OPEN GAP (why "real egress fold" is next)
-This slice is **honestly-minimal**: `fold_c3_policies` folds sandbox binds (worktree + toolchain + declared
-harness dir) but an **EMPTY egress allowlist (deny-all)** — there is no `[gates.permit]`/role egress-config
-fold field yet (DR-028 §"What this does NOT decide" #1). Consequence (auditor NON-BLOCKING nit, disclosed +
-DR-scoped): the run-loop **Mediated spawn arm is dead in production** — a real governed run this slice is
-**confined + CLOSED** (sealed netns, no network), NOT mediated. The Mediated shared-netns path is proven only
-by the SUBSTRATE suite (`start_composed_dataplane`), not by a live governed run. This is truthfully disclosed
-(the `ConfinedClosed` fact carries `network=sealed`/`egress_enforceable=false`) — **but no product copy may
-claim run-loop egress mediation until the real egress fold lands.**
+## Secret hygiene (the load-bearing property this slice adds — auditor-confirmed)
+`BrokeredSecret` has NO `Serialize` + redacting `Debug`/`Display`, so a secret value is STRUCTURALLY
+unserializable onto a fact/CAS/trace. The single `.expose()` stays on the upstream-write path (`egress.rs:1669`);
+`credential.*`/`egress.*` facts carry ONLY `secret_ref` (label) + `dest` + `policy_ref`. Values live host-side
+only (`REZIDNT_EGRESS_SECRETS`, env-pointed OUTSIDE any workspace spec — a dev can't self-grant). The honesty
+guard is DISCHARGED for the mediated path: product copy MAY now claim Linux/WSL egress mediation + credential
+brokering for a shipped run with a configured `[egress]` allowlist + resolvable secret.
 
-## Next action — the real egress fold (make a live governed run actually MEDIATED)
-Source a **non-empty egress allowlist + brokered secrets** from the folded `[gates.permit]`/role layer so a
-real `rezidnt open` run routes through a live proxy end-to-end at the RUN-LOOP level (activating the currently-
-dead Mediated arm, `runs.rs` ~1093-1107). Likely a **light DR or just a slice under DR-028's deferral** (the
-posture is already ratified; this is the fold-field + wiring). Then oracle→impl→/vet→/debrief. Pairs naturally
-with the deferred warden `/subject` (below) since the live Mediated run emits `egress.*`/`credential.*` facts
-that currently ride PLACEHOLDER subjects.
+## Next action — the 1Password `op`-CLI SecretSource backend
+The owner directed (2026-07-21) 1Password as the secret-management direction ([[secret-source-1password-direction]]);
+the host-file MVP shipped this slice behind the `SecretSource` seam precisely so `op` slots in as a drop-in.
+Build an **`OpSecretSource`** backend behind the same trait: `op read op://vault/item/field` **exec'd not linked**
+(I7-clean — the pasta/bwrap/git pattern; an MCP-based backend is the heavier alternative). Its own light DR
+(DR-030; the `SecretSource` seam + posture are already ratified — the DR is the `op` invocation shape, the
+`secret_ref → op://` mapping, availability/degrade when `op` absent or not signed in → honest error not fake
+secret), then oracle→impl→/vet→/debrief. Pairs with deciding how `secret_ref` names an `op://` reference (a new
+`[egress.secrets]` value grammar, or a side map).
 
-## Open /debrief findings (all NON-BLOCKING, advisory — carried, none blocks done)
-1. **Dead run-loop Mediated arm** (`runs.rs` ~1093-1107) + placeholder `proxy_addr="127.0.0.1:9"` — cleared by
-   the real egress fold above; keep the honesty comment until then.
-2. **`insert_bwrap_chdir` targets `a.ends_with("bwrap")`** (`runs.rs` ~1183) — unambiguous today (no pasta token
-   ends in "bwrap"), but a string-suffix heuristic; pin the index from the known handoff structure if a future
-   proxy_addr/bind could ever end in "bwrap".
-3. **`argv_to_command` indexes `argv[0]`** (`runs.rs` ~1170) unchecked — safe (every non-Unsandboxed arm pushes
-   a program first); add an emptiness guard if refactored.
+## Open /debrief findings (NON-BLOCKING, carried — none blocks done)
+1. **No-widening test is a compile-time interface pin, not fail-first-on-ADDED-door** (`egress_fold_no_widening_fold.rs:232-257`).
+   DR-029 crit-3's "fails-FIRST if a SpawnPlan door is added" is slightly overstated — the private-field guard is
+   the real (and holding) mechanism, but a newly-added widening ctor wouldn't trip the test. Fix = a `trybuild`
+   compile-fail fixture, or narrow the test's claim/comment.
+2. **Stale `sandbox.unavailable` doc-strings in `sandbox.rs`** (lines ~152/160/204/402) — historical C3a-alone
+   posture; the composed path rides `egress.*` only. Purely cosmetic; could mislead a future reader.
 
 ## Decisions still needing a /dr or /subject
-- **Real egress fold** (the next action — light DR/slice under DR-028's deferral) · **warden `/subject` for
-  `sandbox.*`/`egress.*`/`credential.*`** facts (STILL deferred; the wiring emits under placeholders like
-  `sandbox.mediated`/`egress.unavailable`/`sandbox.unavailable` now) · macOS/Windows sandbox+egress backends
-  (each own DR; Windows coupled to the deferred Platform phase) · smaller carried: bench.completed,
-  holder-offline (DR-018 §b), fast-path cache, OPA/Cedar.
+- **1Password `op` SecretSource backend** (the next action — DR-030 light DR) · macOS/Windows sandbox+egress
+  backends (each own DR; Windows coupled to the deferred Platform phase) · the richer role-layer/`[gates.permit]`-
+  precedence egress fold (DR-019/020 style) only if demanded (this slice's `[egress]` is project-level) · smaller
+  carried: bench.completed, holder-offline (DR-018 §b), fast-path cache, OPA/Cedar.
 
 ## Environment (essentials)
-WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`, **quote
-the PATH export** ([[wsl-dev-environment]]). Vet host-side; **host+WSL SEQUENTIAL** ([[vet-concurrency-flake]]);
-**WSL-green NOT sufficient, /vet is host-side** ([[vet-is-host-side-wsl-insufficient]]). The composed WSL suites:
-`cargo test -p rezidnt-run --test compose_shared_netns_c3_wire -- --test-threads=1` and
-`cargo test -p rezidentd --test spawn_composed_c3_wire -- --test-threads=1` (need `pasta` + `bwrap` + netns —
-all present; host → honest early-return). **The dev probe example must be built** (`cargo build -p rezidnt-run
---example egress_c3bc_probe`) for the WSL composed/enforce suites — bwrap binds it via the confined-program
-fold. **For WSL-only evidence, re-run it yourself — the auditor can't.** [[clippy-doc-lazy-continuation-trap]]
-still bites doc/test headers.
+WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`, **quote the
+PATH export** ([[wsl-dev-environment]]). Vet host-side; **host+WSL SEQUENTIAL** ([[vet-concurrency-flake]]);
+**WSL-green NOT sufficient, /vet is host-side** ([[vet-is-host-side-wsl-insufficient]]) — BUT note the inverse this
+session: `#[cfg(unix)]` test BODIES compile to zero tests on host, so host `/vet` does NOT lint them; **run WSL
+`cargo clippy -p <pkg> --test <name> -- -D warnings` on any new `#[cfg(unix)]` suite** (host clippy can't reach the
+unix body — bit us on the mediated suite's doc header). The mediated suite:
+`cargo test -p rezidentd --test egress_fold_mediated_run_c3_wire -- --test-threads=1` (needs pasta + bwrap + netns,
+all present; **build the dev probe example first**: `cargo build -p rezidnt-run --example egress_c3bc_probe`).
+`REZIDNT_EGRESS_SECRETS` = host TOML `secret_ref = "value"` (the secret-source env). **For WSL-only evidence, re-run
+it yourself — the auditor can't.** [[clippy-doc-lazy-continuation-trap]] bit a WSL test doc header again (a wrapped
+line starting with `+`). **Sweep stray `*.rlib` probe artifacts from the repo root before committing** (agents leave
+them). [[secret-source-1password-direction]] guides the next slice.
 
 ---
-**NEXT ACTION → the real egress fold: source a non-empty egress allowlist + brokered secrets from the folded
-`[gates.permit]`/role layer so a live governed `rezidnt open` run is actually MEDIATED end-to-end (activate the
-dead run-loop Mediated arm), pairing with the deferred warden `/subject` for the `egress.*`/`credential.*` facts.
-Light DR/slice under DR-028's deferral (posture already ratified), then oracle→impl→/vet→/debrief. `current-slice`
-= c3-wire (done). High autonomy ON. For WSL-only evidence, re-run it yourself.**
+**NEXT ACTION → the 1Password `op`-CLI SecretSource backend: build an `OpSecretSource` behind the ratified
+`SecretSource` seam (`op read op://…` exec'd not linked, I7), degrading honestly when `op` is absent/not-signed-in
+(never a fake secret). Draft DR-030 (light — the seam+posture are ratified; the DR is the `op` invocation + the
+`secret_ref → op://` mapping + degrade), then oracle→impl→/vet→/debrief. `current-slice` = c3-egress-fold (done).
+High autonomy ON. For WSL-only evidence, re-run it yourself; lint `#[cfg(unix)]` bodies on WSL.**

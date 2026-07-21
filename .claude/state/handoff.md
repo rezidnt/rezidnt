@@ -1,86 +1,88 @@
-# Handoff — 2026-07-21 (session 17: c3-egress-fold DONE — live run actually mediates + brokers; next = 1Password op SecretSource backend)
+# Handoff — 2026-07-21 (session 18: c3-op-secrets DONE — 1Password op backend; C3 credential-brokering arc complete; next = owner-gated live-op proof / Platform backends)
 
 ## State of play
-**`c3-egress-fold` is DONE.** A real `rezidnt open` governed run now ACTUALLY mediates egress and brokers a
-token the agent never holds — **DR-026 crit 4 at the run-loop level**, not just the substrate suite. This
-activated the Mediated arm that DR-028's honestly-minimal empty deny-all fold left dead. DR-029 ratified,
-warden `/subject` minted the real fact taxonomy, implementation landed + audited. Host `/vet` PASS, WSL
-live-mediated suite 2/2 (re-run by me), `/debrief` PASS (no blocking defects). High autonomy ON
-([[autonomy-high-trust]]). `current-slice` = `c3-egress-fold` (**done**). NOT yet pushed at time of writing —
-push is the last step of this handoff.
+**`c3-op-secrets` is DONE.** The C3 credential-brokering arc is now COMPLETE end-to-end: a shipped `rezidnt open`
+run mediates egress AND brokers a secret the agent never holds, sourced from EITHER a host file OR **1Password**
+(`op read op://vault/item/field`, exec'd not linked, vault-scoped service account) — both behind the DR-029
+`SecretSource` I4 seam, dispatched by reference scheme. DR-030 ratified, implementation landed + audited + a
+seam-cleanup round (removed trait pollution). Host `/vet` PASS, op suites green host+WSL, WSL crit-5 (live op)
+honest-skips, `/debrief` PASS (no blocking defects). High autonomy ON ([[autonomy-high-trust]]). `current-slice`
+= `c3-op-secrets` (**done**). Pushed to `origin/main` (push is the last step of this handoff).
 
 ## Current slice & criteria
-`c3-egress-fold` — DONE. DR-029's five criteria: (1) `[egress]` block parses, absent⇒deny-all, malformed⇒honest
-error; (2) `SecretSource` host-file backend resolves, absent⇒empty, missing/malformed⇒honest error,
-unresolvable⇒drop with a loud `credential.dropped` fact (never a fake/empty secret); (3) fold folded-only,
-C6/DR-024 preserved end-to-end (`from_folded_authority` sole door). All host-provable → GREEN (26 host tests).
-(4) live mediated run reaches the run-loop Mediated arm end-to-end (`egress.mediated`/`egress_enforceable=true`,
-`credential.injected` by-ref, **token value in NO log fact**) → WSL `#[cfg(unix)]` `egress_fold_mediated_run_c3_wire`
-2/2. (5) facts ride the real minted subjects (paired warden `/subject`) → done. Enforce 4/4, composed +
-spawn_composed + open_flow green (no regressions). `/debrief` = PASS.
+`c3-op-secrets` — DONE. DR-030's five criteria: (1) scheme-dispatch (`op://` → OpSecretSource, plain →
+HostFileSecretSource, Composite mixes both); (2) OpSecretSource resolves via exec'd `op read` + newline-trim +
+redaction; (3) honest degrade taxonomy — op absent ⇒ UNAVAILABLE (spawn err), token unset ⇒ AUTH_FAIL (op exit 1),
+op read other-nonzero ⇒ RESOLUTION_FAIL — each DROPS with a DISTINGUISHING `credential.dropped` reason, never a
+fake token; (4) leak-discipline — `OP_SERVICE_ACCOUNT_TOKEN` + resolved value in NO fact/log/trace/RunError/agent-env,
+`.expose()` single call-site. Crit 1–4 → GREEN (21 host op tests; also green on WSL). (5) live op-injected mediated
+run → WSL `#[cfg(unix)]` `egress_fold_op_mediated_run_c3_wire`, **OWNER-GATED** (honest-skips 2/2 until the owner
+provides live op + token). `/debrief` = PASS. Auditor's one flagged nit (trait pollution) was FIXED this session.
+
+## THE OWNER-GATED PROOF (the one open thread on C3)
+Criterion 5 — a LIVE `op`-injected mediated run — is the only C3 arm not yet proven, and it needs the OWNER to
+provision on the WSL box: **(a)** the `op` CLI installed on PATH, **(b)** a vault-scoped `OP_SERVICE_ACCOUNT_TOKEN`
+in the daemon env, **(c)** `REZIDNT_TEST_OP_REF` pointing at a real vault item (e.g. `op://rezidnt/GitHub/token`).
+Then it's a one-command proof:
+`cargo build -p rezidnt-run --example op_fake` (already built) then
+`cargo test -p rezidentd --test egress_fold_op_mediated_run_c3_wire -- --test-threads=1` (currently honest-SKIPs
+without a/b/c, exactly like the pasta/bwrap gates). Until provisioned, it skips — NOT a failure. **NB the "1Password
+for Claude" connector (Desktop/Chrome, human-in-the-loop) is the WRONG tool here — the daemon needs the `op` CLI +
+a service account; see [[secret-source-1password-direction]].**
 
 ## What changed this session (git log since c3-wire handoff `2e43ef3`)
-- `7737b8e` **DR-029** (c3-egress-fold): `[egress]` block + `SecretSource` I4 seam; host-file MVP now, **1Password
-  `op`-CLI backend fenced as the next backend**. Rides DR-026 posture + DR-020 host-authority-file precedent.
-- `f2c7fc9` **/subject mint**: 5 real subjects — `egress.mediated`/`egress.unavailable`/`egress.denied`/
-  `credential.injected`/`credential.dropped` (sandbox posture folded INTO `egress.*` as a field; `credential.*`
-  its own noun, facts structurally value-free). 4 folding reducers named (DR-006), wired by the impl.
-- `a9e443d` **c3-egress-fold impl**: NEW `crates/rezidnt-run/src/secret.rs` (`SecretSource` + `HostFileSecretSource`
-  reading `REZIDNT_EGRESS_SECRETS`); `spec.rs` (`EgressSpec` on `ProjectSpec`); `egress.rs` (`fold_egress_policy`,
-  `CredentialDrop`, `denied_fact`/`dropped_fact`, `injected_refs`); `compose.rs` (placeholder→real-subject swap);
-  `rezidnt-state` (4 `AgentRunState` fields + 5 apply arms); `runs.rs` (`fold_c3_policies` real fold, Mediated arm
-  activated, `credential.injected`/`credential.dropped` emission); testkit helpers. No new linked dep. 6 new test
-  files (1 WSL-only).
+- `7737b8e`/`f2c7fc9`/`a9e443d` **c3-egress-fold** (DR-029): `[egress]` block + `SecretSource` seam + host-file MVP;
+  live run reaches the Mediated arm (DR-026 crit 4 at run-loop level); 5 `egress.*`/`credential.*` subjects minted.
+- `2d77d23` **DR-030** (c3-op-secrets): the `op` backend design + the connector-vs-op-CLI distinction.
+- `09aaf53` **c3-op-secrets impl**: `OpSecretSource` (exec `op read`), `CompositeSecretSource` scheme-dispatch,
+  per-floor drop reasons; `fold_c3_policies` composite wiring; `examples/op_fake.rs` (dev-only cross-platform fake op);
+  testkit `start_daemon_with_op_secrets`/`op_ref_available`. `with_binary` inherent-only (seam un-polluted). No new
+  linked dep.
 
-## Secret hygiene (the load-bearing property this slice adds — auditor-confirmed)
-`BrokeredSecret` has NO `Serialize` + redacting `Debug`/`Display`, so a secret value is STRUCTURALLY
-unserializable onto a fact/CAS/trace. The single `.expose()` stays on the upstream-write path (`egress.rs:1669`);
-`credential.*`/`egress.*` facts carry ONLY `secret_ref` (label) + `dest` + `policy_ref`. Values live host-side
-only (`REZIDNT_EGRESS_SECRETS`, env-pointed OUTSIDE any workspace spec — a dev can't self-grant). The honesty
-guard is DISCHARGED for the mediated path: product copy MAY now claim Linux/WSL egress mediation + credential
-brokering for a shipped run with a configured `[egress]` allowlist + resolvable secret.
-
-## Next action — the 1Password `op`-CLI SecretSource backend
-The owner directed (2026-07-21) 1Password as the secret-management direction ([[secret-source-1password-direction]]);
-the host-file MVP shipped this slice behind the `SecretSource` seam precisely so `op` slots in as a drop-in.
-Build an **`OpSecretSource`** backend behind the same trait: `op read op://vault/item/field` **exec'd not linked**
-(I7-clean — the pasta/bwrap/git pattern; an MCP-based backend is the heavier alternative). Its own light DR
-(DR-030; the `SecretSource` seam + posture are already ratified — the DR is the `op` invocation shape, the
-`secret_ref → op://` mapping, availability/degrade when `op` absent or not signed in → honest error not fake
-secret), then oracle→impl→/vet→/debrief. Pairs with deciding how `secret_ref` names an `op://` reference (a new
-`[egress.secrets]` value grammar, or a side map).
+## Next action (owner's steer — C3 core is complete)
+The C3 sole-chokepoint (sandbox + inescapable egress + credential brokering, host-file + 1Password) is DONE on
+Linux/WSL. Natural next options, owner to pick:
+1. **Finish the live-op proof** — once the owner provisions op + token (above), run it + fold the evidence in (tiny).
+2. **macOS/Windows sandbox+egress backends** — each its own DR behind the ratified traits; Windows coupled to the
+   deferred native-Windows Platform phase (Phase 3). Demand-gated.
+3. **A different phase** — e.g. S5 ratatui read-only fleet board (the I1 proof, can precede Phase 3), or the
+   benchmark harness (DR-022). 
+There is no forced next slice; C3 can stop here (like the roadmap's "may stop after any primitive", DR-025).
 
 ## Open /debrief findings (NON-BLOCKING, carried — none blocks done)
-1. **No-widening test is a compile-time interface pin, not fail-first-on-ADDED-door** (`egress_fold_no_widening_fold.rs:232-257`).
-   DR-029 crit-3's "fails-FIRST if a SpawnPlan door is added" is slightly overstated — the private-field guard is
-   the real (and holding) mechanism, but a newly-added widening ctor wouldn't trip the test. Fix = a `trybuild`
-   compile-fail fixture, or narrow the test's claim/comment.
-2. **Stale `sandbox.unavailable` doc-strings in `sandbox.rs`** (lines ~152/160/204/402) — historical C3a-alone
-   posture; the composed path rides `egress.*` only. Purely cosmetic; could mislead a future reader.
+1. **No-widening test is a compile-time interface pin, not fail-first-on-ADDED-door** (`egress_fold_no_widening_fold.rs`,
+   DR-029) — a `trybuild` compile-fail fixture would close it; the private-field guard genuinely holds.
+2. **Stale `sandbox.unavailable` doc-strings in `sandbox.rs`** (~152/160/204/402) — cosmetic; composed path rides `egress.*`.
+3. **`op_fake_bin()` doesn't assert the example exists** (`secret_source_op_resolve.rs:73`) — when `op_fake` isn't
+   built the op suites fail LOUDLY (expect-Some-got-drop) rather than with a clear "run `cargo build --example op_fake`"
+   message. A diagnostic-clarity nit (not a false-pass); an existence-assert would sharpen it.
 
 ## Decisions still needing a /dr or /subject
-- **1Password `op` SecretSource backend** (the next action — DR-030 light DR) · macOS/Windows sandbox+egress
-  backends (each own DR; Windows coupled to the deferred Platform phase) · the richer role-layer/`[gates.permit]`-
-  precedence egress fold (DR-019/020 style) only if demanded (this slice's `[egress]` is project-level) · smaller
-  carried: bench.completed, holder-offline (DR-018 §b), fast-path cache, OPA/Cedar.
+- macOS/Windows sandbox+egress backends (each own DR; Windows ↔ deferred Platform phase) · an MCP-based 1Password
+  backend (heavier alt behind the same seam; DR-030 fenced it) · the richer role-layer/`[gates.permit]`-precedence
+  egress fold (only if demanded) · smaller carried: bench.completed, holder-offline (DR-018 §b), fast-path cache,
+  OPA/Cedar.
 
 ## Environment (essentials)
 WSL = `wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, `CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target`, **quote the
 PATH export** ([[wsl-dev-environment]]). Vet host-side; **host+WSL SEQUENTIAL** ([[vet-concurrency-flake]]);
-**WSL-green NOT sufficient, /vet is host-side** ([[vet-is-host-side-wsl-insufficient]]) — BUT note the inverse this
-session: `#[cfg(unix)]` test BODIES compile to zero tests on host, so host `/vet` does NOT lint them; **run WSL
-`cargo clippy -p <pkg> --test <name> -- -D warnings` on any new `#[cfg(unix)]` suite** (host clippy can't reach the
-unix body — bit us on the mediated suite's doc header). The mediated suite:
-`cargo test -p rezidentd --test egress_fold_mediated_run_c3_wire -- --test-threads=1` (needs pasta + bwrap + netns,
-all present; **build the dev probe example first**: `cargo build -p rezidnt-run --example egress_c3bc_probe`).
-`REZIDNT_EGRESS_SECRETS` = host TOML `secret_ref = "value"` (the secret-source env). **For WSL-only evidence, re-run
-it yourself — the auditor can't.** [[clippy-doc-lazy-continuation-trap]] bit a WSL test doc header again (a wrapped
-line starting with `+`). **Sweep stray `*.rlib` probe artifacts from the repo root before committing** (agents leave
-them). [[secret-source-1password-direction]] guides the next slice.
+**WSL-green NOT sufficient, /vet is host-side** ([[vet-is-host-side-wsl-insufficient]]) — and **lint `#[cfg(unix)]`
+test BODIES on WSL** (`cargo clippy -p <pkg> --test <name> -- -D warnings`; host can't reach the unix body).
+**Dev-only example binaries must be built before their suites run OFF the full gauntlet:** host `vet.sh` builds them
+via `clippy --workspace --all-targets`, but a bare WSL `cargo test` does NOT — build first:
+`cargo build -p rezidnt-run --example op_fake` (op suites) and `--example egress_c3bc_probe` (egress/mediation suites),
+else the exec-based tests fail (spawn err → UNAVAILABLE, masking the real path). WSL op suites:
+`cargo test -p rezidnt-run --test secret_source_composite_dispatch --test secret_source_op_resolve --test op_secret_degrade_taxonomy_fold --test op_secret_leak_discipline -- --test-threads=1`.
+`REZIDNT_EGRESS_SECRETS` = host-file secrets TOML; `OP_SERVICE_ACCOUNT_TOKEN` + `REZIDNT_TEST_OP_REF` = the live-op arm.
+**For WSL-only evidence, re-run it yourself — the auditor can't.** [[clippy-doc-lazy-continuation-trap]] keeps biting
+doc headers (a wrapped line starting with `+`/`-`). **Sweep stray `*.rlib` from the repo root before committing.**
+[[secret-source-1password-direction]] records the connector-vs-op-CLI distinction.
 
 ---
-**NEXT ACTION → the 1Password `op`-CLI SecretSource backend: build an `OpSecretSource` behind the ratified
-`SecretSource` seam (`op read op://…` exec'd not linked, I7), degrading honestly when `op` is absent/not-signed-in
-(never a fake secret). Draft DR-030 (light — the seam+posture are ratified; the DR is the `op` invocation + the
-`secret_ref → op://` mapping + degrade), then oracle→impl→/vet→/debrief. `current-slice` = c3-egress-fold (done).
-High autonomy ON. For WSL-only evidence, re-run it yourself; lint `#[cfg(unix)]` bodies on WSL.**
+**NEXT ACTION → C3 core is COMPLETE (sandbox + inescapable egress + credential brokering via host-file AND 1Password
+`op`, Linux/WSL). The one open thread is the OWNER-GATED live-op proof (crit 5): once the owner puts `op` +
+`OP_SERVICE_ACCOUNT_TOKEN` (vault-scoped) + `REZIDNT_TEST_OP_REF` on the WSL box, run
+`cargo test -p rezidentd --test egress_fold_op_mediated_run_c3_wire -- --test-threads=1` (honest-skips until then).
+Otherwise the roadmap MAY STOP after C3 (DR-025 precedent) — next slice is the owner's steer: macOS/Windows backends,
+S5 fleet board, or the benchmark harness. `current-slice` = c3-op-secrets (done). High autonomy ON. For WSL-only
+evidence re-run it yourself; build dev-only example bins first; lint `#[cfg(unix)]` bodies on WSL.**

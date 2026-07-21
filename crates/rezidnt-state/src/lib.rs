@@ -106,6 +106,70 @@ pub struct DelegationRecord {
     pub added_caveats: Vec<serde_json::Value>,
 }
 
+/// DR-029 §Decision 6: a run's current composed egress/sandbox POSTURE, folded
+/// LAST-WRITE-WINS from `egress.mediated` / `egress.unavailable` facts (a run has
+/// one current posture; the latest fact overwrites). The warden taxonomy folds
+/// the sandbox posture in as a FIELD (`sandbox`), not a parallel noun — one
+/// `compose_degrade` decision, one folded posture. Rebuild-stable via the same
+/// `#[serde(default)]` discipline the other DR-* fields use.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EgressPostureState {
+    /// The network posture (`"mediated"` on `egress.mediated`; `"sealed"`/absent
+    /// on `egress.unavailable`), verbatim from the fact. `None` when the fact
+    /// omitted it (the Unsandboxed floor — readers key on `sandbox`).
+    pub network: Option<String>,
+    /// The sandbox discriminator (`"available"` | `"unavailable"`) — the field
+    /// that tells the ConfinedClosed floor (sandbox held) from the Unsandboxed
+    /// floor (sandbox down). Verbatim from the fact.
+    pub sandbox: Option<String>,
+    /// Whether egress is enforceable in this posture — `true` only on
+    /// `egress.mediated` (the sealed netns is the sole route out); `false` on
+    /// both `egress.unavailable` floors. The honesty anchor.
+    #[serde(default)]
+    pub egress_enforceable: bool,
+    /// The composed backend label (`"pasta+bwrap"`, `"bwrap"`, `"none"`),
+    /// recorded for replay. `None` when the fact omitted it.
+    pub backend: Option<String>,
+}
+
+/// DR-029 §Decision 6: one folded `egress.denied` fact — an off-allowlist
+/// per-connection denial (`EgressScope` `fail`). Appended in log order so the
+/// denial trail replays (many denials per run). By-reference only: the `dest`
+/// host + the deciding `policy_ref` hash.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EgressDenial {
+    /// The denied (off-allowlist) destination host.
+    pub dest: String,
+    /// The deciding egress policy's CAS hash (`policy_ref.hash`), so
+    /// `gate_explain` can answer WHY denied (I6). `None` if the fact omitted it.
+    pub policy_ref: Option<String>,
+}
+
+/// DR-029 §Decision 6: one folded `credential.injected` fact — the by-reference
+/// audit trail of a brokered secret injected upstream on an approved mediated
+/// egress (DR-026 crit 5). Records the `dest` + the `secret_ref` LABEL ONLY —
+/// the fact carries NO value, so neither can the fold. Appended in log order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CredentialInjection {
+    /// The allowlisted destination the secret was brokered toward.
+    pub dest: String,
+    /// The brokered secret's LABEL/HASH (`secret_ref`) — the by-reference
+    /// contract. NEVER the value (it is not in the fact).
+    pub secret_ref: String,
+}
+
+/// DR-029 §Decision 2/6: one folded `credential.dropped` fact — the honest-floor
+/// audit trail of a `secret_ref` the `SecretSource` could not resolve, so the
+/// mapping was dropped (never a fake secret). Records the `dest` + the
+/// unresolvable `secret_ref` LABEL. Appended in log order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CredentialDrop {
+    /// The destination host that LOST its injection.
+    pub dest: String,
+    /// The unresolvable `secret_ref` LABEL — carries no value (there is none).
+    pub secret_ref: String,
+}
+
 /// One entry in a run's permit ledger: an authorization request and, once a
 /// decision lands, its outcome (DR-008/DR-009 — the pre-hoc "may" axis). SP5
 /// REDUCER SCAFFOLD: the type + fields exist so the permit subjects have a
@@ -291,6 +355,31 @@ pub struct AgentRunState {
     /// `intent` / `role` already use.
     #[serde(default)]
     pub delegations: Vec<DelegationRecord>,
+    /// DR-029 §Decision 6: this run's current composed egress/sandbox posture,
+    /// folded LAST-WRITE-WINS from `egress.mediated` / `egress.unavailable`
+    /// facts (a run has one current posture). `None` until a posture fact folds.
+    /// `#[serde(default)]` keeps every pre-DR-029 golden fixture parsing (and
+    /// comparing equal) unedited — the exact rebuild-stability discipline the
+    /// other DR-* fields use (I3).
+    #[serde(default)]
+    pub egress: Option<EgressPostureState>,
+    /// DR-029 §Decision 6: this run's off-allowlist denials, folded from
+    /// `egress.denied` facts in append (log) order — the replayable denial
+    /// trail. `#[serde(default)]` keeps pre-DR-029 fixtures unedited (I3).
+    #[serde(default)]
+    pub egress_denials: Vec<EgressDenial>,
+    /// DR-029 §Decision 6: this run's by-reference credential-injection audit
+    /// trail, folded from `credential.injected` facts in append order —
+    /// `secret_ref`/`dest` ONLY, never a value (DR-026 crit 5). `#[serde(default)]`
+    /// keeps pre-DR-029 fixtures unedited (I3).
+    #[serde(default)]
+    pub credential_injections: Vec<CredentialInjection>,
+    /// DR-029 §Decision 2/6: this run's dropped-credential audit trail, folded
+    /// from `credential.dropped` facts in append order — the honest floor (a
+    /// mapping was dropped, never a fake secret injected). `#[serde(default)]`
+    /// keeps pre-DR-029 fixtures unedited (I3).
+    #[serde(default)]
+    pub credential_drops: Vec<CredentialDrop>,
 }
 
 impl AgentRunState {
@@ -694,6 +783,83 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     .entry(run)
                     .or_default()
                     .delegations
+                    .push(record);
+            }
+        }
+        // DR-029 §Decision 6: the composed egress/sandbox POSTURE facts. Both
+        // fold LAST-WRITE-WINS onto `AgentRunState::egress` (a run has one current
+        // posture). Keyed on the payload `run`; a keyless fact folds counters-only
+        // / no-op, never mints a run, never panics — the established
+        // permit/intent discipline (I3, never guess a key). A posture fact needs
+        // no prior `agent.spawned` — the log is truth (I3), so it mints the run.
+        "egress.mediated" | "egress.unavailable" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                graph.agent_runs.entry(run).or_default().egress = Some(EgressPostureState {
+                    network: payload["network"].as_str().map(String::from),
+                    sandbox: payload["sandbox"].as_str().map(String::from),
+                    egress_enforceable: payload["egress_enforceable"].as_bool().unwrap_or(false),
+                    backend: payload["backend"].as_str().map(String::from),
+                });
+            }
+        }
+        // DR-029 §Decision 6: an off-allowlist per-connection denial. Appends an
+        // EgressDenial in log order (many denials per run — the replayable trail).
+        // Keyless fact → counters-only no-op (I3).
+        "egress.denied" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let record = EgressDenial {
+                    dest: payload["dest"].as_str().unwrap_or_default().to_string(),
+                    policy_ref: payload["policy_ref"]["hash"].as_str().map(String::from),
+                };
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .egress_denials
+                    .push(record);
+            }
+        }
+        // DR-029 §Decision 6: the by-reference credential-injection audit trail.
+        // Appends `dest` + `secret_ref` ONLY (the fact carries no value, so
+        // neither can the fold — DR-026 crit 5). Keyless fact → no-op (I3).
+        "credential.injected" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let record = CredentialInjection {
+                    dest: payload["dest"].as_str().unwrap_or_default().to_string(),
+                    secret_ref: payload["secret_ref"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .credential_injections
+                    .push(record);
+            }
+        }
+        // DR-029 §Decision 2/6: the honest-floor dropped-credential audit trail
+        // (a mapping the SecretSource could not resolve, dropped — never a fake
+        // secret). Appends `dest` + `secret_ref`. Keyless fact → no-op (I3).
+        "credential.dropped" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let record = CredentialDrop {
+                    dest: payload["dest"].as_str().unwrap_or_default().to_string(),
+                    secret_ref: payload["secret_ref"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .credential_drops
                     .push(record);
             }
         }

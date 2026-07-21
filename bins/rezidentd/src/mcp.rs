@@ -96,6 +96,7 @@ impl McpSubstrate for McpBridge {
                 })?;
             let root = entry.root.clone();
             let gate_defs = entry.gates.clone();
+            let egress_spec = entry.egress.clone();
 
             let root = tokio::fs::canonicalize(&root).await.map_err(|e| {
                 ToolRefusal::new(
@@ -113,6 +114,7 @@ impl McpSubstrate for McpBridge {
                 Ulid::new(),
                 None,
                 &gate_defs,
+                &egress_spec,
                 // Recorded on the agent.spawned payload so the key→run map is
                 // log-derivable across restart (I3; envelope workspace is set
                 // by launch_agent, the ontology's keyed-spawn obligation).

@@ -172,25 +172,23 @@ pub fn compose_degrade(
 /// §Decision 4). Returns `(subject, payload)`; the run is named so the fact
 /// replays (I3).
 ///
-/// ## WARDEN-GATED subjects — PLACEHOLDER, not ratified (DR-028 §Consequences).
-/// The `sandbox.*`/`egress.*` subject family is a DEFERRED warden `/subject`
-/// question; the subject strings below are PLACEHOLDERS standing in for the
-/// implementer's wiring, keyed off the posture fields the c3bc/c3a fold suites
-/// already pin (`network`/`egress_enforceable`/`sandbox`), NOT ratified ontology
-/// names. TODO(warden, /subject): mint the family WITH its folding reducer and
-/// replace these constants.
-///
-/// The three payloads are fingerprint-distinct by construction:
-/// - Mediated: `network="mediated"`.
-/// - ConfinedClosed: `network="sealed"`, `injected=false`, a loggable `reason`.
-/// - Unsandboxed: `sandbox="unavailable"`, `egress_enforceable=false` (no silent
-///   claim of mediation, no fake handle).
+/// Subjects are the ratified `egress.*` family (DR-029 §Decision 6; ontology
+/// lines 494/503). Per the warden taxonomy judgment, one `compose_degrade`
+/// decision rides ONE subject, and the sandbox posture rides as a `sandbox`
+/// FIELD (not a parallel `sandbox.*` noun). So the three composed states map to:
+/// - Mediated → `egress.mediated` (the enforcing state; carries no
+///   `*.unavailable` marker), `network="mediated"`, `sandbox="available"`.
+/// - ConfinedClosed → `egress.unavailable`, `sandbox="available"` (the sandbox
+///   held; the egress backend was down), `network="sealed"`, `injected=false`.
+/// - Unsandboxed → `egress.unavailable`, `sandbox="unavailable"` (the
+///   discriminator — no sealed netns), `egress_enforceable=false` (no silent
+///   claim of mediation).
 pub fn degrade_fact(degrade: &ComposedDegrade, run: &str) -> (&'static str, Value) {
     match degrade {
         ComposedDegrade::Mediated => (
             // Not a degrade — the enforcing state; its subject carries no
             // `*.unavailable` marker.
-            "sandbox.mediated",
+            "egress.mediated",
             json!({
                 "run": run,
                 // Confined + mediated over the shared netns.
@@ -217,8 +215,11 @@ pub fn degrade_fact(degrade: &ComposedDegrade, run: &str) -> (&'static str, Valu
         ComposedDegrade::Unsandboxed => (
             // The loud-OPEN sandbox degrade composed: unsandboxed AND a declaration
             // that egress is un-enforceable in this run (no sealed netns to mediate
-            // over) — never a silent claim of mediation it lacks.
-            "sandbox.unavailable",
+            // over) — never a silent claim of mediation it lacks. Rides the SAME
+            // `egress.unavailable` subject as ConfinedClosed, disambiguated by the
+            // `sandbox="unavailable"` field (DR-029 taxonomy: one decision, one
+            // subject).
+            "egress.unavailable",
             json!({
                 "run": run,
                 // No sealed netns exists; egress mediation is un-enforceable.

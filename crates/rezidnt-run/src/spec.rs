@@ -3,6 +3,7 @@
 //! `[[workspace.tab]]` layout intent is Phase-3 surface: parsed and preserved,
 //! never an error, never acted on in Phase 1.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,35 @@ pub struct ProjectSpec {
     /// `gates` list names which of these run. Empty in pre-S4 specs.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateSpec>,
+    /// `[egress]` block (DR-029 §Decision 1): the project-DECLARED folded egress
+    /// authority — the allowlist of reachable hosts + the `host → secret_ref`
+    /// LABEL map the daemon-side [`crate::secret::SecretSource`] resolves values
+    /// for. ABSENT ⇒ default ⇒ empty allowlist ⇒ deny-all (absent NEVER means
+    /// open, the DR-028 honest default preserved). The map holds only labels
+    /// (`secret_ref`s), never a value — repo-safe. C6/DR-024: this is folded
+    /// authority (the sole `EgressPolicy::from_folded_authority` door), never a
+    /// run-supplied/request-time value.
+    #[serde(default)]
+    pub egress: EgressSpec,
+}
+
+/// The `[egress]` block (DR-029 §Decision 1). The allowlist hosts + the
+/// `[egress.secrets]` `host → secret_ref` LABEL map (repo-safe — a label, never a
+/// value). Absent block ⇒ default (both empty) ⇒ deny-all. A malformed block
+/// (e.g. `allowlist` given as a string, not an array) surfaces as
+/// [`RunError::Spec`], never a silently-empty allowlist that would drop the
+/// deny-all boundary.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EgressSpec {
+    /// The allowlisted hosts (`allowlist = ["github.com", …]`), in declared
+    /// order. Empty ⇒ deny-all.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// The `[egress.secrets]` `host → secret_ref` LABEL map — a label the
+    /// daemon-side `SecretSource` resolves to a value, NEVER a value itself
+    /// (repo-safe). `BTreeMap` for deterministic fold order.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// One `[[agent]]` table.
@@ -101,6 +131,11 @@ struct RawSpec {
     agent: Vec<AgentSpec>,
     #[serde(default)]
     gates: std::collections::BTreeMap<String, GateSpec>,
+    /// The `[egress]` block, typed so a malformed body (e.g. `allowlist` as a
+    /// string) is a `toml` deserialize error surfaced as [`RunError::Spec`] —
+    /// never a silently-empty allowlist (DR-029 §Decision 1 honesty leg).
+    #[serde(default)]
+    egress: EgressSpec,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +208,7 @@ impl ProjectSpec {
             repo,
             agents: raw.agent,
             gates: raw.gates,
+            egress: raw.egress,
         })
     }
 }

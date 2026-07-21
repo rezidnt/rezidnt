@@ -230,6 +230,18 @@ impl EgressPolicy {
     pub fn secret_for(&self, host: &str) -> Option<&BrokeredSecret> {
         self.injection_map.get(host)
     }
+
+    /// The `(dest_host, secret_ref)` pairs the injection map brokers — the
+    /// BY-REFERENCE view the daemon iterates to emit `credential.injected` facts
+    /// (DR-029 §Decision 6). Yields only LABELS (the host + the `secret_ref`),
+    /// NEVER a value: this deliberately does not expose `BrokeredSecret`, so a
+    /// caller building a fact structurally cannot reach `.expose()` through it.
+    /// Deterministic order (`injection_map` is a `BTreeMap`).
+    pub fn injected_refs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.injection_map
+            .iter()
+            .map(|(host, secret)| (host.as_str(), secret.secret_ref()))
+    }
 }
 
 /// The outcome of a mediation decision for one outbound connection: the verdict
@@ -408,21 +420,14 @@ fn split_addr(addr: &str) -> (&str, Option<&str>) {
 /// Build the by-reference credential-injection fact — the PDP recording THAT a
 /// brokered secret was injected on an approved egress, and WHICH (its
 /// `secret_ref`), NEVER the value (DR-026 §Decision, criterion 5; design §4).
-/// Returns `(subject, payload)`.
+/// Returns `(subject, payload)` on the ratified `credential.injected` subject
+/// (DR-029 §Decision 6, ontology line 520).
 ///
-/// ## WARDEN-GATED subject — PLACEHOLDER, not ratified.
-/// The `credential.injected`/`egress.*` subject family is a DEFERRED warden
-/// `/subject` question (DR-026 §Consequences, design §5) — NOT minted here. The
-/// subject string below is a PLACEHOLDER standing in for the implementer's chosen
-/// wiring; it is not a ratified ontology name. TODO(warden, /subject): once the
-/// family is minted WITH its folding reducer (no consumer-less subjects, DR-006),
-/// replace this constant with the ratified subject.
-///
-/// Payload shape (design §4 candidate `credential.injected {run, dest, secret_ref,
-/// policy_ref}`): the `secret_ref` is the brokered secret's LABEL/HASH
+/// Payload shape (`credential.injected {run, dest, secret_ref, policy_ref}`): the
+/// `secret_ref` is the brokered secret's LABEL/HASH
 /// ([`BrokeredSecret::secret_ref`]) — the by-reference contract. The secret VALUE
 /// is NEVER read here: this constructor takes the secret only to lift its
-/// `secret_ref`, and the `whole_emitted_fabric_carries_secret_ref_never_the_value`
+/// `secret_ref`, and the `credential_injected_carries_ref_dest_policy_never_the_value`
 /// scan (criterion 5) is what forbids a careless impl from inlining `.expose()`.
 /// `policy_ref` is a CAS ref (the deciding egress policy) so the injection is
 /// interrogable/replayable (I3/I6); bytes never ride inline (I2).
@@ -432,7 +437,6 @@ pub fn injected_fact(
     secret: &BrokeredSecret,
     policy_ref: &CasRef,
 ) -> (&'static str, Value) {
-    // WARDEN-GATED: placeholder subject, not a ratified ontology name.
     let subject = "credential.injected";
     let payload = json!({
         "run": run,
@@ -442,6 +446,119 @@ pub fn injected_fact(
         "policy_ref": policy_ref,
     });
     (subject, payload)
+}
+
+/// Build the off-allowlist DENIAL fact — the per-connection `egress.denied` the
+/// `EgressScope` `fail` verdict ([`Mediation::Deny`]) yields (DR-026 crit 3,
+/// DR-029 §Decision 6, ontology line 513). Returns `(subject, payload)`. Records
+/// WHAT was denied (`dest`) and, via `policy_ref` (a CAS ref, never inline
+/// bytes), WHY — so `gate_explain` answers against the exact deciding allowlist
+/// (I6/I3), never a re-derivation.
+pub fn denied_fact(run: &str, dest: &str, policy_ref: &CasRef) -> (&'static str, Value) {
+    let subject = "egress.denied";
+    let payload = json!({
+        "run": run,
+        "dest": dest,
+        "policy_ref": policy_ref,
+        "reason": "destination not on the folded allowlist",
+    });
+    (subject, payload)
+}
+
+/// Build the DROPPED-credential fact — the loud `credential.dropped` a
+/// `secret_ref` the [`crate::secret::SecretSource`] could not resolve rides
+/// (DR-029 §Decision 2, ontology line 527). Returns `(subject, payload)`. Records
+/// the `dest` that LOST its injection + the unresolvable `secret_ref` LABEL + a
+/// loggable `reason` — and by CONSTRUCTION carries no value (there is none to
+/// resolve; that is the point — never a fake token, never an empty-string
+/// injection). Takes no [`BrokeredSecret`] so a value literally cannot ride it.
+pub fn dropped_fact(run: &str, dest: &str, secret_ref: &str) -> (&'static str, Value) {
+    let subject = "credential.dropped";
+    let payload = json!({
+        "run": run,
+        "dest": dest,
+        "secret_ref": secret_ref,
+        "reason": "secret_ref unresolvable by the configured SecretSource — \
+                   mapping dropped, host mediated-without-injection",
+    });
+    (subject, payload)
+}
+
+/// A dropped `host → secret_ref` mapping (DR-029 §Decision 2): the fold could not
+/// resolve `secret_ref` via the [`crate::secret::SecretSource`], so the mapping
+/// was DROPPED — the host stays allowlisted (mediated-without-injection), but no
+/// secret is brokered to it. Reported by [`fold_egress_policy`] so the loud
+/// [`dropped_fact`] can ride it. Carries only LABELS (a `dest` host + a
+/// `secret_ref`), never a value — there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialDrop {
+    /// The destination host whose injection was dropped (the `[egress.secrets]`
+    /// key).
+    dest: String,
+    /// The unresolvable `secret_ref` LABEL (the `[egress.secrets]` value the
+    /// `SecretSource` returned `Ok(None)` for) — never a value.
+    secret_ref: String,
+}
+
+impl CredentialDrop {
+    /// The destination host that lost its injection.
+    pub fn dest(&self) -> &str {
+        &self.dest
+    }
+
+    /// The unresolvable `secret_ref` LABEL (never a value).
+    pub fn secret_ref(&self) -> &str {
+        &self.secret_ref
+    }
+}
+
+/// Fold the project-declared `[egress]` spec + a daemon-side
+/// [`crate::secret::SecretSource`] into an [`EgressPolicy`] (DR-029 §Decision
+/// 1/2). The allowlist is the declared hosts; the injection map is assembled by
+/// resolving each `[egress.secrets]` `host → secret_ref` value via the
+/// `SecretSource`:
+/// - a RESOLVABLE ref → a [`BrokeredSecret`] mapped to its host (mediated + injected);
+/// - an UNRESOLVABLE ref → the mapping is DROPPED (the host stays allowlisted,
+///   mediated-WITHOUT-injection) and a [`CredentialDrop`] is pushed so the loud
+///   [`dropped_fact`] rides it — NEVER a fake/empty secret (DR-029 §Decision 2).
+///
+/// The policy reaches [`EgressPolicy`] ONLY through
+/// [`EgressPolicy::from_folded_authority`] — the sole C6/DR-024 door. This fold
+/// reads the `[egress]` spec (project-DECLARED folded authority) + the
+/// `SecretSource` ONLY; it takes no `SpawnPlan`/request, so a run-supplied
+/// host/secret cannot widen the allowlist OR add a mapping. Returns
+/// `(policy, drops)`; an empty spec folds to a deny-all policy (absent never
+/// means open).
+pub fn fold_egress_policy(
+    spec: &crate::spec::EgressSpec,
+    secrets: &dyn crate::secret::SecretSource,
+) -> Result<(EgressPolicy, Vec<CredentialDrop>), RunError> {
+    let allowlist: Vec<Destination> = spec.allowlist.iter().map(Destination::host).collect();
+
+    let mut injection_map: BTreeMap<String, BrokeredSecret> = BTreeMap::new();
+    let mut drops: Vec<CredentialDrop> = Vec::new();
+    // Deterministic order: `spec.secrets` is a BTreeMap, so both the injection
+    // map and the drop list are built in stable host order (rebuild-stable, I3).
+    for (host, secret_ref) in &spec.secrets {
+        match secrets.resolve(secret_ref)? {
+            Some(secret) => {
+                // Resolvable → broker it to its host (value stays redacted; the
+                // proxy `.expose()`s it upstream ONLY, never here).
+                injection_map.insert(host.clone(), secret);
+            }
+            None => {
+                // Unresolvable → DROP the mapping (never a fake/empty secret) and
+                // report it so the loud `credential.dropped` fact rides it.
+                drops.push(CredentialDrop {
+                    dest: host.clone(),
+                    secret_ref: secret_ref.clone(),
+                });
+            }
+        }
+    }
+
+    let policy = EgressPolicy::from_folded_authority(allowlist, injection_map);
+    Ok((policy, drops))
 }
 
 /// The Linux `pasta`+`rustls`+`rcgen` egress backend (C3b+c — DR-026 §Decision;

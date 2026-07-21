@@ -21,8 +21,11 @@ use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
 use rezidnt_run::badge::{Caveat, Macaroon, RootKey};
 use rezidnt_run::capture::{DEFAULT_CHUNK_BYTES, DEFAULT_RING_BYTES, RingBuffer, chunk_into_cas};
 use rezidnt_run::compose::{ComposedChild, ComposedDegrade, compose_degrade, degrade_fact};
-use rezidnt_run::egress::{EgressPolicy, EgressProxy, PastaProxy};
+use rezidnt_run::egress::{
+    CredentialDrop, EgressPolicy, EgressProxy, PastaProxy, fold_egress_policy,
+};
 use rezidnt_run::sandbox::{Bind, SandboxPolicy, SandboxSubstrate, bwrap_argv};
+use rezidnt_run::secret::HostFileSecretSource;
 use rezidnt_run::spawner::SpawnPlan;
 use rezidnt_run::spec::{AgentSpec, GateSpec, ProjectSpec};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
@@ -137,6 +140,10 @@ pub struct OpenedWorkspace {
     /// `[gates.<name>]` verifier sets from the applied spec (S4). The vet /
     /// pre_merge gates run these; empty for pre-S4 specs.
     pub gates: BTreeMap<String, GateSpec>,
+    /// `[egress]` block from the applied spec (DR-029): the folded egress
+    /// authority (allowlist + `host → secret_ref` map) a governed spawn folds
+    /// into its `EgressPolicy`. Default (empty ⇒ deny-all) for pre-DR-029 specs.
+    pub egress: rezidnt_run::spec::EgressSpec,
     /// §9 idempotency: key → the run it minted. A retried `spawn_agent` with
     /// a known key returns this run and spawns nothing new.
     pub spawn_keys: HashMap<String, Ulid>,
@@ -243,6 +250,7 @@ fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, O
                         root: PathBuf::from(root),
                         agents: Vec::new(),
                         gates: BTreeMap::new(),
+                        egress: rezidnt_run::spec::EgressSpec::default(),
                         spawn_keys: HashMap::new(),
                     },
                 );
@@ -263,6 +271,7 @@ fn fold_workspaces(fabric: &Fabric, cas: &Cas) -> anyhow::Result<HashMap<Ulid, O
                     Some(spec) => {
                         entry.agents = spec.agents;
                         entry.gates = spec.gates;
+                        entry.egress = spec.egress;
                     }
                     // Degraded, never fatal: the workspace stays open with no
                     // spawnable agents; spawn answers agent.unknown.
@@ -459,6 +468,7 @@ pub async fn begin_open(
             root: spec.repo.clone(),
             agents: spec.agents.clone(),
             gates: spec.gates.clone(),
+            egress: spec.egress.clone(),
             spawn_keys: HashMap::new(),
         },
     );
@@ -628,6 +638,7 @@ async fn try_materialize_open(
             correlation,
             Some(applied_id),
             &spec.gates,
+            &spec.egress,
             // Spec-driven open-chain spawns are keyless (ontology: the key is
             // never synthesized).
             None,
@@ -662,6 +673,7 @@ pub async fn launch_agent(
     correlation: Ulid,
     causation: Option<Ulid>,
     gate_defs: &BTreeMap<String, GateSpec>,
+    egress_spec: &rezidnt_run::spec::EgressSpec,
     idempotency_key: Option<&str>,
 ) -> anyhow::Result<RunId> {
     let run = RunId::new(Ulid::new());
@@ -791,16 +803,15 @@ pub async fn launch_agent(
     // CLOSED (bwrap alone, sealed netns) or loud unsandboxed otherwise. The binds /
     // allowlist fold ONLY through `from_folded_authority` (C6 preserved), and the
     // decided composed state is recorded as a distinct loud fact below.
-    let (mut composed_child, composed_degrade) = compose_spawn(&plan, &worktree)
-        .with_context(|| format!("composed spawn of harness {}", plan.bin.display()))?;
+    let (mut composed_child, composed_degrade, egress_policy, credential_drops) =
+        compose_spawn(&plan, &worktree, egress_spec)
+            .with_context(|| format!("composed spawn of harness {}", plan.bin.display()))?;
     let started = std::time::Instant::now();
 
     // The composed-spawn/degrade fact — the durable record that the spawn went
     // THROUGH the composition decision (not a silent raw spawn). Each of the three
-    // states carries its distinct loud posture (DR-028 §Decision 4). WARDEN-GATED
-    // placeholder subject (the `sandbox.*`/`egress.*` family is a deferred
-    // `/subject`, DR-028 §Consequences); keyed off the posture fields the fold
-    // suites pin, not a ratified name.
+    // states carries its distinct loud posture (DR-028 §Decision 4). Rides the
+    // ratified `egress.*` subject family (DR-029 §Decision 6).
     let (degrade_subject, mut degrade_payload) = degrade_fact(&composed_degrade, &run_str);
     if let Some(obj) = degrade_payload.as_object_mut() {
         obj.insert("agent".to_string(), json!(agent.name));
@@ -819,6 +830,87 @@ pub async fn launch_agent(
         )?,
     )
     .await?;
+
+    // DR-029 §Decision 2/5/6: the credential facts riding the fold. Pin the
+    // deciding egress policy DESCRIPTOR into the CAS — the allowlist hosts + the
+    // by-reference `host → secret_ref` labels (NEVER a value; the descriptor is
+    // built from `injected_refs`, which yields only labels), so `gate_explain` can
+    // resolve WHY a host was mediated/injected against the exact folded policy
+    // (I6/I3). Bytes never ride a fact inline (I2).
+    let policy_ref = {
+        let allow: Vec<&str> = egress_policy
+            .allowlist()
+            .iter()
+            .map(|d| d.host.as_str())
+            .collect();
+        let injected: Vec<serde_json::Value> = egress_policy
+            .injected_refs()
+            .map(|(host, secret_ref)| json!({ "dest": host, "secret_ref": secret_ref }))
+            .collect();
+        let descriptor = json!({ "allowlist": allow, "injections": injected });
+        let bytes = serde_json::to_vec(&descriptor).unwrap_or_default();
+        let cas = Arc::clone(&daemon.cas);
+        tokio::task::spawn_blocking(move || cas.put(&bytes, "application/json"))
+            .await
+            .context("cas put task panicked")?
+            .context("pin egress policy descriptor into cas")?
+    };
+
+    // credential.injected — one BY-REFERENCE fact per brokered host on a mediated
+    // run (DR-026 crit 4/5). `injected_refs` yields only the `(dest, secret_ref)`
+    // LABELS: the value literally cannot ride the fact (there is no `BrokeredSecret`
+    // in scope here to `.expose()`). Only on the true Mediated arm — a downgraded
+    // (empty-allowlist ConfinedClosed) run brokers nothing.
+    if composed_degrade == ComposedDegrade::Mediated {
+        // Collect the brokered hosts first (an immutable borrow of the policy) so
+        // the loop body can re-borrow the real `BrokeredSecret` per host — the
+        // fact lifts only its `.secret_ref()`, never the (redacted) value.
+        let hosts: Vec<String> = egress_policy
+            .injected_refs()
+            .map(|(h, _)| h.to_string())
+            .collect();
+        for host in &hosts {
+            let Some(secret) = egress_policy.secret_for(host) else {
+                continue;
+            };
+            let (subject, payload) =
+                rezidnt_run::egress::injected_fact(&run_str, host, secret, &policy_ref);
+            publish(
+                &daemon.fabric,
+                Event::new(
+                    SourceId::new("rezidnt-run"),
+                    Some(workspace),
+                    Subject::new(subject),
+                    correlation,
+                    Some(allocated_id),
+                    1,
+                    payload,
+                )?,
+            )
+            .await?;
+        }
+    }
+
+    // credential.dropped — one loud fact per unresolvable `secret_ref` (DR-029
+    // §Decision 2). The mapping was dropped (host mediated-without-injection),
+    // never a fake secret. Carries only labels; by construction no value.
+    for drop in &credential_drops {
+        let (subject, payload) =
+            rezidnt_run::egress::dropped_fact(&run_str, drop.dest(), drop.secret_ref());
+        publish(
+            &daemon.fabric,
+            Event::new(
+                SourceId::new("rezidnt-run"),
+                Some(workspace),
+                Subject::new(subject),
+                correlation,
+                Some(allocated_id),
+                1,
+                payload,
+            )?,
+        )
+        .await?;
+    }
 
     let mut spawned_payload = json!({
         "run": run,
@@ -985,8 +1077,22 @@ pub async fn launch_agent(
 /// inside its sealed mount-ns (DR-028 §Decision 1); the harness identity is
 /// DECLARED authority computed daemon-side (`plan.bin`), not a request-time value —
 /// `compose::confined_program_binds` is the single shared definition of "bind what
-/// you're about to exec". Returns `(sandbox, egress)`.
-fn fold_c3_policies(plan: &SpawnPlan, worktree: &Path) -> (SandboxPolicy, EgressPolicy) {
+/// you're about to exec".
+///
+/// DR-029: the egress half is now the REAL fold — the project-declared `[egress]`
+/// allowlist + the `[egress.secrets]` map, whose values resolve daemon-side via a
+/// [`HostFileSecretSource`] (env `REZIDNT_EGRESS_SECRETS`, the authority boundary
+/// OUTSIDE any workspace spec). An unresolvable `secret_ref` is DROPPED (reported
+/// as a [`CredentialDrop`] so the loud `credential.dropped` fact rides it), never
+/// a fake secret. Both policies reach their type ONLY through
+/// `from_folded_authority` (C6/DR-024 — no `SpawnPlan`/request door). Returns
+/// `(sandbox, egress, drops)`. A source/parse failure is an honest error (the
+/// deny-all default is preserved for an ABSENT block, never for a malformed one).
+fn fold_c3_policies(
+    plan: &SpawnPlan,
+    worktree: &Path,
+    egress_spec: &rezidnt_run::spec::EgressSpec,
+) -> anyhow::Result<(SandboxPolicy, EgressPolicy, Vec<CredentialDrop>)> {
     // Sandbox binds, in bwrap APPLICATION ORDER (later binds override earlier ones
     // on overlapping paths — so the WRITABLE worktree must come LAST, or a broader
     // read-only bind that happens to be an ANCESTOR of the worktree would shadow it
@@ -1016,9 +1122,18 @@ fn fold_c3_policies(plan: &SpawnPlan, worktree: &Path) -> (SandboxPolicy, Egress
     //    would break the golden-path diff (the harness could not write its change).
     binds.push(Bind::writable(worktree));
     let sandbox = SandboxPolicy::from_folded_authority(binds, true);
-    // Egress: empty spec ⇒ empty allowlist ⇒ deny-all (absent never means open).
-    let egress = EgressPolicy::from_folded_authority(Vec::new(), std::collections::BTreeMap::new());
-    (sandbox, egress)
+
+    // Egress: fold the DECLARED `[egress]` allowlist + resolve the
+    // `[egress.secrets]` values daemon-side. An ABSENT block folds to an empty
+    // allowlist (deny-all — absent never means open); a set-but-missing/malformed
+    // secrets file is an honest error (never a silently-empty source that would
+    // drop the boundary — DR-029 §Decision 3 / DR-020). An unresolvable ref is
+    // DROPPED (reported so the loud fact rides it), never a fake secret.
+    let secrets = HostFileSecretSource::from_env()
+        .context("resolve REZIDNT_EGRESS_SECRETS host secrets source")?;
+    let (egress, drops) = fold_egress_policy(egress_spec, &secrets)
+        .context("fold the [egress] allowlist + brokered secrets")?;
+    Ok((sandbox, egress, drops))
 }
 
 /// The composed spawn (DR-028 §Decision 1/2/4) — the C3 wiring that REPLACES the
@@ -1037,10 +1152,24 @@ fn fold_c3_policies(plan: &SpawnPlan, worktree: &Path) -> (SandboxPolicy, Egress
 ///   claim of mediation.
 ///
 /// Binds/allowlist reach the wrapper ONLY via `fold_c3_policies` (C6 preserved).
+///
+/// DR-029: returns the folded [`EgressPolicy`] + any [`CredentialDrop`]s so the
+/// caller emits the by-reference `credential.injected` (per brokered host) and
+/// loud `credential.dropped` (per unresolvable ref) facts. The Mediated arm is now
+/// REACHABLE — a non-empty folded allowlist keeps the Mediated decision; only an
+/// EMPTY allowlist (the no-egress-config case) downgrades to the confined+CLOSED
+/// sealed netns (honest deny-all, never a claim of mediation with nothing to
+/// mediate).
 fn compose_spawn(
     plan: &SpawnPlan,
     worktree: &Path,
-) -> anyhow::Result<(ComposedChild, ComposedDegrade)> {
+    egress_spec: &rezidnt_run::spec::EgressSpec,
+) -> anyhow::Result<(
+    ComposedChild,
+    ComposedDegrade,
+    EgressPolicy,
+    Vec<CredentialDrop>,
+)> {
     // Resolve the harness binary FIRST — a nonexistent harness is a spawn-time
     // failure (`open-failed`), exactly as the raw `Command::new(&plan.bin).spawn()`
     // it replaces: `Command::new("/nonexistent")` returned ENOENT. Routing through
@@ -1055,7 +1184,7 @@ fn compose_spawn(
             plan.bin.display()
         );
     }
-    let (sandbox_policy, egress_policy) = fold_c3_policies(plan, worktree);
+    let (sandbox_policy, egress_policy, drops) = fold_c3_policies(plan, worktree, egress_spec)?;
 
     // Probe the two backends (a missing tool is a VERDICT, never a crash — the
     // could-not-run discipline).
@@ -1065,17 +1194,15 @@ fn compose_spawn(
     let egress_avail = pasta.availability();
     let mut degrade = compose_degrade(&sandbox_avail, &egress_avail);
 
-    // HONESTY: the Mediated posture requires a LIVE proxy the sealed netns routes
-    // to. This slice's honestly-minimal fold is deny-all (an EMPTY egress
-    // allowlist), so there is NO allowlisted host and the daemon starts no per-run
-    // proxy dataplane here (the live proxy is the `start_composed_dataplane` path
-    // the enforce/shared-netns suite drives, not the real agent run yet). With
-    // nothing to mediate and no proxy address to route to, the honest posture is
-    // confined + CLOSED — a SEALED netns with no network — NOT a claim of
-    // mediation over a proxy that does not exist (the overclaim DR-028 forbids).
-    // When the folded allowlist is empty, downgrade a Mediated decision to
-    // ConfinedClosed for the SPAWN + the fact. A non-empty allowlist (a later
-    // slice that folds real egress config) takes the true Mediated pasta-outer arm.
+    // HONESTY (DR-029 §Decision 5): a non-empty folded allowlist takes the true
+    // Mediated pasta-outer arm — a sealed netns whose sole route out is the proxy,
+    // an allowlist for it to enforce, and the resolved secrets to broker. The
+    // EMPTY-allowlist case (no `[egress]` config, or one that folded empty) is the
+    // no-egress-config floor: there is nothing to mediate, so the honest posture
+    // is confined + CLOSED — a SEALED netns with no network — NOT a claim of
+    // mediation over an empty allowlist (the overclaim DR-028/DR-029 forbid; absent
+    // never means open). So downgrade a Mediated decision to ConfinedClosed ONLY
+    // when the folded allowlist is empty.
     if degrade == ComposedDegrade::Mediated && egress_policy.allowlist().is_empty() {
         degrade = ComposedDegrade::ConfinedClosed;
     }
@@ -1143,7 +1270,12 @@ fn compose_spawn(
         ComposedDegrade::ConfinedClosed => "bwrap",
         ComposedDegrade::Unsandboxed => "none",
     };
-    Ok((ComposedChild::new(backend, child), degrade))
+    Ok((
+        ComposedChild::new(backend, child),
+        degrade,
+        egress_policy,
+        drops,
+    ))
 }
 
 /// Does the harness binary `bin` resolve to an existing executable — either an

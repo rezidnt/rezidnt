@@ -494,6 +494,102 @@ pub fn start_daemon_with_admin_permit(admin_permit_toml: &str) -> (DaemonGuard, 
     )
 }
 
+/// A daemon started with a HOST-LEVEL egress-secrets source wired OUTSIDE any
+/// workspace spec (DR-029 §Decision 3): `REZIDNT_EGRESS_SECRETS` points at a host
+/// TOML (`secret_ref = "value"`) the daemon reads at fold time, physically
+/// unreachable from the `spec_toml` an `open` carries — a dev cannot self-grant a
+/// secret. The `REZIDNT_ADMIN_PERMIT` authority-boundary harness applied to
+/// secrets. Returns a plain [`DaemonGuard`] (the test binds a single value and
+/// uses `.socket`).
+pub fn start_daemon_with_egress_secrets(secrets_toml: &str) -> DaemonGuard {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let cas = dir.path().join("cas");
+    // The host secrets file lives OUTSIDE any workspace repo/spec — a sibling of
+    // the daemon's own state, set by whoever launches the daemon (the boundary).
+    let secrets = dir.path().join("egress-secrets.toml");
+    std::fs::write(&secrets, secrets_toml).expect("write host egress secrets toml");
+
+    let child = Command::new(daemon_bin())
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .env("REZIDNT_CAS", &cas)
+        .env("REZIDNT_EGRESS_SECRETS", &secrets)
+        .spawn()
+        .expect("spawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    DaemonGuard {
+        child,
+        socket,
+        db,
+        _dir: dir,
+    }
+}
+
+/// A temp project carrying a non-empty `[egress]` block (DR-029): a git repo +
+/// the stub harness + a §13 spec with `allowlist` + an `[egress.secrets]`
+/// `host → secret_ref` LABEL map (repo-safe — labels, never values). `gap_ms`
+/// sizes the harness's fake work; `allowlist` names the hosts; `secrets` is the
+/// `(host, secret_ref)` mapping the daemon-side `SecretSource` resolves. Returns
+/// `(tempdir, spec_toml)` — mirrors [`make_project`].
+pub fn make_egress_project(
+    gap_ms: u64,
+    allowlist: &[&str],
+    secrets: &[(&str, &str)],
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).expect("mkdir repo");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .expect("git init");
+    assert!(git.success());
+
+    let script = stub_harness(dir.path(), gap_ms);
+
+    // The allowlist array + the [egress.secrets] LABEL map (a secret_ref, never a
+    // value — the values resolve daemon-side from REZIDNT_EGRESS_SECRETS).
+    let allow = allowlist
+        .iter()
+        .map(|h| format!("\"{h}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let secret_lines = secrets
+        .iter()
+        .map(|(host, secret_ref)| format!("\"{host}\" = \"{secret_ref}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let spec = format!(
+        r#"[project]
+name = "c3-egress-fold"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+bin_override = "{script}"
+
+[egress]
+allowlist = [{allow}]
+
+[egress.secrets]
+{secret_lines}
+"#,
+        repo = repo.display(),
+        script = script.display(),
+    );
+    (dir, spec)
+}
+
 /// Attempt to start `rezidentd` with `REZIDNT_ADMIN_PERMIT` pointed at
 /// `admin_permit_path` (which may be missing or malformed) and report whether the
 /// daemon BECOMES READY — i.e. whether its socket appears within `deadline`.

@@ -8,6 +8,7 @@ pub mod compose;
 pub mod egress;
 pub mod reaper;
 pub mod sandbox;
+pub mod secret;
 pub mod spawner;
 pub mod spec;
 

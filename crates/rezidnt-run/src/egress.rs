@@ -475,6 +475,29 @@ pub struct PastaProxy {
     pub enforce: Option<EnforceWiring>,
 }
 
+/// The bwrap-splice wiring the composed dataplane threads into pasta's netns exec
+/// (DR-028 §Decision 1/2). Pure data (the bwrap binary + the unshare-all-MINUS-net
+/// confinement prefix rendered from the folded `SandboxPolicy` ONLY — the C6
+/// no-widening guard). When present, `pasta … -- <bwrap_bin> <bwrap_prefix> -- <probe> …`
+/// runs the probe UNDER bwrap confinement inside pasta's sealed netns; the prefix
+/// deliberately carries NO net unshare so the probe inherits the shared netns.
+///
+/// It is NOT a field on [`PastaProxy`] (that struct's literal shape is pinned by
+/// the enforce + c3-wire oracle suites, which construct it with `connector_bin` +
+/// `enforce` only); the composed start passes it SEPARATELY to
+/// [`unix-only PastaHandle::start_composed`]. Cross-platform data carrier; only the
+/// unix dataplane consumes it.
+#[derive(Debug, Clone)]
+pub struct ComposedSpliceWiring {
+    /// The `bwrap` binary pasta execs as the confined program (defaults resolved
+    /// by the caller; `"bwrap"` on PATH).
+    pub bwrap_bin: String,
+    /// The bwrap confinement argv (unshare-all-MINUS-net + `--die-with-parent` +
+    /// the folded binds), rendered from the folded [`crate::sandbox::SandboxPolicy`]
+    /// ONLY. Sits between `<bwrap_bin>` and the `--` that hands off to the probe.
+    pub bwrap_prefix: Vec<String>,
+}
+
 /// The test-support wiring the enforce dataplane needs to stand up the live
 /// byte-path (DR-023 dev-only). The confined program `pasta` execs in the sealed
 /// netns, and the upstream the proxy dials on an approved reach. In production
@@ -979,8 +1002,32 @@ impl EgressDataplane for PastaProxy {
 }
 
 #[cfg(unix)]
-impl EgressDataplane for PastaProxy {
-    fn start(&self, policy: &EgressPolicy) -> Result<Box<dyn DataplaneHandle>, RunError> {
+impl PastaProxy {
+    /// The c3-wire COMPOSED dataplane start (DR-028 §Decision 1/2): identical to
+    /// [`EgressDataplane::start`] but pasta execs the confined probe THROUGH the
+    /// `splice`'s `bwrap` inside the sealed netns (pasta-outer -> bwrap -> probe),
+    /// so the probe is filesystem-confined AND inherits pasta's sealed netns. The
+    /// splice's bwrap prefix is folded from the sandbox policy ONLY (C6 guard); the
+    /// composed run-loop (`compose::start_composed_dataplane`) is the sole caller.
+    /// Kept beside `start` so both share the CA/availability/honesty-guard path.
+    pub fn start_composed(
+        &self,
+        policy: &EgressPolicy,
+        splice: ComposedSpliceWiring,
+    ) -> Result<Box<dyn DataplaneHandle>, RunError> {
+        self.start_dataplane(policy, Some(splice))
+    }
+
+    /// The shared dataplane-start path (DR-026 enforce + DR-028 compose). `splice`
+    /// selects the confined exec: `None` → pasta execs the probe directly
+    /// (c3bc-enforce), `Some` → pasta execs `bwrap <prefix> -- <probe>` inside the
+    /// sealed netns (c3-wire composition). The CA mint, the honesty guard (unwired
+    /// enforce is an error), and the CLOSED-on-unavailable degrade are identical.
+    fn start_dataplane(
+        &self,
+        policy: &EgressPolicy,
+        splice: Option<ComposedSpliceWiring>,
+    ) -> Result<Box<dyn DataplaneHandle>, RunError> {
         // The enforce dataplane needs its wiring (the confined probe program + the
         // upstream to dial). Absent it, this is the DR-027 honesty guard, not a
         // fake pass: the decide-layer default does NOT enforce, so an unwired
@@ -1013,13 +1060,32 @@ impl EgressDataplane for PastaProxy {
                 .map_err(|e| RunError::Spawn(format!("rezidnt CA build failed: {e}")))?,
         );
 
-        let handle = unix_dataplane::PastaHandle::start(
-            self.connector_bin.clone(),
-            ca,
-            policy.clone(),
-            wiring,
-        )?;
+        let handle = match splice {
+            Some(splice) => unix_dataplane::PastaHandle::start_composed(
+                self.connector_bin.clone(),
+                ca,
+                policy.clone(),
+                wiring,
+                splice,
+            )?,
+            None => unix_dataplane::PastaHandle::start(
+                self.connector_bin.clone(),
+                ca,
+                policy.clone(),
+                wiring,
+            )?,
+        };
         Ok(Box::new(handle))
+    }
+}
+
+#[cfg(unix)]
+impl EgressDataplane for PastaProxy {
+    fn start(&self, policy: &EgressPolicy) -> Result<Box<dyn DataplaneHandle>, RunError> {
+        // The c3bc-enforce shape: pasta execs the confined probe DIRECTLY (no bwrap
+        // splice — the enforce suite's self-made netns). The composed run-loop uses
+        // `start_composed` to splice bwrap inside the sealed netns (DR-028).
+        self.start_dataplane(policy, None)
     }
 }
 
@@ -1046,8 +1112,8 @@ mod unix_dataplane {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        CapturedExchange, DataplaneHandle, EgressPolicy, EnforceWiring, EscapeAttempt, ProbeReach,
-        ProbeReport, RezidntCa,
+        CapturedExchange, ComposedSpliceWiring, DataplaneHandle, EgressPolicy, EnforceWiring,
+        EscapeAttempt, ProbeReach, ProbeReport, RezidntCa,
     };
     use crate::RunError;
 
@@ -1072,6 +1138,12 @@ mod unix_dataplane {
         ca: Arc<RezidntCa>,
         policy: EgressPolicy,
         wiring: EnforceWiring,
+        /// c3-wire composition splice (DR-028): when `Some`, pasta execs the
+        /// confined probe THROUGH `bwrap` inside the sealed netns (pasta-outer ->
+        /// bwrap -> probe), so the probe is filesystem-confined AND inherits pasta's
+        /// sealed netns. `None` for the c3bc-enforce self-made shape (pasta execs
+        /// the probe directly).
+        splice: Option<ComposedSpliceWiring>,
         /// Signals the accept loop to stop; the listener drops with the handle.
         shutdown: Arc<AtomicBool>,
         /// The last ingress (agent) request headers the proxy read — the capture
@@ -1086,6 +1158,33 @@ mod unix_dataplane {
             ca: Arc<RezidntCa>,
             policy: EgressPolicy,
             wiring: EnforceWiring,
+        ) -> Result<Self, RunError> {
+            // The c3bc-enforce shape: pasta execs the probe DIRECTLY, no bwrap
+            // splice (the enforce suite's self-made netns).
+            Self::start_inner(connector_bin, ca, policy, wiring, None)
+        }
+
+        /// The c3-wire COMPOSED start (DR-028 §Decision 1/2): pasta seals the netns
+        /// and execs `bwrap <prefix> -- <probe>` inside it, so the probe (the
+        /// running agent) inherits pasta's sealed netns UNDER bwrap confinement.
+        /// The `splice` carries the bwrap binary + the unshare-all-MINUS-net
+        /// confinement prefix (folded from the sandbox policy ONLY — C6 guard).
+        pub fn start_composed(
+            connector_bin: Option<String>,
+            ca: Arc<RezidntCa>,
+            policy: EgressPolicy,
+            wiring: EnforceWiring,
+            splice: ComposedSpliceWiring,
+        ) -> Result<Self, RunError> {
+            Self::start_inner(connector_bin, ca, policy, wiring, Some(splice))
+        }
+
+        fn start_inner(
+            connector_bin: Option<String>,
+            ca: Arc<RezidntCa>,
+            policy: EgressPolicy,
+            wiring: EnforceWiring,
+            splice: Option<ComposedSpliceWiring>,
         ) -> Result<Self, RunError> {
             let connector_bin = connector_bin.unwrap_or_else(|| "pasta".to_string());
             // Bind the proxy on host loopback (the host namespace HAS internet; the
@@ -1138,6 +1237,7 @@ mod unix_dataplane {
                 ca,
                 policy,
                 wiring,
+                splice,
                 shutdown,
                 agent_headers,
                 listener_thread: Some(listener_thread),
@@ -1171,11 +1271,33 @@ mod unix_dataplane {
             // The probe seals routes then runs; the connector is EXEC'd, never
             // linked (I7 — no new linked crate for the netns).
             let mut cmd = std::process::Command::new(&self.connector_bin);
-            cmd.arg("--config-net")
-                .arg("-q")
-                .arg("-f")
-                .arg("--")
-                .arg(&self.wiring.probe_bin)
+            cmd.arg("--config-net").arg("-q").arg("-f").arg("--");
+            // c3-wire COMPOSITION (DR-028 §Decision 1): when a splice is present,
+            // pasta execs `bwrap <prefix> --` BEFORE the probe, so the probe runs
+            // filesystem-confined by bwrap INSIDE pasta's sealed netns. The prefix
+            // carries the unshare-all-MINUS-net posture (no `--unshare-net`), so the
+            // probe INHERITS pasta's already-sealed, proxy-only netns rather than a
+            // fresh empty one. Absent a splice (c3bc-enforce), pasta execs the probe
+            // directly. The prefix is folded from the sandbox policy ONLY (C6 guard).
+            if let Some(splice) = &self.splice {
+                cmd.arg(&splice.bwrap_bin);
+                for a in &splice.bwrap_prefix {
+                    cmd.arg(a);
+                }
+                // The CA-cert PEM is the folded READ-ONLY trust anchor the confined
+                // probe reads to trust the proxy's per-destination leaf (DR-026
+                // §Decision — the sandbox trusts the rezidnt CA via a read-only
+                // bind). Under composition bwrap seals the mount-ns, so this
+                // daemon-written temp PEM must be bind-mounted or the probe cannot
+                // read it (`read CA pem: No such file or directory`). It is a PUBLIC
+                // trust anchor (never the CA private key, which never leaves the
+                // daemon) — a read-only bind of the exact file the probe was told to
+                // read, not a policy widening.
+                let ca_str = ca_path.to_string_lossy().into_owned();
+                cmd.arg("--ro-bind").arg(&ca_str).arg(&ca_str);
+                cmd.arg("--");
+            }
+            cmd.arg(&self.wiring.probe_bin)
                 .arg(mode)
                 .arg(&self.proxy_addr)
                 .arg(&ca_path);

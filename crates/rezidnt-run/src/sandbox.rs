@@ -233,23 +233,78 @@ pub trait SandboxSubstrate {
 /// Oracle stub: the implementer writes the real renderer. It exists as a `pub`
 /// pure fn so the no-widening + confinement-argv tests can drive it host-side
 /// (no `bwrap` needed to inspect the argv it WOULD run).
-pub fn bwrap_argv(_plan: &SpawnPlan, policy: &SandboxPolicy) -> Vec<String> {
-    // Binds and unshare come from `policy` ONLY — never `plan.args`/`plan.env`.
-    // This is the C6/DR-024 no-widening guard: a run-supplied value cannot reach
-    // the bind directives (the `_plan` arg is deliberately unused here — its
-    // argv/env is the CHILD's, composed AFTER the `--` in `spawn_confined`, never
-    // folded into a bind). The private `SandboxPolicy::binds` field is the
-    // type-system half of the same guard.
+pub fn bwrap_argv(plan: &SpawnPlan, policy: &SandboxPolicy) -> Vec<String> {
+    // The C3a-alone posture: the full unshare set (network INCLUDED). bwrap makes
+    // its own fresh netns via `--unshare-all` — no shared netns to inherit.
+    bwrap_argv_inner(plan, policy, /* share_net */ false)
+}
+
+/// Render the `bwrap` argv for the SHARED-NETNS composition (DR-028 §Decision 1):
+/// the unshare-all-MINUS-net posture. Every namespace the C3a posture drops is
+/// still dropped (user, pid, ipc, uts, cgroup) EXCEPT the network — so the agent
+/// INHERITS the netns bwrap runs inside (pasta's already-sealed, proxy-only netns)
+/// rather than landing in a fresh empty one with no route out.
+///
+/// This is the ONE argv difference that makes pasta-outer work: a bare
+/// `--unshare-all` (or `--unshare-net`) here would re-unshare the network and drop
+/// the agent into an empty netns — mediation would be dead, not enforced. The
+/// composed spawn calls THIS renderer (not [`bwrap_argv`]) only when egress is
+/// active; the binds/`--die-with-parent`/no-widening discipline are identical.
+pub fn bwrap_argv_shared_netns(plan: &SpawnPlan, policy: &SandboxPolicy) -> Vec<String> {
+    bwrap_argv_inner(plan, policy, /* share_net */ true)
+}
+
+/// The shared renderer both public `bwrap_argv*` fns delegate to. `share_net`
+/// selects the netns posture: `false` → the C3a full `--unshare-all` (fresh
+/// netns), `true` → the unshare-all-MINUS-net set (inherit the shared netns —
+/// DR-028 §Decision 1). Binds and unshare come from `policy` ONLY, never
+/// `plan.args`/`plan.env` (the C6/DR-024 no-widening guard — `_plan` is unused for
+/// wrapper directives; the run-supplied argv is the CHILD's, composed AFTER `--`).
+fn bwrap_argv_inner(_plan: &SpawnPlan, policy: &SandboxPolicy, share_net: bool) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
-    // Namespaces first (the folded unshare posture). `--unshare-all` drops
-    // network + pid + ipc + uts + cgroup + user; a run arg cannot add an
+    // Namespaces first (the folded unshare posture). A run arg cannot add an
     // unshare-EXCEPTION because we never read the plan here.
     if policy.unshare_all() {
-        argv.push("--unshare-all".to_string());
+        if share_net {
+            // Unshare-all MINUS net AND MINUS user: drop the namespaces
+            // `--unshare-all` would drop EXCEPT the network AND the user namespace,
+            // because BOTH are pasta's under pasta-outer (DR-028 §Decision 1). The
+            // net stays shared so the agent inherits pasta's already-sealed,
+            // proxy-only netns rather than a fresh empty one. The USER namespace
+            // stays pasta's too: pasta created the netns in ITS user-ns, so a
+            // process must remain in that user-ns to hold `CAP_NET_ADMIN` over the
+            // netns (seal its routes, reach the proxy). A bwrap `--unshare-user`
+            // here would put the agent in a NEW user-ns that does NOT own pasta's
+            // netns — stripping net-admin caps and breaking the sealed-route / proxy
+            // path (RTNETLINK EPERM). We still unshare ipc/pid/uts/cgroup + confine
+            // the filesystem to the folded binds — the confinement bwrap owns.
+            // Deliberately NO `--unshare-net`, `--unshare-all`, or `--unshare-user`.
+            argv.push("--unshare-ipc".to_string());
+            argv.push("--unshare-pid".to_string());
+            argv.push("--unshare-uts".to_string());
+            argv.push("--unshare-cgroup".to_string());
+        } else {
+            // The C3a-alone posture: `--unshare-all` drops network + pid + ipc +
+            // uts + cgroup + user (a fresh empty netns, no route to inherit).
+            argv.push("--unshare-all".to_string());
+        }
     }
     // The child dies when the daemon-owned parent does — no orphaned confined
     // process outlives the run (S1: the daemon owns the process lifetime).
     argv.push("--die-with-parent".to_string());
+    // A FRESH devtmpfs + procfs inside the namespace (NOT host binds — new
+    // namespace-isolated pseudo-filesystems, so no confinement leak). Required for
+    // a confined program to spawn children of its own: a dynamically-linked child
+    // exec'd via `posix_spawn` (glibc, as Rust's `std::process::Command` uses) needs
+    // `/dev` present or the spawn fails with a spurious ENOENT even though the
+    // target binary is reachable — a shell's plain `fork+execvp` does not, which is
+    // why a shell harness masks this. A confined agent that runs tools (`git`, `ip`,
+    // …) therefore needs `/dev` + `/proc`; without them the sandbox is exec-broken
+    // for real dynamically-linked programs.
+    argv.push("--dev".to_string());
+    argv.push("/dev".to_string());
+    argv.push("--proc".to_string());
+    argv.push("/proc".to_string());
     // One directive per folded bind, in policy order (deterministic): writable →
     // `--bind SRC DST`, read-only → `--ro-bind SRC DST`. DST defaults to SRC (the
     // worktree keeps its own path inside the namespace).

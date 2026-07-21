@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod badge;
 pub mod capture;
+pub mod compose;
 pub mod egress;
 pub mod reaper;
 pub mod sandbox;

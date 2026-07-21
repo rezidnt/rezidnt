@@ -20,6 +20,9 @@ use rezidnt_run::RunId;
 use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
 use rezidnt_run::badge::{Caveat, Macaroon, RootKey};
 use rezidnt_run::capture::{DEFAULT_CHUNK_BYTES, DEFAULT_RING_BYTES, RingBuffer, chunk_into_cas};
+use rezidnt_run::compose::{ComposedChild, ComposedDegrade, compose_degrade, degrade_fact};
+use rezidnt_run::egress::{EgressPolicy, EgressProxy, PastaProxy};
+use rezidnt_run::sandbox::{Bind, SandboxPolicy, SandboxSubstrate, bwrap_argv};
 use rezidnt_run::spawner::SpawnPlan;
 use rezidnt_run::spec::{AgentSpec, GateSpec, ProjectSpec};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
@@ -782,17 +785,40 @@ pub async fn launch_agent(
             .await
             .with_context(|| format!("write permit hook settings {}", settings_path.display()))?;
     }
-    let mut child = tokio::process::Command::new(&plan.bin)
-        .args(&plan.args)
-        .env_clear()
-        .envs(plan.env.iter().cloned())
-        .current_dir(&worktree)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn harness {}", plan.bin.display()))?;
+    // C3 COMPOSED SPAWN (DR-028): the raw `Command::new(&plan.bin)` bypass is GONE.
+    // The harness spawns THROUGH the composed confinement path — pasta -> bwrap ->
+    // agent on one shared netns when both backends are up, degrading to confined +
+    // CLOSED (bwrap alone, sealed netns) or loud unsandboxed otherwise. The binds /
+    // allowlist fold ONLY through `from_folded_authority` (C6 preserved), and the
+    // decided composed state is recorded as a distinct loud fact below.
+    let (mut composed_child, composed_degrade) = compose_spawn(&plan, &worktree)
+        .with_context(|| format!("composed spawn of harness {}", plan.bin.display()))?;
     let started = std::time::Instant::now();
+
+    // The composed-spawn/degrade fact — the durable record that the spawn went
+    // THROUGH the composition decision (not a silent raw spawn). Each of the three
+    // states carries its distinct loud posture (DR-028 §Decision 4). WARDEN-GATED
+    // placeholder subject (the `sandbox.*`/`egress.*` family is a deferred
+    // `/subject`, DR-028 §Consequences); keyed off the posture fields the fold
+    // suites pin, not a ratified name.
+    let (degrade_subject, mut degrade_payload) = degrade_fact(&composed_degrade, &run_str);
+    if let Some(obj) = degrade_payload.as_object_mut() {
+        obj.insert("agent".to_string(), json!(agent.name));
+        obj.insert("backend".to_string(), json!(composed_child.backend()));
+    }
+    publish(
+        &daemon.fabric,
+        Event::new(
+            SourceId::new("rezidnt-run"),
+            Some(workspace),
+            Subject::new(degrade_subject),
+            correlation,
+            Some(allocated_id),
+            1,
+            degrade_payload,
+        )?,
+    )
+    .await?;
 
     let mut spawned_payload = json!({
         "run": run,
@@ -803,7 +829,10 @@ pub async fn launch_agent(
         // `hex(blake3(sig)[..8])` — the sig-derived shape (DR-018 §Decision (a)).
         "badge_id": injected_badge.badge_id(),
     });
-    if let (Some(pid), Some(obj)) = (child.id(), spawned_payload.as_object_mut()) {
+    if let (Some(pid), Some(obj)) = (
+        composed_child.child_mut().id(),
+        spawned_payload.as_object_mut(),
+    ) {
         obj.insert("pid".to_string(), json!(pid));
     }
     if let (Some(key), Some(obj)) = (idempotency_key, spawned_payload.as_object_mut()) {
@@ -907,7 +936,17 @@ pub async fn launch_agent(
     } else {
         None
     };
-    let stdout = child.stdout.take().context("child stdout must be piped")?;
+    // Drain the composed child's PIPED stdout (the capture seam) off the borrow,
+    // then move the OWNED `tokio::process::Child` into the run task where the
+    // daemon reaper adopts it (S1 — the daemon owns the composed process, DR-028
+    // §Decision 2). No detached orphan waiter: the same child the run loop drains
+    // is the child the reaper `wait()`s.
+    let stdout = composed_child
+        .child_mut()
+        .stdout
+        .take()
+        .context("composed child stdout must be piped")?;
+    let child = composed_child.into_child();
     let ctx = RunTaskContext {
         daemon: Arc::clone(daemon),
         run,
@@ -928,6 +967,224 @@ pub async fn launch_agent(
         .instrument(span),
     );
     Ok(run)
+}
+
+/// Fold the honestly-minimal C3 policies for one run FROM FOLDED AUTHORITY ONLY
+/// (DR-028 §Decision 3; C6/DR-024 preserved end-to-end). The `[gates.permit]`/role
+/// bind+allowlist+secret fold field does not exist yet, so this slice's
+/// honestly-scoped FIRST source is the run state the daemon already holds:
+/// - the SANDBOX binds fold to the allocated worktree (writable) plus the
+///   read-only toolchain roots the confined harness needs to resolve — the minimal
+///   confinement that lets a real run execute, NEVER a run-supplied bind.
+/// - the EGRESS allowlist is EMPTY: the spec carries no egress config, so absent
+///   means DENY-ALL (a sealed netns whose proxy allows nothing), never open.
+///
+/// Both go through `from_folded_authority` — the sole door; no `SpawnPlan`/request
+/// value reaches either policy (the private-field guard). The confined program's
+/// OWN binary directory is folded read-only too, so bwrap can `execvp` the harness
+/// inside its sealed mount-ns (DR-028 §Decision 1); the harness identity is
+/// DECLARED authority computed daemon-side (`plan.bin`), not a request-time value —
+/// `compose::confined_program_binds` is the single shared definition of "bind what
+/// you're about to exec". Returns `(sandbox, egress)`.
+fn fold_c3_policies(plan: &SpawnPlan, worktree: &Path) -> (SandboxPolicy, EgressPolicy) {
+    // Sandbox binds, in bwrap APPLICATION ORDER (later binds override earlier ones
+    // on overlapping paths — so the WRITABLE worktree must come LAST, or a broader
+    // read-only bind that happens to be an ANCESTOR of the worktree would shadow it
+    // read-only). `unshare_all = true` — the composed spawn drops the net unshare
+    // only when egress is active (DR-028 §Decision 1), inside compose.
+    //
+    // 1. Read-only toolchain roots (the C3a usr-merged discipline — the confined
+    //    harness's interpreter/libs resolve inside the namespace).
+    let mut binds = vec![
+        Bind::read_only("/usr"),
+        Bind::read_only("/bin"),
+        Bind::read_only("/lib"),
+        Bind::read_only("/lib64"),
+        Bind::read_only("/etc"),
+    ];
+    // 2. The harness binary's own directory (read-only) so bwrap can exec it inside
+    //    the sealed mount-ns — a harness living outside the toolchain binds (e.g. a
+    //    cargo-target example, or an installed `claude` under $HOME) is otherwise
+    //    `No such file or directory` under bwrap even though it exists on the host.
+    //    Folded from the DECLARED harness path daemon-side (C6 holds — same door).
+    //    Placed BEFORE the worktree so that when the harness dir is an ancestor of
+    //    the worktree (e.g. a test tmpdir holding both), the writable worktree bind
+    //    below still WINS — the confined harness must be able to write its worktree.
+    binds.extend(rezidnt_run::compose::confined_program_binds(plan));
+    // 3. The WRITABLE worktree — LAST, so it overrides any read-only ancestor bind
+    //    above. The confined harness edits its worktree; a shadowing read-only bind
+    //    would break the golden-path diff (the harness could not write its change).
+    binds.push(Bind::writable(worktree));
+    let sandbox = SandboxPolicy::from_folded_authority(binds, true);
+    // Egress: empty spec ⇒ empty allowlist ⇒ deny-all (absent never means open).
+    let egress = EgressPolicy::from_folded_authority(Vec::new(), std::collections::BTreeMap::new());
+    (sandbox, egress)
+}
+
+/// The composed spawn (DR-028 §Decision 1/2/4) — the C3 wiring that REPLACES the
+/// raw `Command::new(&plan.bin)` bypass. Probes the sandbox + egress backends,
+/// decides the composed degrade state, and spawns the harness THROUGH the composed
+/// confinement path, returning a daemon-owned [`ComposedChild`] (the S1 handle the
+/// run loop drains + the reaper adopts) plus the [`ComposedDegrade`] the caller
+/// records as a distinct loud fact.
+///
+/// - **Mediated** (sandbox-up + egress-up): `pasta -> bwrap(minus-net) -> harness`
+///   over one shared netns (composed argv).
+/// - **ConfinedClosed** (sandbox-up + egress-down): `bwrap(--unshare-all) -> harness`
+///   — confined + a sealed netns, no network (DR-026's CLOSED degrade composed).
+/// - **Unsandboxed** (sandbox-down): the harness spawns raw (DR-025's loud-OPEN
+///   degrade) — the caller's fact declares egress un-enforceable, never a silent
+///   claim of mediation.
+///
+/// Binds/allowlist reach the wrapper ONLY via `fold_c3_policies` (C6 preserved).
+fn compose_spawn(
+    plan: &SpawnPlan,
+    worktree: &Path,
+) -> anyhow::Result<(ComposedChild, ComposedDegrade)> {
+    // Resolve the harness binary FIRST — a nonexistent harness is a spawn-time
+    // failure (`open-failed`), exactly as the raw `Command::new(&plan.bin).spawn()`
+    // it replaces: `Command::new("/nonexistent")` returned ENOENT. Routing through
+    // bwrap would otherwise turn that into `Command::new("bwrap")` (which exists)
+    // succeeding and the confined child failing later — a run-time error, not a
+    // spawn error, breaking the S1 partial-open contract. Also prevents
+    // `confined_program_binds` from binding a nonexistent directory (bwrap would
+    // reject it with a confusing error). A bare name is resolved via PATH.
+    if !harness_binary_resolves(&plan.bin) {
+        anyhow::bail!(
+            "harness binary {} does not exist or is not on PATH",
+            plan.bin.display()
+        );
+    }
+    let (sandbox_policy, egress_policy) = fold_c3_policies(plan, worktree);
+
+    // Probe the two backends (a missing tool is a VERDICT, never a crash — the
+    // could-not-run discipline).
+    let bwrap = rezidnt_run::sandbox::BwrapSubstrate::default();
+    let pasta = PastaProxy::default();
+    let sandbox_avail = bwrap.availability();
+    let egress_avail = pasta.availability();
+    let mut degrade = compose_degrade(&sandbox_avail, &egress_avail);
+
+    // HONESTY: the Mediated posture requires a LIVE proxy the sealed netns routes
+    // to. This slice's honestly-minimal fold is deny-all (an EMPTY egress
+    // allowlist), so there is NO allowlisted host and the daemon starts no per-run
+    // proxy dataplane here (the live proxy is the `start_composed_dataplane` path
+    // the enforce/shared-netns suite drives, not the real agent run yet). With
+    // nothing to mediate and no proxy address to route to, the honest posture is
+    // confined + CLOSED — a SEALED netns with no network — NOT a claim of
+    // mediation over a proxy that does not exist (the overclaim DR-028 forbids).
+    // When the folded allowlist is empty, downgrade a Mediated decision to
+    // ConfinedClosed for the SPAWN + the fact. A non-empty allowlist (a later
+    // slice that folds real egress config) takes the true Mediated pasta-outer arm.
+    if degrade == ComposedDegrade::Mediated && egress_policy.allowlist().is_empty() {
+        degrade = ComposedDegrade::ConfinedClosed;
+    }
+
+    let bwrap_bin = "bwrap";
+    // The proxy address the sealed netns would route to under true mediation. Unused
+    // in the current arms (Mediated with a live proxy is a later slice); kept for
+    // the composed-argv render seam.
+    let proxy_addr = "127.0.0.1:9";
+
+    // Build the composed command per the decided state. Every arm pipes stdout
+    // (the capture seam), nulls stdin/stderr, and runs in the worktree — the same
+    // S1 lifecycle the raw spawn had, now through confinement.
+    let mut cmd = match degrade {
+        ComposedDegrade::Mediated => {
+            // pasta -> bwrap(minus-net) -> harness, one shared netns. The composed
+            // argv is argv[0]=pasta … -- bwrap … -- <harness> <args>. bwrap resets
+            // cwd inside its sealed mount-ns, so inject `--chdir <worktree>` after
+            // the bwrap token — the confined harness runs IN the worktree (its
+            // relative paths resolve), matching the raw spawn's `.current_dir`.
+            let mut argv = rezidnt_run::compose::composed_argv(
+                plan,
+                &sandbox_policy,
+                /* egress_active */ true,
+                proxy_addr,
+            );
+            insert_bwrap_chdir(&mut argv, worktree);
+            argv_to_command(&argv)
+        }
+        ComposedDegrade::ConfinedClosed => {
+            // bwrap alone with the full --unshare-all (net sealed, no route) — the
+            // confined + CLOSED spawn. No pasta: the sealed netns has no network.
+            let mut argv = vec![bwrap_bin.to_string()];
+            argv.extend(bwrap_argv(plan, &sandbox_policy));
+            // Run the confined harness IN the worktree (bwrap resets cwd otherwise).
+            argv.push("--chdir".to_string());
+            argv.push(worktree.to_string_lossy().into_owned());
+            argv.push("--".to_string());
+            argv.push(plan.bin.to_string_lossy().into_owned());
+            argv.extend(plan.args.iter().cloned());
+            argv_to_command(&argv)
+        }
+        ComposedDegrade::Unsandboxed => {
+            // Sandbox down ⇒ the harness spawns raw (DR-025 loud-OPEN degrade). The
+            // caller emits the loud egress-un-enforceable fact; NO silent claim of
+            // confinement or mediation is made.
+            let mut cmd = tokio::process::Command::new(&plan.bin);
+            cmd.args(&plan.args);
+            cmd
+        }
+    };
+
+    let child = cmd
+        .env_clear()
+        .envs(plan.env.iter().cloned())
+        .current_dir(worktree)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("composed spawn ({:?}) of {}", degrade, plan.bin.display()))?;
+
+    let backend = match degrade {
+        ComposedDegrade::Mediated => "pasta+bwrap",
+        ComposedDegrade::ConfinedClosed => "bwrap",
+        ComposedDegrade::Unsandboxed => "none",
+    };
+    Ok((ComposedChild::new(backend, child), degrade))
+}
+
+/// Does the harness binary `bin` resolve to an existing executable — either an
+/// existing path (absolute/relative with a directory component) or a bare name on
+/// `PATH`? Reproduces the ENOENT semantics of the raw `Command::new(bin).spawn()`
+/// the composed spawn replaces, so a nonexistent harness fails at SPAWN time (the
+/// S1 `open-failed` contract) rather than turning into a bwrap run-time failure.
+fn harness_binary_resolves(bin: &Path) -> bool {
+    // A path with a directory component (absolute or `./x`) must exist on disk.
+    if bin.components().count() > 1 || bin.is_absolute() {
+        return bin.exists();
+    }
+    // A bare name resolves via PATH — search each entry for an existing file.
+    let name = bin.as_os_str();
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).exists()))
+        .unwrap_or(false)
+}
+
+/// Build a `tokio::process::Command` from a rendered argv (`argv[0]` is the
+/// program, the rest are its args). The composed wrapper argv is a flat vector;
+/// this lifts it back into a command the run loop spawns.
+fn argv_to_command(argv: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd
+}
+
+/// Inject `--chdir <worktree>` into the bwrap layer of a composed argv so the
+/// confined harness runs IN the worktree (bwrap otherwise resets cwd to `/` inside
+/// its sealed mount-ns, breaking a harness's relative paths). Inserts right after
+/// the `bwrap` program token — the first `"bwrap"`-suffixed argv element after the
+/// pasta handoff. A no-op if no bwrap token is found (defensive; the Mediated arm
+/// always renders one). `--chdir` is a bwrap directive, folded from the worktree
+/// the daemon allocated — not a run-supplied value (C6 holds).
+fn insert_bwrap_chdir(argv: &mut Vec<String>, worktree: &Path) {
+    if let Some(pos) = argv.iter().position(|a| a.ends_with("bwrap")) {
+        let wt = worktree.to_string_lossy().into_owned();
+        argv.insert(pos + 1, "--chdir".to_string());
+        argv.insert(pos + 2, wt);
+    }
 }
 
 /// `git worktree add` under the workspace dir. A repo with commits gets a

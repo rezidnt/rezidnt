@@ -94,6 +94,22 @@ impl SpawnPlan {
     pub fn permit_hook_config(&self) -> Option<&str> {
         self.permit_hook_config.as_deref()
     }
+
+    /// An empty placeholder plan — the pure wrapper renderers (`bwrap_argv*`,
+    /// `connector_argv`) deliberately do NOT read the plan for wrapper directives
+    /// (the C6/DR-024 no-widening guard), so a caller that renders ONLY the folded
+    /// wrapper (e.g. the composed dataplane's bwrap prefix, where the confined
+    /// program is appended separately, not from a plan) needs a plan value the
+    /// renderer will ignore. No `Default` impl: this is deliberately named to
+    /// document that the plan is a no-op here, never a source of confinement.
+    pub fn default_placeholder() -> Self {
+        Self {
+            bin: PathBuf::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            permit_hook_config: None,
+        }
+    }
 }
 
 /// The claude-code `.claude/settings.json` fragment wiring the `PreToolUse`

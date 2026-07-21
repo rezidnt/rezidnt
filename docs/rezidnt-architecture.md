@@ -318,6 +318,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Amended by [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md).** Folds **C3b+c** into one slice — the full L7 egress chokepoint: a TLS-terminating `EgressProxy` (I4) that is the sole, inescapable route out of C3a's sealed netns (`pasta` connector, transparent TCP+DNS interception), a process-lifetime rezidnt CA (`rustls`/`rcgen`), and credential brokering (secrets injected upstream, never held by the agent, logged by-ref-never-value). Degrades CLOSED. First C3 slice to add linked deps (App. A). macOS/Windows egress backends stay fenced behind the same trait; Windows coupled to the deferred Platform phase.
 >
 > **Amended by [DR-027](decisions/DR-027-c3bc-split-decide-enforce.md).** Sequences the folded c3bc into **c3bc-decide** (the egress decision/governance + type-safety + CA/TLS scaffolding layer, landed ENFORCEMENT-INERT — decides + builds certs but carries no live traffic, not wired live) then **c3bc-enforce** (the dataplane: `pasta` netns inescapability + live TLS byte-path + real injection + the WSL integration suite — carries DR-026's crit 3/4 and exit demo). DR-026 not weakened; its criteria are partitioned across the two slices.
+>
+> **Amended by [DR-028](decisions/DR-028-c3-wire.md).** Carves the **`c3-wire`** slice (Linux/WSL) after c3bc-enforce: wires C3a bwrap + the c3bc egress dataplane into the live spawn over one shared netns (pasta-outer), threads the daemon-owned composed child (S1), folds binds/allowlist/secrets from spec through `from_folded_authority` only (C6), and defines the product of the two asymmetric degrades (sandbox loud-OPEN × egress CLOSED) as three distinct loud facts. No invariant, posture, dependency, or ontology change.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -391,8 +393,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-025](decisions/DR-025-c3a-linux-sandbox.md) | C3a Linux OS-sandbox: bwrap-backed `SandboxSubstrate` (I4), folded-policy binds, loud degrade when absent, `PathConfinement` verdict stays a permit-verifier | ACCEPTED | §16, §18 |
 | [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md) | C3b+c full L7 egress MITM + credential brokering: `EgressProxy` (I4) sole inescapable route out of C3a's netns, rezidnt CA (rustls/rcgen), secrets injected upstream/never-held, logged by-ref-never-value, degrade CLOSED; first C3 linked deps | ACCEPTED | §16, §18, App. A |
 | [DR-027](decisions/DR-027-c3bc-split-decide-enforce.md) | C3b+c split decide→enforce: land the egress governance/type-safety/CA-scaffold layer ENFORCEMENT-INERT; sequence DR-026's full-MITM dataplane (inescapability + real injection, crit 3/4 + exit demo) into its own next slice. DR-026 not weakened — criteria partitioned | ACCEPTED | §16, §18 |
+| [DR-028](decisions/DR-028-c3-wire.md) | C3 run-loop wiring (c3-wire): compose C3a bwrap + c3bc egress dataplane into the live rezidnt open/spawn over ONE shared netns (pasta-outer, sealed-before-agent), daemon-owned composed child (S1), folded-from-spec first source (C6 preserved), three composed degrade facts. No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
 
-*The next record is DR-028.*
+*The next record is DR-029.*
 
 ---
 

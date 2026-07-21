@@ -4,24 +4,30 @@
 //! an `EgressScope` sibling of `PathConfinement` in `rezidnt-gate`) the ONLY
 //! route out of C3a's sealed netns — and brokers a secret the agent never holds.
 //!
-//! ## Scope: this is the DECISION layer — ENFORCEMENT-INERT (DR-027 split)
+//! ## Scope: decide + enforce both landed (DR-027 split), NOT YET run-loop-wired
 //!
-//! DR-026's folded C3b+c was split by DR-027 into **c3bc-decide** (this module,
-//! landed) and **c3bc-enforce** (the dataplane, next slice). What lives here and
-//! is proven green: the `EgressScope` decision (allow/deny/escalate from folded
-//! policy), the [`EgressPolicy`] no-widening guard, the redacted
-//! [`BrokeredSecret`] type, the connector-argv renderer, the availability/
-//! degrade-CLOSED probe, and the [`RezidntCa`] + `rustls` terminating-config
-//! **scaffolding** (proves the CA/leaf lifecycle compiles and runs). What is NOT
-//! here and is c3bc-enforce's job: the live `pasta` netns→proxy→upstream
-//! **byte-path** (inescapability, DR-026 crit 3), live TLS termination of real
-//! traffic, and **real credential injection** into the upstream request
-//! (crit 4). `mediate`/`inject_and_proxy` therefore DECIDE and build certs but
-//! carry no live traffic and inject nothing — they return the `secret_ref` only.
-//! **This substrate MUST NOT be wired into a live run loop as if it enforced
-//! egress or brokered a credential until c3bc-enforce ships** (the DR-027 honesty
-//! guard — the decision layer announces itself inert, it does not look
-//! authoritative).
+//! DR-026's folded C3b+c was split by DR-027 into **c3bc-decide** and
+//! **c3bc-enforce**, both now landed in this module:
+//! - **c3bc-decide** (host-provable): the `EgressScope` decision (allow/deny/
+//!   escalate from folded policy), the [`EgressPolicy`] no-widening guard, the
+//!   redacted [`BrokeredSecret`] type, the connector-argv renderer, the
+//!   availability/degrade-CLOSED probe, and the [`RezidntCa`] + `rustls`
+//!   terminating-config.
+//! - **c3bc-enforce** (the live dataplane, unix, `EgressDataplane`/`PastaHandle`
+//!   below): a real `pasta` netns→`rustls`-terminating-proxy→upstream byte-path
+//!   with NO route out except the proxy (inescapability, DR-026 crit 3), live TLS
+//!   termination, and **real credential injection** at the one `.expose()`
+//!   upstream-write (crit 4). Proven by the `#[cfg(unix)]` WSL mediation suite
+//!   (real netns + real TLS; 4/4 green).
+//!
+//! **Still NOT wired into a live daemon run loop.** The dataplane exists and is
+//! test-proven behind the `EgressDataplane` seam, but nothing in the daemon/spawn
+//! path calls it yet — `start()` with unset wiring returns an honest error, and
+//! the `#[cfg(not(unix))]` path is an honest unsupported-platform error. Wiring
+//! the enforced spawn into the run loop is its own integration step; until then,
+//! product copy must not claim egress is enforced in a shipped run (the DR-027
+//! honesty guard, narrowed: the mechanism is real, the run-loop integration is
+//! not yet done).
 //!
 //! ## The load-bearing shape (DR-026 §Decision, mirroring the C3a C6 guard)
 //!
@@ -456,6 +462,50 @@ pub struct PastaProxy {
     /// PATH). The availability probe resolves through this so a test can point a
     /// substrate at a missing binary to exercise the CLOSED degrade.
     pub connector_bin: Option<String>,
+
+    /// c3bc-ENFORCE dataplane wiring — the live netns→proxy→upstream byte-path
+    /// (whose IMPL is unix-only, though this data carrier is cross-platform).
+    /// `None` on the decide-layer default: the honesty guard (DR-027) means the
+    /// substrate does NOT enforce until this is set. The enforce integration suite
+    /// builds it (the confined probe binary + the capturing upstream = test-support,
+    /// DR-023 fixtures-stay-dev-only); the daemon's live run-loop wiring that folds
+    /// this from real project state is the downstream slice. A `start` with `None`
+    /// (or on a non-unix host) is an honest `RunError`, never a silent no-op that
+    /// looks authoritative.
+    pub enforce: Option<EnforceWiring>,
+}
+
+/// The test-support wiring the enforce dataplane needs to stand up the live
+/// byte-path (DR-023 dev-only). The confined program `pasta` execs in the sealed
+/// netns, and the upstream the proxy dials on an approved reach. In production
+/// these are folded from real state (the harness the run-loop spawns + the real
+/// allowlisted upstream); here the enforce suite provides a probe binary and a
+/// capturing upstream so criterion 3/4 are FALSIFIABLE and non-vacuous. Pure data
+/// (paths/addr/DER) — cross-platform; only the dataplane that CONSUMES it (the
+/// `pasta`/netns machinery) is unix-only.
+#[derive(Debug, Clone)]
+pub struct EnforceWiring {
+    /// The confined program `pasta` execs inside the sealed netns — it seals the
+    /// route table to the proxy-only `/32`, runs the direct-egress escape
+    /// attempts, and reaches the proxy. Invoked as `<probe_bin> <mode> <args…>`;
+    /// the enforce suite points this at its dev-only probe example.
+    pub probe_bin: std::path::PathBuf,
+    /// The upstream `host:port` the proxy dials on an approved reach (the
+    /// capturing TLS server, test-support). The proxy terminates the confined
+    /// client's TLS, then opens ITS OWN upstream TLS here and injects the folded
+    /// secret — so the capture records what the upstream received (criterion 4).
+    pub upstream_addr: std::net::SocketAddr,
+    /// The upstream (capture server) CA cert DER the proxy's UPSTREAM client
+    /// config trusts — so the proxy's own TLS dial to the test upstream verifies
+    /// (the capture server is self-signed; the daemon trusts it for the test).
+    /// In production the upstream client trusts the webpki roots; here it trusts
+    /// the capture server's CA. Never a secret — a public trust anchor.
+    pub upstream_ca_der: Vec<u8>,
+    /// The file the capture upstream server writes the headers it RECEIVED to —
+    /// `drive_injected_egress` reads it as independent proof the injection reached
+    /// the upstream (criterion 4). The capture server (test-support) is started by
+    /// the enforce suite writing to this same path.
+    pub upstream_capture_path: std::path::PathBuf,
 }
 
 impl EgressProxy for PastaProxy {
@@ -638,6 +688,16 @@ impl RezidntCa {
         })
     }
 
+    /// The CA certificate DER — PUBLIC (it is the trust anchor, not the secret;
+    /// the private key never leaves `self.issuer`). The confined client's trust
+    /// store is seeded with this so it trusts the per-destination leaves the
+    /// proxy mints; the enforce dataplane hands it to the confined probe as a
+    /// PEM-encoded read-only file (the folded read-only bind, on the live path).
+    #[cfg(unix)]
+    fn ca_cert_der(&self) -> &[u8] {
+        &self.ca_cert_der
+    }
+
     /// Mint a per-destination leaf cert for `host`, signed by the CA — returning
     /// the leaf DER + its private key. This is the cert the proxy presents to the
     /// confined client when terminating TLS to `host`; the sandbox trusts it
@@ -681,5 +741,947 @@ impl RezidntCa {
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)
             .map_err(|e| RunError::Spawn(format!("rustls termination config failed: {e}")))
+    }
+}
+
+// ============================================================================
+// c3bc-ENFORCE — the LIVE DATAPLANE seam (DR-027 §Decision — the enforce slice)
+// ============================================================================
+//
+// Everything ABOVE this line is c3bc-decide (DR-027): it DECIDES and builds
+// certs but carries NO live traffic and injects NOTHING — the enforcement-inert
+// governance/type/scaffold layer. The section BELOW is the c3bc-enforce
+// interface: the LIVE netns→proxy→upstream byte-path that makes DR-026 criteria
+// 3 (inescapability) and 4 (agent-never-sees-token) achievable. It is defined
+// here (the interface the enforce impl must build) but its live methods are
+// `todo!()`-stubbed — so the WSL integration suite `egress_mediation_c3bc.rs`
+// FAILS for the right reason (the LIVE dataplane is absent), not because the
+// interface is undecided.
+//
+// ## Why a separate trait, DI'd, driven by the tests (the house pattern)
+//
+// The `EgressProxy` trait above decides + scaffolds; it never opens a socket.
+// The dataplane is a genuinely-new subsystem (a `pasta`-in-netns connector with
+// no default route, a `rustls` terminating listener, an upstream TLS dial, and
+// the ONE `.expose()` upstream-write) whose integration can only be proven on a
+// Linux netns box. Following the `SandboxSubstrate`/`BwrapSubstrate` split, the
+// live path is its own trait ([`EgressDataplane`]) returning a handle the tests
+// drive ([`DataplaneHandle`]) — so the enforce oracle asserts against a stable
+// seam while the impl behind it is `todo!()` until the implementer lands it.
+//
+// ## The ONE `.expose()` call-site lives HERE (DR-026 §Decision, criterion 5)
+//
+// The decide layer's `inject_and_proxy` returns only the `secret_ref` and NEVER
+// calls `.expose()` — its own comment records that the upstream-write call-site
+// "lives in the live upstream-write path (the WSL integration surface), never
+// here." THIS is that surface: the enforce impl's upstream-write is the single
+// sanctioned `.expose()` reachability point, on the plaintext the agent never
+// sees. The [`CapturedExchange`] the handle returns is what lets a test PROVE
+// the token rode the upstream request and NOT the agent's own request — the
+// criterion-4 capture seam.
+
+/// One direct-egress escape attempt a confined probe makes, and whether it
+/// reached the open internet (DR-026 criterion 3 — inescapability). The confined
+/// probe tries each of these from INSIDE the sealed netns, whose ONLY route out
+/// is the rezidnt proxy; a well-formed dataplane makes every non-proxy attempt
+/// reach NOTHING (fail/timeout) and the proxy attempt succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EscapeAttempt {
+    /// Unset every proxy env var (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`) and try
+    /// to reach a known public host by name — proving the route, not env, is what
+    /// confines (an agent that unsets proxy env still cannot escape).
+    UnsetProxyEnv { target_host: String },
+    /// Open a RAW TCP socket to a hard-coded public IP:port (e.g. `1.1.1.1:80`) —
+    /// bypassing any proxy-aware client. With no default route this reaches
+    /// nothing; a delivered byte is an inescapability HOLE.
+    RawSocketPublicIp { ip: String, port: u16 },
+    /// Query an ALTERNATE DNS resolver directly (e.g. `8.8.8.8:53`) — proving DNS
+    /// resolves THROUGH the mediator or is denied, never via the open resolver.
+    AltDnsResolver { resolver_ip: String },
+    /// The sanctioned path: reach an allowlisted host THROUGH the proxy. This is
+    /// the ONE attempt that MUST succeed (else the netns is not merely sealed, it
+    /// is dead — the proxy route must actually carry traffic).
+    ViaProxy { target_host: String },
+}
+
+/// Whether one [`EscapeAttempt`] reached the open internet. The inescapability
+/// property (criterion 3) is: EVERY non-`ViaProxy` attempt is `Blocked`, and the
+/// `ViaProxy` attempt is `ReachedProxy`. A non-proxy attempt that is
+/// `ReachedOpenInternet` is a confinement HOLE — the test that observes it FAILS
+/// loudly (theater, DR-026 §8.2 — "a bypass makes it theater").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeReach {
+    /// The attempt reached NOTHING — connection refused, timed out, or DNS denied.
+    /// This is the REQUIRED outcome for every direct-egress (non-proxy) attempt.
+    Blocked { how: String },
+    /// The attempt landed on the rezidnt proxy (the sole route out) — the
+    /// REQUIRED outcome for the `ViaProxy` attempt, and an ACCEPTABLE outcome for
+    /// a raw-socket/alt-DNS attempt that pasta transparently redirected to the
+    /// mediator (it reached the proxy, NOT the open internet — still no escape).
+    ReachedProxy { evidence: String },
+    /// CATASTROPHIC — the attempt reached the OPEN INTERNET, bypassing the proxy.
+    /// A single observation of this on a non-proxy attempt is an inescapability
+    /// failure; the criterion-3 test asserts this NEVER occurs.
+    ReachedOpenInternet { evidence: String },
+}
+
+/// The result of running the confined direct-egress probe (criterion 3). Pairs
+/// each attempt with what it reached, so the test asserts the whole set: no
+/// non-proxy attempt reached the open internet, and the proxy attempt worked.
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    /// Each escape attempt and its observed reach, in the order the probe ran.
+    pub outcomes: Vec<(EscapeAttempt, ProbeReach)>,
+}
+
+impl ProbeReport {
+    /// Did ANY direct-egress (non-`ViaProxy`) attempt reach the open internet?
+    /// `true` is an inescapability HOLE — the criterion-3 test fails on it.
+    pub fn any_direct_escape_reached_internet(&self) -> bool {
+        self.outcomes.iter().any(|(attempt, reach)| {
+            !matches!(attempt, EscapeAttempt::ViaProxy { .. })
+                && matches!(reach, ProbeReach::ReachedOpenInternet { .. })
+        })
+    }
+
+    /// Did the sanctioned `ViaProxy` attempt reach the proxy? `false` means the
+    /// netns is not merely sealed but has NO working route at all — the proxy
+    /// path must actually carry traffic (else the test is vacuous).
+    pub fn proxy_path_reached(&self) -> bool {
+        self.outcomes.iter().any(|(attempt, reach)| {
+            matches!(attempt, EscapeAttempt::ViaProxy { .. })
+                && matches!(reach, ProbeReach::ReachedProxy { .. })
+        })
+    }
+}
+
+/// The two sides of a mediated exchange, captured so criterion 4 is FALSIFIABLE:
+/// what the AGENT's own request carried (captured at the proxy INGRESS, before
+/// injection) vs what the UPSTREAM test server RECEIVED (post-termination, post-
+/// injection). The token must be ABSENT from `agent_request_headers` and
+/// PRESENT in `upstream_received_headers`. This is the capture seam the enforce
+/// impl must expose; without it criterion 4 cannot be proven, only asserted-
+/// around (theater the oracle refuses).
+#[derive(Debug, Clone)]
+pub struct CapturedExchange {
+    /// The AGENT's own request as the proxy read it at ingress (before any
+    /// injection) — header name → value. The brokered token MUST NOT appear here:
+    /// the agent never held it, so its own request cannot carry it.
+    pub agent_request_headers: BTreeMap<String, String>,
+    /// The environment the confined agent ran with (name → value). The brokered
+    /// token MUST NOT appear here either (criterion 4 — "absent from the agent's
+    /// environment").
+    pub agent_env: BTreeMap<String, String>,
+    /// What the UPSTREAM test server actually RECEIVED (post-termination, post-
+    /// injection) — header name → value. The brokered token (e.g. an
+    /// `Authorization` header) MUST appear here: the upstream received it, the
+    /// agent never did.
+    pub upstream_received_headers: BTreeMap<String, String>,
+}
+
+impl CapturedExchange {
+    /// Does the AGENT side (its own request headers OR its environment) carry the
+    /// secret VALUE anywhere? `true` is a criterion-4 failure — the agent held or
+    /// transmitted a secret it must never see.
+    pub fn agent_side_contains(&self, secret_value: &str) -> bool {
+        self.agent_request_headers
+            .values()
+            .chain(self.agent_env.values())
+            .any(|v| v.contains(secret_value))
+    }
+
+    /// Does the UPSTREAM-received request carry the secret VALUE? `true` is the
+    /// REQUIRED criterion-4 outcome — the injection reached the upstream (else the
+    /// non-exposure assertion is vacuous: the token must land SOMEWHERE, and the
+    /// only legitimate somewhere is the upstream the agent never sees).
+    pub fn upstream_contains(&self, secret_value: &str) -> bool {
+        self.upstream_received_headers
+            .values()
+            .any(|v| v.contains(secret_value))
+    }
+}
+
+/// A live dataplane started for one confined mediated egress — the handle the
+/// enforce tests drive (DR-026 criteria 3 + 4). It owns the running `pasta`
+/// connector (sole route = the proxy), the `rustls` terminating listener, and
+/// the upstream capture server for the duration of the test, and tears them all
+/// down on drop. The tests never touch the sockets directly; they ask the handle
+/// to run the confined probe and to surface the captured exchange.
+///
+/// This trait is the CAPTURE SEAM criterion 4 needs and the PROBE SEAM criterion
+/// 3 needs. The implementer builds the concrete handle behind
+/// [`EgressDataplane::start`]; until then `start` is `todo!()` and the WSL suite
+/// fails for the missing live impl.
+pub trait DataplaneHandle {
+    /// The proxy address the confined netns's SOLE route reaches (`host:port`).
+    /// A test uses this to point an allowlisted host's upstream at a capture
+    /// server and to name the `ViaProxy` probe target.
+    fn proxy_addr(&self) -> &str;
+
+    /// Run the confined direct-egress probe INSIDE the sealed netns and return
+    /// what each attempt reached (criterion 3). The probe unsets proxy env, opens
+    /// a raw socket to a public IP, queries an alternate resolver, and reaches an
+    /// allowlisted host via the proxy — the report pairs each attempt with its
+    /// [`ProbeReach`]. NEVER panics on a blocked attempt (a blocked escape is the
+    /// EXPECTED result, reported as [`ProbeReach::Blocked`], not an error).
+    fn run_escape_probe(&self) -> Result<ProbeReport, RunError>;
+
+    /// Drive ONE approved+mapped mediated egress to `host` end-to-end (criterion
+    /// 4): the confined agent issues its request, the proxy terminates TLS,
+    /// injects the folded secret into the UPSTREAM request only (the ONE
+    /// `.expose()` call-site), and the capture server records what it received.
+    /// Returns the captured two-sided [`CapturedExchange`] PLUS the durable
+    /// injection `secret_ref` (never the value) the daemon would fold onto the
+    /// log — so the test asserts both the non-exposure AND the by-reference fact.
+    fn drive_injected_egress(
+        &self,
+        host: &str,
+    ) -> Result<(CapturedExchange, Option<String>), RunError>;
+}
+
+/// The LIVE egress dataplane substrate (c3bc-enforce — DR-026 criteria 3, 4;
+/// DR-027 §Decision). Where [`EgressProxy`] DECIDES, this ENFORCES: it stands up
+/// the netns connector + terminating listener + upstream capture and returns a
+/// [`DataplaneHandle`] the tests drive. Selected by platform like the other
+/// substrates (DR-001); the Linux `pasta`+`rustls` backend is the enforce slice's
+/// job.
+pub trait EgressDataplane {
+    /// Start a live dataplane for one confined mediated-egress run under `policy`.
+    /// Sets up the `pasta` netns connector whose SOLE outbound target is the
+    /// proxy (no default route — the inescapability precondition), a `rustls`
+    /// terminating listener presenting per-destination leaves from the folded CA,
+    /// the upstream TLS dial + capture, and the injection path. Returns a handle
+    /// the test drives, or [`RunError`] if the box cannot provision the netns/
+    /// connector (a provisioning failure is an honest error, never a fake pass).
+    ///
+    /// IMPLEMENTER (c3bc-enforce): this is the enforcement dataplane the enforce
+    /// slice builds — the live netns→proxy→upstream byte-path DR-027 split out.
+    /// It is `todo!()` here so the WSL integration suite fails for the missing
+    /// LIVE impl, not for an undecided interface.
+    fn start(&self, policy: &EgressPolicy) -> Result<Box<dyn DataplaneHandle>, RunError>;
+}
+
+// The live enforce dataplane is unix-only (netns + `pasta` + kernel routing). On
+// non-unix hosts `start` is an honest unsupported-platform error — NEVER a fake
+// handle. Splitting the impl keeps the host build free of dead unix-only helpers
+// ([[vet-is-host-side-wsl-insufficient]]): every dataplane helper below is
+// `#[cfg(unix)]`, and the non-unix `start` references none of them.
+#[cfg(not(unix))]
+impl EgressDataplane for PastaProxy {
+    fn start(&self, _policy: &EgressPolicy) -> Result<Box<dyn DataplaneHandle>, RunError> {
+        Err(RunError::Spawn(
+            "the c3bc-enforce egress dataplane (pasta netns + kernel routing) is unix-only; \
+             this platform has no live dataplane backend (DR-026 §Consequences — macOS/Windows \
+             egress backends are later, behind the same trait)"
+                .to_string(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl EgressDataplane for PastaProxy {
+    fn start(&self, policy: &EgressPolicy) -> Result<Box<dyn DataplaneHandle>, RunError> {
+        // The enforce dataplane needs its wiring (the confined probe program + the
+        // upstream to dial). Absent it, this is the DR-027 honesty guard, not a
+        // fake pass: the decide-layer default does NOT enforce, so an unwired
+        // `start` is an explicit error — never a silent handle that looks
+        // authoritative.
+        let wiring = self.enforce.clone().ok_or_else(|| {
+            RunError::Spawn(
+                "the c3bc-enforce dataplane is not wired (PastaProxy.enforce is None): the \
+                 decision layer does not enforce until the live run-loop (or the enforce \
+                 integration suite) provides the confined probe + upstream (DR-027 honesty guard)"
+                    .to_string(),
+            )
+        })?;
+
+        // The connector must be present (a missing `pasta` is a CLOSED degrade,
+        // never a crash — the availability contract).
+        if !self.availability().is_available() {
+            return Err(RunError::Spawn(
+                "egress backend unavailable at dataplane start (pasta/CA absent) — the daemon \
+                 degrades CLOSED here; never opens (criterion 7)"
+                    .to_string(),
+            ));
+        }
+
+        // The process-lifetime CA (its private key is daemon-only, never leaves
+        // this process). Its cert (public) is written read-only for the confined
+        // probe's trust store — the folded read-only bind, on the live path.
+        let ca = std::sync::Arc::new(
+            RezidntCa::new()
+                .map_err(|e| RunError::Spawn(format!("rezidnt CA build failed: {e}")))?,
+        );
+
+        let handle = unix_dataplane::PastaHandle::start(
+            self.connector_bin.clone(),
+            ca,
+            policy.clone(),
+            wiring,
+        )?;
+        Ok(Box::new(handle))
+    }
+}
+
+/// The live enforce dataplane (unix-only): the `pasta` netns connector (sole
+/// route = the proxy, no default route), the `rustls` terminating listener, the
+/// upstream TLS dial + the ONE `.expose()` injection, and the two-sided capture.
+/// Every item here is `#[cfg(unix)]` so the host build carries none of it
+/// ([[vet-is-host-side-wsl-insufficient]]).
+///
+/// ## The wire protocol the confined probe speaks (dev-only, DR-023)
+///
+/// `pasta` execs the confined probe (test-support) inside the sealed netns. The
+/// probe seals its own route table to the proxy-only `/32`, runs the direct-egress
+/// escape attempts, reaches the proxy, and reports each attempt as one JSON line
+/// on stdout. The parent parses those lines into a [`ProbeReport`]. The probe is
+/// dev-only test-support (a compiled example), NEVER shipped in the daemon binary
+/// (I7) — the same fixtures-stay-dev-only rule as the golden seeders (DR-023).
+#[cfg(unix)]
+mod unix_dataplane {
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        CapturedExchange, DataplaneHandle, EgressPolicy, EnforceWiring, EscapeAttempt, ProbeReach,
+        ProbeReport, RezidntCa,
+    };
+    use crate::RunError;
+
+    /// The probe-mode selectors the confined program dispatches on (argv[1]). The
+    /// dev-only probe example matches these exact strings — they are the wire
+    /// contract between the dataplane and its test-support probe.
+    pub const MODE_ESCAPE_PROBE: &str = "escape-probe";
+    pub const MODE_INJECTED: &str = "injected-egress";
+
+    /// Bound on the HTTP request head the proxy reads at ingress — a control-plane
+    /// read is bounded so a malicious confined client cannot exhaust proxy memory
+    /// (the I2 discipline applied to the terminated request head).
+    const REQUEST_HEAD_LIMIT: usize = 64 * 1024;
+
+    /// A live `pasta` netns + `rustls` terminating proxy for one confined
+    /// mediated-egress run. Owns the proxy listener thread (host namespace, which
+    /// has internet), the CA, the folded policy, and the enforce wiring; tears the
+    /// listener down on drop.
+    pub struct PastaHandle {
+        connector_bin: String,
+        proxy_addr: String,
+        ca: Arc<RezidntCa>,
+        policy: EgressPolicy,
+        wiring: EnforceWiring,
+        /// Signals the accept loop to stop; the listener drops with the handle.
+        shutdown: Arc<AtomicBool>,
+        /// The last ingress (agent) request headers the proxy read — the capture
+        /// seam for `drive_injected_egress` (agent side).
+        agent_headers: Arc<Mutex<BTreeMap<String, String>>>,
+        listener_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PastaHandle {
+        pub fn start(
+            connector_bin: Option<String>,
+            ca: Arc<RezidntCa>,
+            policy: EgressPolicy,
+            wiring: EnforceWiring,
+        ) -> Result<Self, RunError> {
+            let connector_bin = connector_bin.unwrap_or_else(|| "pasta".to_string());
+            // Bind the proxy on host loopback (the host namespace HAS internet; the
+            // proxy is the sole route the sealed netns reaches, mapped in by pasta
+            // `--map-gw`). Ephemeral port so parallel runs don't collide.
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .map_err(|e| RunError::Spawn(format!("proxy listener bind failed: {e}")))?;
+            let local = listener
+                .local_addr()
+                .map_err(|e| RunError::Spawn(format!("proxy listener addr: {e}")))?;
+            let proxy_addr = format!("127.0.0.1:{}", local.port());
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let agent_headers = Arc::new(Mutex::new(BTreeMap::new()));
+
+            let loop_ca = Arc::clone(&ca);
+            let loop_policy = policy.clone();
+            let loop_wiring = wiring.clone();
+            let loop_shutdown = Arc::clone(&shutdown);
+            let loop_agent_headers = Arc::clone(&agent_headers);
+            // A dedicated std thread runs the blocking accept loop — this is a
+            // substrate helper thread, NOT an async context (rust-conventions:
+            // no blocking in async; this is deliberately off the async runtime).
+            listener
+                .set_nonblocking(false)
+                .map_err(|e| RunError::Spawn(format!("proxy listener nonblocking: {e}")))?;
+            let listener_thread = std::thread::spawn(move || {
+                // The adapter task span (rust-conventions) — carries the backend +
+                // proxy addr, NEVER a secret field (the redaction discipline
+                // extends to tracing: no `.expose()` near a span).
+                let span = tracing::info_span!(
+                    "adapter",
+                    kind = "egress-dataplane",
+                    backend = "pasta+rustls"
+                );
+                let _guard = span.enter();
+                proxy_accept_loop(
+                    listener,
+                    loop_ca,
+                    loop_policy,
+                    loop_wiring,
+                    loop_shutdown,
+                    loop_agent_headers,
+                );
+            });
+
+            Ok(Self {
+                connector_bin,
+                proxy_addr,
+                ca,
+                policy,
+                wiring,
+                shutdown,
+                agent_headers,
+                listener_thread: Some(listener_thread),
+            })
+        }
+
+        /// Exec the confined probe inside a `pasta` sealed netns, passing the mode,
+        /// the proxy address, and the CA-cert PEM path. The netns starts with the
+        /// host routes copied; the probe SEALS them to the proxy-only `/32` before
+        /// probing (the inescapability precondition — a raw socket to a public IP
+        /// then reaches NOTHING). Returns the probe's stdout for the caller to
+        /// parse.
+        fn run_confined(
+            &self,
+            mode: &str,
+            extra: &[String],
+        ) -> Result<std::process::Output, RunError> {
+            // Write the CA cert (PUBLIC) to a temp PEM the confined probe trusts —
+            // the folded read-only trust anchor on the live path. A std-only unique
+            // path (no `tempfile` dep — criterion 8 keeps rustls+rcgen the ONLY new
+            // linked deps); cleaned up on drop of the guard below.
+            let ca_path = unique_temp_path("rezidnt-egress-ca", "pem");
+            std::fs::write(&ca_path, pem_encode_cert(self.ca.ca_cert_der()))
+                .map_err(|e| RunError::Spawn(format!("write ca pem: {e}")))?;
+            let _ca_guard = TempPathGuard(ca_path.clone());
+
+            // `pasta --config-net -q -f -- <probe> <mode> <proxy_addr> <ca_pem> …`
+            //   --config-net: configure the tap interface (give the netns an addr +
+            //                 the gateway the proxy maps to).
+            //   -q -f:        quiet, foreground (we own the child).
+            // The probe seals routes then runs; the connector is EXEC'd, never
+            // linked (I7 — no new linked crate for the netns).
+            let mut cmd = std::process::Command::new(&self.connector_bin);
+            cmd.arg("--config-net")
+                .arg("-q")
+                .arg("-f")
+                .arg("--")
+                .arg(&self.wiring.probe_bin)
+                .arg(mode)
+                .arg(&self.proxy_addr)
+                .arg(&ca_path);
+            for e in extra {
+                cmd.arg(e);
+            }
+            // The probe inherits a clean, marked env; the enforce suite asserts the
+            // brokered token is absent from it (criterion 4 — the agent env).
+            cmd.env_clear();
+            cmd.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+            let output = cmd
+                .output()
+                .map_err(|e| RunError::Spawn(format!("pasta confined probe exec failed: {e}")))?;
+            Ok(output)
+        }
+    }
+
+    impl DataplaneHandle for PastaHandle {
+        fn proxy_addr(&self) -> &str {
+            &self.proxy_addr
+        }
+
+        fn run_escape_probe(&self) -> Result<ProbeReport, RunError> {
+            let host = self
+                .policy
+                .allowlist()
+                .first()
+                .map(|d| d.host.clone())
+                .ok_or_else(|| {
+                    RunError::Spawn("no allowlisted host to drive the ViaProxy probe".to_string())
+                })?;
+            let output = self.run_confined(MODE_ESCAPE_PROBE, std::slice::from_ref(&host))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let outcomes = parse_probe_lines(&stdout).map_err(|e| {
+                RunError::Spawn(format!(
+                    "probe report parse failed ({e}); stdout={stdout:?} stderr={stderr:?}"
+                ))
+            })?;
+            if outcomes.is_empty() {
+                return Err(RunError::Spawn(format!(
+                    "confined probe produced no outcomes (netns/pasta setup likely failed); \
+                     stdout={stdout:?} stderr={stderr:?}"
+                )));
+            }
+            Ok(ProbeReport { outcomes })
+        }
+
+        fn drive_injected_egress(
+            &self,
+            host: &str,
+        ) -> Result<(CapturedExchange, Option<String>), RunError> {
+            // The upstream capture server (test-support, started by the caller)
+            // writes the headers it RECEIVED to `wiring.upstream_capture_path` —
+            // independent proof the injection reached the upstream (the capture
+            // server records it, not the proxy asserting about itself).
+            //
+            // The confined probe issues ONE request to `host` through the proxy and
+            // reports its OWN env (the agent env) on stdout.
+            let extra = vec![host.to_string()];
+            let output = self.run_confined(MODE_INJECTED, &extra)?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() {
+                return Err(RunError::Spawn(format!(
+                    "confined injected-egress probe failed: status={:?} stdout={stdout:?} \
+                     stderr={stderr:?}",
+                    output.status
+                )));
+            }
+
+            // The agent's OWN request headers, captured by the proxy at ingress
+            // (before injection). The agent never held the token, so its own
+            // request cannot carry it.
+            let agent_request_headers = self
+                .agent_headers
+                .lock()
+                .map_err(|_| RunError::Spawn("agent-headers mutex poisoned".to_string()))?
+                .clone();
+
+            // The agent env: the probe reports its own environment as a JSON line
+            // prefixed `AGENT_ENV `, so criterion 4 can assert the token is absent.
+            let agent_env = parse_agent_env(&stdout);
+
+            // What the UPSTREAM received (post-injection) — read from the capture
+            // server's file (independent of the proxy).
+            let upstream_received_headers =
+                read_upstream_capture(&self.wiring.upstream_capture_path)?;
+
+            // The by-reference secret_ref for the durable fact (never the value).
+            let secret_ref = self
+                .policy
+                .secret_for(host)
+                .map(|s| s.secret_ref().to_string());
+
+            Ok((
+                CapturedExchange {
+                    agent_request_headers,
+                    agent_env,
+                    upstream_received_headers,
+                },
+                secret_ref,
+            ))
+        }
+    }
+
+    impl Drop for PastaHandle {
+        fn drop(&mut self) {
+            // Signal the accept loop and unblock it with a throwaway connection so
+            // the thread observes the flag and exits (the listener drops with it).
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(&self.proxy_addr);
+            if let Some(t) = self.listener_thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// The blocking accept loop (a dedicated std thread, never async). Each
+    /// connection: read the ClientHello SNI, mediate against the folded policy,
+    /// present the per-SNI leaf, terminate TLS, read the confined client's request
+    /// headers (captured as the AGENT side), inject the folded secret into the
+    /// UPSTREAM request only (the ONE `.expose()`), dial the upstream, and relay.
+    fn proxy_accept_loop(
+        listener: TcpListener,
+        ca: Arc<RezidntCa>,
+        policy: EgressPolicy,
+        wiring: EnforceWiring,
+        shutdown: Arc<AtomicBool>,
+        agent_headers: Arc<Mutex<BTreeMap<String, String>>>,
+    ) {
+        for stream in listener.incoming() {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            let stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // One connection at a time is sufficient for the confined probe (it
+            // issues serial requests); errors on a single connection are logged and
+            // never crash the loop (a broken client is not a proxy failure).
+            if let Err(e) = handle_connection(stream, &ca, &policy, &wiring, &agent_headers) {
+                // A single broken/denied connection is logged (redacted span — never
+                // a secret field) and never crashes the loop or the daemon.
+                tracing::warn!(error = %e, "egress proxy connection handling failed");
+            }
+        }
+    }
+
+    fn handle_connection(
+        stream: TcpStream,
+        ca: &RezidntCa,
+        policy: &EgressPolicy,
+        wiring: &EnforceWiring,
+        agent_headers: &Arc<Mutex<BTreeMap<String, String>>>,
+    ) -> Result<(), RunError> {
+        stream
+            .set_nodelay(true)
+            .map_err(|e| RunError::Spawn(format!("proxy nodelay: {e}")))?;
+        // Read the ClientHello to learn the SNI (which host the confined client is
+        // reaching) BEFORE choosing a leaf — the mediation input.
+        let mut acceptor = rustls::server::Acceptor::default();
+        let mut stream = stream;
+        let accepted = loop {
+            let n = acceptor
+                .read_tls(&mut stream)
+                .map_err(|e| RunError::Spawn(format!("read ClientHello: {e}")))?;
+            // EOF before a full ClientHello (a bare probe/close, e.g. the drop
+            // wake-up connection) — bail instead of busy-looping on `Ok(None)`.
+            if n == 0 {
+                return Err(RunError::Spawn(
+                    "connection closed before ClientHello completed".to_string(),
+                ));
+            }
+            match acceptor.accept() {
+                Ok(Some(a)) => break a,
+                Ok(None) => continue,
+                // rustls 0.23 returns `(Error, AcceptedAlert)` on accept failure;
+                // the alert is best-effort back to the client, the Error is ours.
+                Err((e, _alert)) => return Err(RunError::Spawn(format!("tls accept: {e}"))),
+            }
+        };
+        let sni = accepted
+            .client_hello()
+            .server_name()
+            .map(|s| s.to_string())
+            .ok_or_else(|| RunError::Spawn("client hello carried no SNI".to_string()))?;
+
+        // MEDIATE — the folded decision (deny-by-default). Off-allowlist → refuse
+        // (drop): the confined client's TLS fails to complete, which is a denied
+        // egress, never a silent proxy-through. Reuses the SAME allowlist predicate
+        // the decide-layer `mediate` uses (the folded policy's private fields).
+        if !policy.allows(&sni) {
+            return Err(RunError::Spawn(format!(
+                "egress to {sni} not approved — connection refused (deny-by-default)"
+            )));
+        }
+
+        // Present the per-SNI leaf and terminate the confined client's TLS. Use
+        // `into_connection` so the ServerConnection CONTINUES from the ClientHello
+        // the Acceptor already read — a fresh `ServerConnection::new` would discard
+        // that consumed handshake and stall waiting for a ClientHello that already
+        // arrived (the confined client sees EAGAIN).
+        let server_config = ca.terminating_config(&sni)?;
+        let conn = accepted
+            .into_connection(Arc::new(server_config))
+            .map_err(|(e, _alert)| RunError::Spawn(format!("into connection: {e}")))?;
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+
+        // Read the confined client's request line + headers (HTTP/1.1). This is the
+        // AGENT side — captured verbatim. The agent never held the token, so this
+        // must carry NONE of it (criterion 4).
+        let (request_line, headers) = read_http_head(&mut tls)?;
+        {
+            let mut guard = agent_headers
+                .lock()
+                .map_err(|_| RunError::Spawn("agent-headers mutex poisoned".to_string()))?;
+            *guard = headers.clone();
+        }
+
+        // Open the proxy's OWN upstream TLS to the capture server (its host is the
+        // mediated `sni`; the dial target is the folded upstream). Trust the
+        // upstream CA (public trust anchor, never a secret).
+        let upstream = dial_upstream(&sni, wiring)?;
+        let mut upstream = upstream;
+
+        // Rebuild the request UPSTREAM and inject the folded secret HERE — the ONE
+        // `.expose()` call-site, on the plaintext the agent never sees. The token
+        // rides ONLY the upstream request; it never touches a fact, a log line, a
+        // trace, or a return value (the redaction discipline).
+        let mut upstream_req = String::new();
+        upstream_req.push_str(&request_line);
+        upstream_req.push_str("\r\n");
+        for (k, v) in &headers {
+            // Skip any client-supplied Authorization — the broker owns it.
+            if k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            upstream_req.push_str(k);
+            upstream_req.push_str(": ");
+            upstream_req.push_str(v);
+            upstream_req.push_str("\r\n");
+        }
+        if let Some(secret) = policy.secret_for(&sni) {
+            // === THE ONE `.expose()` CALL-SITE (DR-026 §Decision, criterion 5). ===
+            // The brokered secret bytes leave `BrokeredSecret` HERE and only here,
+            // written into the UPSTREAM request bytes. Never near a fact/log/trace/
+            // return value; the `secret_ref` (label) is what the durable fact
+            // carries. An auditor greps `.expose(` and finds exactly this line.
+            upstream_req.push_str("Authorization: Bearer ");
+            upstream_req.push_str(secret.expose());
+            upstream_req.push_str("\r\n");
+        }
+        upstream_req.push_str("\r\n");
+        upstream
+            .write_all(upstream_req.as_bytes())
+            .map_err(|e| RunError::Spawn(format!("upstream write: {e}")))?;
+        upstream
+            .flush()
+            .map_err(|e| RunError::Spawn(format!("upstream flush: {e}")))?;
+
+        // Relay the upstream response back to the confined client (so its request
+        // completes and the ViaProxy probe observes a real reach — non-vacuity).
+        // Many upstreams (incl. our capture server) close the TCP connection
+        // WITHOUT a TLS close_notify after `Connection: close`; rustls surfaces
+        // that as `UnexpectedEof`. That is a graceful end-of-response here (we
+        // already hold the full body), NOT a proxy failure — tolerate it rather
+        // than dropping the response and leaving the client with an empty read.
+        let resp = read_to_end_tolerant(&mut upstream)?;
+        tls.write_all(&resp)
+            .map_err(|e| RunError::Spawn(format!("client relay write: {e}")))?;
+        let _ = tls.flush();
+        Ok(())
+    }
+
+    /// Dial the proxy's OWN upstream TLS. The upstream is the folded capture server
+    /// (test-support); its self-signed CA is trusted here (a public trust anchor).
+    fn dial_upstream(
+        sni: &str,
+        wiring: &EnforceWiring,
+    ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, RunError> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                wiring.upstream_ca_der.clone(),
+            ))
+            .map_err(|e| RunError::Spawn(format!("upstream root add: {e}")))?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| RunError::Spawn(format!("upstream protocol versions: {e}")))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
+            .map_err(|e| RunError::Spawn(format!("upstream server name {sni}: {e}")))?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|e| RunError::Spawn(format!("upstream client connection: {e}")))?;
+        let sock = TcpStream::connect(wiring.upstream_addr).map_err(|e| {
+            RunError::Spawn(format!("upstream connect {}: {e}", wiring.upstream_addr))
+        })?;
+        Ok(rustls::StreamOwned::new(conn, sock))
+    }
+
+    /// Read a TLS stream to EOF, tolerating a peer close WITHOUT a TLS
+    /// close_notify (rustls surfaces that as `io::ErrorKind::UnexpectedEof`). For
+    /// a proxied response that is a graceful end-of-body — the upstream sent
+    /// `Connection: close` and closed — not a failure. Any OTHER error propagates.
+    fn read_to_end_tolerant<S: Read>(stream: &mut S) -> Result<Vec<u8>, RunError> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(RunError::Spawn(format!("upstream read: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read an HTTP/1.1 request head (request line + headers) from a terminated
+    /// stream. Returns `(request_line, headers)`. Bounded so a malicious client
+    /// cannot exhaust memory (I2 discipline: control-plane reads are bounded).
+    fn read_http_head<S: Read>(
+        stream: &mut S,
+    ) -> Result<(String, BTreeMap<String, String>), RunError> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream
+                .read(&mut byte)
+                .map_err(|e| RunError::Spawn(format!("request head read: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                break;
+            }
+            if buf.len() > REQUEST_HEAD_LIMIT {
+                return Err(RunError::Spawn("request head exceeded bound".to_string()));
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines = text.split("\r\n");
+        let request_line = lines
+            .next()
+            .ok_or_else(|| RunError::Spawn("empty request".to_string()))?
+            .to_string();
+        let mut headers = BTreeMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        Ok((request_line, headers))
+    }
+
+    /// Parse the confined probe's stdout (one JSON line per escape attempt) into
+    /// the `(EscapeAttempt, ProbeReach)` pairs the [`ProbeReport`] carries.
+    fn parse_probe_lines(stdout: &str) -> Result<Vec<(EscapeAttempt, ProbeReach)>, String> {
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                continue;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| format!("json {line:?}: {e}"))?;
+            let kind = v.get("attempt").and_then(|x| x.as_str()).unwrap_or("");
+            let reach = v.get("reach").and_then(|x| x.as_str()).unwrap_or("");
+            let detail = v
+                .get("detail")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let attempt = match kind {
+                "unset_proxy_env" => EscapeAttempt::UnsetProxyEnv {
+                    target_host: v
+                        .get("target")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                "raw_socket_public_ip" => EscapeAttempt::RawSocketPublicIp {
+                    ip: v
+                        .get("ip")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    port: v.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+                },
+                "alt_dns_resolver" => EscapeAttempt::AltDnsResolver {
+                    resolver_ip: v
+                        .get("resolver")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                "via_proxy" => EscapeAttempt::ViaProxy {
+                    target_host: v
+                        .get("target")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                other => return Err(format!("unknown attempt kind {other:?}")),
+            };
+            let reach = match reach {
+                "blocked" => ProbeReach::Blocked { how: detail },
+                "reached_proxy" => ProbeReach::ReachedProxy { evidence: detail },
+                "reached_open_internet" => ProbeReach::ReachedOpenInternet { evidence: detail },
+                other => return Err(format!("unknown reach {other:?}")),
+            };
+            out.push((attempt, reach));
+        }
+        Ok(out)
+    }
+
+    /// Parse the probe's `AGENT_ENV {json}` line (its own environment) so criterion
+    /// 4 can assert the brokered token is absent from the agent env.
+    fn parse_agent_env(stdout: &str) -> BTreeMap<String, String> {
+        for line in stdout.lines() {
+            if let Some(rest) = line.trim().strip_prefix("AGENT_ENV ")
+                && let Ok(m) = serde_json::from_str::<BTreeMap<String, String>>(rest)
+            {
+                return m;
+            }
+        }
+        BTreeMap::new()
+    }
+
+    /// Read the upstream capture server's recorded headers (independent proof the
+    /// injection reached the upstream).
+    fn read_upstream_capture(path: &std::path::Path) -> Result<BTreeMap<String, String>, RunError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| RunError::Spawn(format!("read upstream capture {path:?}: {e}")))?;
+        serde_json::from_str(&text)
+            .map_err(|e| RunError::Spawn(format!("parse upstream capture: {e}")))
+    }
+
+    /// PEM-encode a DER certificate (BEGIN/END CERTIFICATE) — the confined probe
+    /// reads this as its trust anchor. Pure, no new dep (base64 via a tiny local
+    /// encoder to avoid a linked crate — I7).
+    fn pem_encode_cert(der: &[u8]) -> String {
+        let b64 = base64_encode(der);
+        let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            out.push('\n');
+        }
+        out.push_str("-----END CERTIFICATE-----\n");
+        out
+    }
+
+    /// Minimal standard base64 encoder (no linked crate — I7: 20 lines beats a
+    /// dependency for a PEM wrapper).
+    fn base64_encode(input: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                T[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// A unique path under the system temp dir — std-only (no `tempfile` dep, so
+    /// rustls+rcgen stay the ONLY new linked deps, criterion 8). Uniqueness from a
+    /// fresh `Ulid` (already a crate dep) + the pid.
+    fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
+        let name = format!(
+            "{prefix}-{}-{}.{ext}",
+            std::process::id(),
+            ulid::Ulid::new()
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    /// Removes its path on drop (best-effort) — the std-only stand-in for the
+    /// `tempfile` auto-cleanup we deliberately avoid linking.
+    struct TempPathGuard(std::path::PathBuf);
+    impl Drop for TempPathGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 }

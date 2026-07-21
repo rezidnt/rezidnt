@@ -46,6 +46,11 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# anyhow (dev-only): the c3bc-enforce test-support example `egress_c3bc_probe`
+# is a binary (anyhow at the edges, per rust-conventions) — the confined probe +
+# capturing upstream TLS server. Example/dev-only: NEVER linked into the daemon
+# binary (I7 one-static-binary is untouched; DR-023 fixtures-stay-dev-only).
+anyhow = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # proptest (dev): SP4b macaroon monotonicity/forgery property tests
 # (testing-oracles skill). Already vendored at the workspace root (used by

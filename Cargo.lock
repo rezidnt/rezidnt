@@ -2542,6 +2542,7 @@ dependencies = [
 name = "rezidnt-run"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "blake3",
  "libc",
  "proptest",

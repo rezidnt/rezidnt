@@ -40,6 +40,9 @@ use rezidnt_run::egress::{EgressAvailability, EgressProxy, PastaProxy};
 fn missing_connector_is_unavailable_with_a_reason_not_a_panic() {
     let proxy = PastaProxy {
         connector_bin: Some("/nonexistent/definitely-not-pasta-xyz".to_string()),
+        // `..Default::default()` fills the (unix-only, enforce-inert) enforce
+        // wiring as None — this decide-layer test exercises only availability.
+        ..Default::default()
     };
     match proxy.availability() {
         EgressAvailability::Unavailable { reason } => {

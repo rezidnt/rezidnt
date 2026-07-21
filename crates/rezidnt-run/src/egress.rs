@@ -469,17 +469,24 @@ pub fn denied_fact(run: &str, dest: &str, policy_ref: &CasRef) -> (&'static str,
 /// `secret_ref` the [`crate::secret::SecretSource`] could not resolve rides
 /// (DR-029 §Decision 2, ontology line 527). Returns `(subject, payload)`. Records
 /// the `dest` that LOST its injection + the unresolvable `secret_ref` LABEL + a
-/// loggable `reason` — and by CONSTRUCTION carries no value (there is none to
-/// resolve; that is the point — never a fake token, never an empty-string
-/// injection). Takes no [`BrokeredSecret`] so a value literally cannot ride it.
-pub fn dropped_fact(run: &str, dest: &str, secret_ref: &str) -> (&'static str, Value) {
+/// loggable, per-floor DISTINGUISHING `reason` (DR-030 §Decision 5, I6 — the op
+/// unavailable/auth-fail/resolution-fail floors are tellable apart) — and by
+/// CONSTRUCTION carries no value (there is none to resolve; that is the point —
+/// never a fake token, never an empty-string injection). Takes no [`BrokeredSecret`]
+/// so a value literally cannot ride it; the `reason` is a LABEL only and NEVER
+/// carries the resolved value or the service-account token (DR-030 §Decision 3).
+pub fn dropped_fact(
+    run: &str,
+    dest: &str,
+    secret_ref: &str,
+    reason: &str,
+) -> (&'static str, Value) {
     let subject = "credential.dropped";
     let payload = json!({
         "run": run,
         "dest": dest,
         "secret_ref": secret_ref,
-        "reason": "secret_ref unresolvable by the configured SecretSource — \
-                   mapping dropped, host mediated-without-injection",
+        "reason": reason,
     });
     (subject, payload)
 }
@@ -496,8 +503,14 @@ pub struct CredentialDrop {
     /// key).
     dest: String,
     /// The unresolvable `secret_ref` LABEL (the `[egress.secrets]` value the
-    /// `SecretSource` returned `Ok(None)` for) — never a value.
+    /// `SecretSource` returned a DROP for) — never a value.
     secret_ref: String,
+    /// The DISTINGUISHING, per-floor `reason` the resolving `SecretSource` attached
+    /// (DR-030 §Decision 5, I6 — op unavailable vs auth-fail vs resolution-fail are
+    /// tellable apart; the host-file MVP carries the generic DR-029 reason). A LABEL
+    /// only — NEVER a resolved value or the service-account token (DR-030 §Decision
+    /// 3). This is what the loud `credential.dropped` fact rides.
+    reason: String,
 }
 
 impl CredentialDrop {
@@ -509,6 +522,12 @@ impl CredentialDrop {
     /// The unresolvable `secret_ref` LABEL (never a value).
     pub fn secret_ref(&self) -> &str {
         &self.secret_ref
+    }
+
+    /// The DISTINGUISHING, loggable drop reason (I6 — "why was this credential
+    /// dropped?" per floor). A LABEL; never a value/token.
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 }
 
@@ -540,18 +559,24 @@ pub fn fold_egress_policy(
     // Deterministic order: `spec.secrets` is a BTreeMap, so both the injection
     // map and the drop list are built in stable host order (rebuild-stable, I3).
     for (host, secret_ref) in &spec.secrets {
-        match secrets.resolve(secret_ref)? {
-            Some(secret) => {
+        // `resolve_with_reason` distinguishes a RESOLVED value from a DROP that
+        // carries the source's per-floor reason (DR-030 §Decision 5, I6) — the op
+        // backend tells unavailable/auth-fail/resolution-fail apart; the host-file
+        // MVP carries the generic DR-029 reason. The reason is a LABEL only.
+        match secrets.resolve_with_reason(secret_ref)? {
+            crate::secret::SecretResolution::Resolved(secret) => {
                 // Resolvable → broker it to its host (value stays redacted; the
                 // proxy `.expose()`s it upstream ONLY, never here).
                 injection_map.insert(host.clone(), secret);
             }
-            None => {
+            crate::secret::SecretResolution::Dropped { reason } => {
                 // Unresolvable → DROP the mapping (never a fake/empty secret) and
-                // report it so the loud `credential.dropped` fact rides it.
+                // report it (with the distinguishing reason) so the loud
+                // `credential.dropped` fact rides it.
                 drops.push(CredentialDrop {
                     dest: host.clone(),
                     secret_ref: secret_ref.clone(),
+                    reason,
                 });
             }
         }

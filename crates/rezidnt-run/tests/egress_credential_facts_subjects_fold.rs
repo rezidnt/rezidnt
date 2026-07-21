@@ -203,7 +203,12 @@ fn credential_dropped_fact_names_the_unresolvable_ref_and_carries_no_value() {
     // COMPILE-RED: `dropped_fact` does not exist yet.
     use rezidnt_run::egress::dropped_fact;
 
-    let (subject, payload) = dropped_fact(RUN, "github.com", "gh_token");
+    let (subject, payload) = dropped_fact(
+        RUN,
+        "github.com",
+        "gh_token",
+        "secret_ref unresolvable by the configured SecretSource",
+    );
     assert_eq!(
         subject, "credential.dropped",
         "an unresolvable secret_ref rides the ratified `credential.dropped` subject (DR-029)"

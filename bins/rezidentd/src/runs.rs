@@ -25,7 +25,7 @@ use rezidnt_run::egress::{
     CredentialDrop, EgressPolicy, EgressProxy, PastaProxy, fold_egress_policy,
 };
 use rezidnt_run::sandbox::{Bind, SandboxPolicy, SandboxSubstrate, bwrap_argv};
-use rezidnt_run::secret::HostFileSecretSource;
+use rezidnt_run::secret::{CompositeSecretSource, HostFileSecretSource, OpSecretSource};
 use rezidnt_run::spawner::SpawnPlan;
 use rezidnt_run::spec::{AgentSpec, GateSpec, ProjectSpec};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
@@ -895,8 +895,12 @@ pub async fn launch_agent(
     // §Decision 2). The mapping was dropped (host mediated-without-injection),
     // never a fake secret. Carries only labels; by construction no value.
     for drop in &credential_drops {
-        let (subject, payload) =
-            rezidnt_run::egress::dropped_fact(&run_str, drop.dest(), drop.secret_ref());
+        let (subject, payload) = rezidnt_run::egress::dropped_fact(
+            &run_str,
+            drop.dest(),
+            drop.secret_ref(),
+            drop.reason(),
+        );
         publish(
             &daemon.fabric,
             Event::new(
@@ -1129,8 +1133,18 @@ fn fold_c3_policies(
     // secrets file is an honest error (never a silently-empty source that would
     // drop the boundary — DR-029 §Decision 3 / DR-020). An unresolvable ref is
     // DROPPED (reported so the loud fact rides it), never a fake secret.
-    let secrets = HostFileSecretSource::from_env()
+    // DR-030: dispatch by reference SCHEME — an `op://…` ref resolves via the `op`
+    // CLI backend (daemon-side, at fold time, before the confined agent's netns is
+    // sealed — DR-030 §Decision 4), a plain label via the host-file MVP. Both
+    // backends coexist so one project's mixed `[egress.secrets]` resolves. The op
+    // arm reads the real `OP_SERVICE_ACCOUNT_TOKEN` from the DAEMON's env (env-only,
+    // never a fact/log, never the confined child's env — DR-030 §Decision 3). An
+    // ABSENT block still folds deny-all; a set-but-missing/malformed host-file is
+    // still an honest error; an unresolvable op:// ref still DROPS (with its
+    // distinguishing per-floor reason), never a fake secret.
+    let host_file = HostFileSecretSource::from_env()
         .context("resolve REZIDNT_EGRESS_SECRETS host secrets source")?;
+    let secrets = CompositeSecretSource::new(Box::new(OpSecretSource::new()), Box::new(host_file));
     let (egress, drops) = fold_egress_policy(egress_spec, &secrets)
         .context("fold the [egress] allowlist + brokered secrets")?;
     Ok((sandbox, egress, drops))

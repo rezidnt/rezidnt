@@ -531,6 +531,71 @@ pub fn start_daemon_with_egress_secrets(secrets_toml: &str) -> DaemonGuard {
     }
 }
 
+/// A daemon started for the OP-BACKED egress path (DR-030 crit 5): NO
+/// `REZIDNT_EGRESS_SECRETS` (this is the `op` backend, not the host-file one) — the
+/// daemon INHERITS the launching process's env, including the real
+/// `OP_SERVICE_ACCOUNT_TOKEN` and `PATH` (so `op` is resolvable and the op backend
+/// auths). The `op://` refs in the run's `[egress.secrets]` resolve daemon-side via
+/// the `op` CLI at fold time (pre-seal, DR-030 §Decision 4); the token stays
+/// env-only (never a fact/log, never the confined child's env). Returns a plain
+/// [`DaemonGuard`]. GATE with [`op_ref_available`] — this assumes the caller already
+/// checked the live `op`/token are present.
+pub fn start_daemon_with_op_secrets() -> DaemonGuard {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let cas = dir.path().join("cas");
+
+    // NO REZIDNT_EGRESS_SECRETS: the op backend resolves op:// refs; the daemon
+    // inherits OP_SERVICE_ACCOUNT_TOKEN + PATH from this process (Command inherits
+    // env by default), exactly as a real operator-launched daemon would.
+    let child = Command::new(daemon_bin())
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .env("REZIDNT_CAS", &cas)
+        .spawn()
+        .expect("spawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    DaemonGuard {
+        child,
+        socket,
+        db,
+        _dir: dir,
+    }
+}
+
+/// The OWNER-GATE probe for the live-`op` crit-5 arm (DR-030 §Decision 5; the
+/// pasta/bwrap availability-gate precedent — a missing tool is a SKIP, never a fake
+/// pass): the live op-injected mediated run is provable ONLY when all three hold —
+/// the `op` CLI is on `PATH` (`op --version` succeeds), a non-empty
+/// `OP_SERVICE_ACCOUNT_TOKEN` is in the env, AND `REZIDNT_TEST_OP_REF` names a live
+/// item the service-account's vault holds. Absent any, the suite EARLY-RETURNS
+/// (honest SKIP). Reads presence only — never the token VALUE into any surface.
+pub fn op_ref_available() -> bool {
+    // A non-empty service-account token in the env (presence-only; the value is
+    // never read into a return/log surface).
+    let token_ok = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    // The owner points the suite at a live item via REZIDNT_TEST_OP_REF.
+    let ref_ok = std::env::var("REZIDNT_TEST_OP_REF")
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+    // The `op` CLI is installed + runnable on PATH.
+    let op_ok = Command::new("op")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    token_ok && ref_ok && op_ok
+}
+
 /// A temp project carrying a non-empty `[egress]` block (DR-029): a git repo +
 /// the stub harness + a §13 spec with `allowlist` + an `[egress.secrets]`
 /// `host → secret_ref` LABEL map (repo-safe — labels, never values). `gap_ms`

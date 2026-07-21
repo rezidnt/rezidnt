@@ -316,6 +316,8 @@ Ordered by the oracle principle that sequences the whole project — build where
 > **Amended by [DR-025](decisions/DR-025-c3a-linux-sandbox.md).** Slices the DR-009 sole-chokepoint (C3) phase: **C3a** — a Linux `bwrap`-backed `SandboxSubstrate` (I4) wrapping the S1 spawn seam, confinement from folded policy, loud `sandbox.unavailable` degrade when absent — ships first with its own acceptance criteria + exit demo. C3b (egress proxy), C3c (credential brokering), and the macOS/Windows backends stay fenced, each behind its own DR; the Windows tier is coupled to the deferred native-Windows Platform phase.
 >
 > **Amended by [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md).** Folds **C3b+c** into one slice — the full L7 egress chokepoint: a TLS-terminating `EgressProxy` (I4) that is the sole, inescapable route out of C3a's sealed netns (`pasta` connector, transparent TCP+DNS interception), a process-lifetime rezidnt CA (`rustls`/`rcgen`), and credential brokering (secrets injected upstream, never held by the agent, logged by-ref-never-value). Degrades CLOSED. First C3 slice to add linked deps (App. A). macOS/Windows egress backends stay fenced behind the same trait; Windows coupled to the deferred Platform phase.
+>
+> **Amended by [DR-027](decisions/DR-027-c3bc-split-decide-enforce.md).** Sequences the folded c3bc into **c3bc-decide** (the egress decision/governance + type-safety + CA/TLS scaffolding layer, landed ENFORCEMENT-INERT — decides + builds certs but carries no live traffic, not wired live) then **c3bc-enforce** (the dataplane: `pasta` netns inescapability + live TLS byte-path + real injection + the WSL integration suite — carries DR-026's crit 3/4 and exit demo). DR-026 not weakened; its criteria are partitioned across the two slices.
 
 Estimates are mine, part-time-founder calibrated, moderate confidence, wide intervals dominated by your available hours.
 
@@ -388,8 +390,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-024](decisions/DR-024-running-risk-cap-c6.md) | Running-risk cap (C6): deterministic rule-table scorer, pre-action, granted-only fold, contract-free shared-scorer seam | ACCEPTED | §8, §9 |
 | [DR-025](decisions/DR-025-c3a-linux-sandbox.md) | C3a Linux OS-sandbox: bwrap-backed `SandboxSubstrate` (I4), folded-policy binds, loud degrade when absent, `PathConfinement` verdict stays a permit-verifier | ACCEPTED | §16, §18 |
 | [DR-026](decisions/DR-026-c3bc-egress-credential-brokering.md) | C3b+c full L7 egress MITM + credential brokering: `EgressProxy` (I4) sole inescapable route out of C3a's netns, rezidnt CA (rustls/rcgen), secrets injected upstream/never-held, logged by-ref-never-value, degrade CLOSED; first C3 linked deps | ACCEPTED | §16, §18, App. A |
+| [DR-027](decisions/DR-027-c3bc-split-decide-enforce.md) | C3b+c split decide→enforce: land the egress governance/type-safety/CA-scaffold layer ENFORCEMENT-INERT; sequence DR-026's full-MITM dataplane (inescapability + real injection, crit 3/4 + exit demo) into its own next slice. DR-026 not weakened — criteria partitioned | ACCEPTED | §16, §18 |
 
-*The next record is DR-027.*
+*The next record is DR-028.*
 
 ---
 

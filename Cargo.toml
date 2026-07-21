@@ -93,6 +93,20 @@ notify = "8"
 # - rand: 256-bit badge minting, doc §12 (NOT in the approved set; auditor-flagged)
 # portable-pty stays out until a TTY-demanding harness arrives (I7).
 
+# dependency additions noted by the implementer (C3b+c — DR-026 §Consequences,
+# Appendix A): the ONLY two LINKED deps this slice adds (criterion 8). MITM/PKI
+# cannot be safely hand-rolled (the opposite of SP4b's envelope-over-blake3
+# finding), so rustls (TLS termination) + rcgen (rezidnt CA + per-destination
+# leaf certs) are the honest, bounded cost. The netns connector (`pasta`) is
+# EXEC'd via std::process like `bwrap`/the git-CLI — zero new linked crate.
+# Both permissively licensed (rustls: Apache-2.0/ISC/MIT; rcgen: MIT/Apache-2.0)
+# and audited by wide ecosystem use. Declared in rezidnt-run (daemon-side egress
+# backend). No default `aws-lc` provider churn: rustls uses its `ring` provider
+# (the default), rcgen its default `aws_lc_rs`→NO — rcgen `ring` feature keeps
+# the crypto surface to `ring`, matching rustls, no second provider linked.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
 # approved set (rust-conventions)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

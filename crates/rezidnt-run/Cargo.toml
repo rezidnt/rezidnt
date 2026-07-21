@@ -27,6 +27,13 @@ tracing = { workspace = true }
 toml = "0.8"
 rand = "0.9"
 ulid = { workspace = true }
+# rustls + rcgen (C3b+c — DR-026): the egress-proxy backend's TLS termination
+# (rustls) + the process-lifetime rezidnt CA / per-destination leaf certs
+# (rcgen). The ONLY two linked deps DR-026 ratifies for this slice (criterion 8);
+# the `pasta` connector is EXEC'd (std::process), never linked. Workspace-pinned
+# so the license/version note lives once at the root.
+rustls = { workspace = true }
+rcgen = { workspace = true }
 # time: the SP4b macaroon expiry caveat is an RFC3339 UTC timestamp; the daemon
 # supplies a real wall-clock `now` at mint (expiry base) and at the check_badge
 # door (expiry eval) — verify itself stays pure/clock-free (I6). Already vendored

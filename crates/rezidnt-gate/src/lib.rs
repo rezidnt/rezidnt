@@ -780,6 +780,86 @@ fn path_within(bind: &str, path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Permit native (C3b+c — DR-026; design `permit-egress-proxy-c3b.md` §3): the
+/// deterministic "is this destination ALLOWLISTED for egress?" decision — the
+/// sibling of [`PathConfinement`]/[`PathScope`] that the OS egress proxy
+/// (`EgressProxy`, in `rezidnt-run`) makes UNBYPASSABLE. The VERDICT is
+/// native/pure/interrogable (I6); the proxy is only the mechanism enforcing it.
+///
+/// Reads the requested destination `params.dest` (the host the confined agent is
+/// trying to reach) against the folded egress `params.allow` (the allowlist,
+/// injected by the PDP from FOLDED AUTHORITY — never a self-declared request arg;
+/// the C6/DR-024 lesson mirrored from C3a). An allowlisted host → Pass (the proxy
+/// terminates + proxies it); a host outside the allowlist → Fail naming the
+/// destination (deterministic, I6 — logged as `permit.denied`/`egress.denied`); a
+/// dest that requires a human call → the caller escalates; the allowlist ABSENT →
+/// Inconclusive (cannot-run — undecidable is never a synthesized allow, I6).
+///
+/// The `allow` entries are host strings (exact host match, the allowlist axis the
+/// proxy keys SNI/Host on). This is the DENY-BY-DEFAULT posture: a destination on
+/// NO allowlist entry is refused, never opened.
+///
+/// Decision layer (c3bc-decide, DR-027): `verify` runs the exact-host allowlist
+/// scan (allowlisted → Pass, off-list → Fail naming the dest, allow-absent →
+/// Inconclusive, never coerced) and is registered in [`builtin_natives`]. This is
+/// the pure egress *decision* — the mechanism that makes it the only route out of
+/// the netns (the live proxy) is c3bc-enforce, not this verifier.
+pub struct EgressScope;
+
+impl NativeVerifier for EgressScope {
+    fn name(&self) -> &'static str {
+        "egress-scope"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        // allow key ABSENT ⇒ undecidable → Inconclusive (cannot-run). The
+        // discriminator is key-presence, NOT emptiness: a present-but-empty
+        // `allow: []` is a DECLARED lockdown (every destination off-list), not
+        // an absence — mirrors PathConfinement's declared-empty binds and
+        // IntentLock's declared-empty allowlist (I6, deny-by-default).
+        let Some(allow_val) = input.params.get("allow") else {
+            return Ok(cannot_run(
+                "no egress allowlist in params — undecidable, not a pass (I6)",
+            ));
+        };
+        // The folded allowlist is a list of host strings (exact-host axis the
+        // proxy keys SNI/Host on). A malformed entry is skipped — it widens
+        // nothing (deny-by-default).
+        let allow: Vec<&str> = allow_val
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        // The requested destination (request axis). Absent ⇒ nothing requested
+        // → undecidable (no destination to decide on), never a synthesized pass.
+        let Some(dest) = input.params.get("dest").and_then(Value::as_str) else {
+            return Ok(cannot_run(
+                "no destination in params — undecidable, not a pass (I6)",
+            ));
+        };
+
+        // Deterministic EXACT-host match: a destination equal to an allowlisted
+        // host → Pass (the proxy terminates + proxies it). NEVER a substring /
+        // prefix / suffix match — a look-alike host (`github.com.evil.com`) is
+        // NOT allowlisted (an egress confinement hole is worse than none,
+        // design §8.3). An EMPTY allowlist matches nothing → every dest Fails
+        // (present-empty is lockdown, deny-by-default). Same params → same
+        // verdict AND same named destination (determinism BINDING, I6).
+        if allow.contains(&dest) {
+            Ok(VerifierOutput {
+                verdict: Verdict::Pass,
+                evidence: vec![],
+                cost_ms: 0,
+            })
+        } else {
+            fail_evidence(
+                cas,
+                "dest-not-allowlisted",
+                &format!("destination {dest} outside the egress allowlist — DENIED"),
+            )
+        }
+    }
+}
+
 /// Permit native (SP1, DR-009 C1): the running per-session spend + rate vs. a
 /// soft/hard cap. The running totals arrive as PINNED INPUTS in `params` (the
 /// daemon folds `PermitAccumulators` from the log, I3, and passes the snapshot
@@ -1113,6 +1193,7 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(ToolAllowlist),
         Box::new(PathScope),
         Box::new(PathConfinement),
+        Box::new(EgressScope),
         Box::new(SpendCap),
         Box::new(RiskCap),
         Box::new(IntentLock),

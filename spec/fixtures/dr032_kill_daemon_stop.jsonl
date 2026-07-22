@@ -1,0 +1,3 @@
+{"id":"01DR032EVTAK111DMN00000000","ts":"2026-07-22T09:10:00Z","v":1,"source":"rezidnt-run","subject":"agent.spawned","correlation":"01DR032C0RRK111DMN00000000","payload":{"run":"01DR032RVNK111DMN000000000","agent":"impl","harness":"claude-code","badge_id":"deadbeef01234567"}}
+{"id":"01DR032EVTBK111DMN00000000","ts":"2026-07-22T09:10:01Z","v":1,"source":"rezidnt-run","subject":"agent.status.changed","correlation":"01DR032C0RRK111DMN00000000","payload":{"run":"01DR032RVNK111DMN000000000","from":"spawning","to":"running"}}
+{"id":"01DR032EVTCK111DMN00000000","ts":"2026-07-22T09:10:02Z","v":1,"source":"rezidnt-run","subject":"agent.signaled","correlation":"01DR032C0RRK111DMN00000000","payload":{"run":"01DR032RVNK111DMN000000000","signal":"SIGKILL","escalation":"kill"}}

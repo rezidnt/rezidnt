@@ -53,6 +53,24 @@ pub struct GateExplainArgs {
     pub run: String,
 }
 
+/// `kill_run` — DR-032 §Decision 1: the OPERATOR-ONLY mutating tool that
+/// terminates a run. Mutating: requires an operator badge (doc §12), checked
+/// before any side effect; the agent-macaroon path is rejected on policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KillRunArgs {
+    /// Operator badge token (hex), doc §12 / DR-032 §1. The operator identity
+    /// checked before the run is touched; never logged (the verified id is,
+    /// not the token, §12/I2).
+    pub badge: String,
+    /// Run ULID (canonical 26-char text form) to terminate.
+    pub run: String,
+    /// Optional operator-supplied reason: rides the emitted `agent.signaled`
+    /// fact when present (I6 interrogability), omitted when the caller gave
+    /// none — never synthesized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// `request_permission` — the harness PEP asks the daemon PDP "may this action
 /// proceed?" and gets back a three-valued decision (`allow | deny | ask`),
 /// NEVER coerced (I6, design §5).

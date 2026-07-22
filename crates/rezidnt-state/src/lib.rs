@@ -380,6 +380,25 @@ pub struct AgentRunState {
     /// keeps pre-DR-029 fixtures unedited (I3).
     #[serde(default)]
     pub credential_drops: Vec<CredentialDrop>,
+    /// DR-032 §Decision 5: the loggable operator badge id of the human who
+    /// KILLED this run, folded VERBATIM from an `agent.signaled` fact carrying
+    /// `operator_badge_id` (`hex(blake3(sig)[..8])`, the loggable id — NEVER the
+    /// token, I2/§12). `None` = NOT operator-killed: a daemon-initiated reaper
+    /// TERM→KILL stop carries no `operator_badge_id`, so this stays `None` —
+    /// ABSENCE is the honest representation, NEVER synthesized to a sentinel
+    /// (DR-012 declared-vs-absent). This is the interrogable "a human killed this
+    /// run" record `debrief` / `gate_explain` reads, DISTINCT from a
+    /// daemon-timeout stop (I6). `#[serde(default)]` keeps every pre-DR-032 golden
+    /// fixture parsing (and comparing equal) unedited — I3 rebuild-stability.
+    #[serde(default)]
+    pub killed_by: Option<String>,
+    /// DR-032 §Decision 5: the operator-supplied kill reason, folded VERBATIM
+    /// from an `agent.signaled` fact's `reason`. `None` when absent (a daemon
+    /// stop has no operator and no reason) — never synthesized to an empty
+    /// string. Interrogable alongside [`AgentRunState::killed_by`] (I6).
+    /// `#[serde(default)]` keeps every pre-DR-032 golden fixture unedited (I3).
+    #[serde(default)]
+    pub kill_reason: Option<String>,
 }
 
 impl AgentRunState {
@@ -512,6 +531,28 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 state.input_tokens = payload["cost"]["input_tokens"].as_u64();
                 state.output_tokens = payload["cost"]["output_tokens"].as_u64();
                 state.session_id = payload["session_id"].as_str().map(String::from);
+            }
+        }
+        // DR-032 §Decision 5: the `agent.signaled` kill-attribution fold, keyed
+        // on the payload `run`. An OPERATOR kill carries `operator_badge_id` +
+        // `reason`, which fold VERBATIM onto `killed_by` / `kill_reason`
+        // (mirroring the `pep`/`role` optional-field fold above). A DAEMON stop
+        // (reaper TERM→KILL) carries NEITHER, so both stay `None` — ABSENCE is
+        // the honest representation, NEVER synthesized to a sentinel (DR-012;
+        // the daemon-vs-operator distinction `debrief` reads, I6). This arm does
+        // NOT touch `status` — the signaled run-status transition rides
+        // `agent.status.changed`, untouched here. A keyless fact folds
+        // counters-only (never guesses a key, I3). `#[serde(default)]` on the
+        // fields keeps rebuild stable across the schema addition (I3).
+        "agent.signaled" => {
+            if let Some(run) = payload_run(event) {
+                let state = graph.agent_runs.entry(run).or_default();
+                if let Some(id) = event.payload()["operator_badge_id"].as_str() {
+                    state.killed_by = Some(id.to_string());
+                }
+                if let Some(reason) = event.payload()["reason"].as_str() {
+                    state.kill_reason = Some(reason.to_string());
+                }
             }
         }
         // S2 worktree reducers, keyed by the payload's canonicalized path

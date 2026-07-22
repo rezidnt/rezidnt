@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use rezidnt_gate::permit::{PermitLayer, PermitVerifierSpec};
-use rezidnt_mcp::{BoxFuture, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes};
+use rezidnt_mcp::{BoxFuture, KillAck, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes};
 use rezidnt_types::WorkspaceId;
 use ulid::Ulid;
 
@@ -203,6 +203,65 @@ impl McpSubstrate for McpBridge {
             ))
         })
     }
+
+    /// DR-032 §Decision 1: drive the EXISTING reaper to terminate the run's
+    /// process. The pid is LOG-DERIVED — read from the run's `agent.spawned`
+    /// fact (`runs.rs` records it on the spawn payload, I3: the log is truth,
+    /// never a side table). The signal logic is REUSED, not reimplemented:
+    /// `reaper::stop_with_escalation` performs TERM → grace → KILL. A run the log
+    /// never spawned, or one whose spawn carried no pid (a run that never
+    /// launched a process), is refused `RUN_UNKNOWN` — no fact (the operator door
+    /// already passed at the core; a refusal here still emits nothing, I3).
+    fn kill_run(&self, run: String) -> BoxFuture<Result<KillAck, ToolRefusal>> {
+        let daemon = Arc::clone(&self.daemon);
+        Box::pin(async move {
+            let Some(pid) = run_pid(&daemon, &run).await else {
+                return Err(ToolRefusal::new(
+                    codes::RUN_UNKNOWN,
+                    format!("run {run} has no live process on this daemon"),
+                ));
+            };
+            // REUSE the reaper (reaper.rs:105) — do not reimplement signal logic.
+            let description =
+                rezidnt_run::reaper::stop_with_escalation(pid, rezidnt_run::reaper::TERM_GRACE)
+                    .await
+                    .map_err(|e| {
+                        ToolRefusal::new(codes::SPAWN_FAILED, format!("stop run {run}: {e}"))
+                    })?;
+            // The reaper answered on SIGTERM within grace unless it escalated;
+            // its description names the outcome. Report the terminal signal +
+            // escalation stage for the fact's interrogable "how it stopped".
+            let escalated = description.starts_with("escalated");
+            Ok(KillAck {
+                signal: if escalated { "SIGKILL" } else { "SIGTERM" }.to_string(),
+                escalation: Some(if escalated { "kill" } else { "term" }.to_string()),
+            })
+        })
+    }
+}
+
+/// Fold the log to find a run's pid (recorded on its `agent.spawned` fact by
+/// `runs.rs`) — the honest, log-derived liveness key the reaper drives (I3),
+/// off the async threads (SQLite replay is blocking). `None` for a run the log
+/// never spawned or whose spawn carried no pid.
+async fn run_pid(daemon: &Arc<Daemon>, run: &str) -> Option<u32> {
+    let fabric = Arc::clone(&daemon.fabric);
+    let run = run.to_string();
+    tokio::task::spawn_blocking(move || {
+        let events = fabric.replay_since(None).ok()?;
+        events.into_iter().find_map(|e| {
+            if e.subject.as_str() == "agent.spawned" && e.payload()["run"].as_str() == Some(&run) {
+                e.payload()["pid"]
+                    .as_u64()
+                    .and_then(|p| u32::try_from(p).ok())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Fold the log to find a run's workspace (the envelope `workspace` on its

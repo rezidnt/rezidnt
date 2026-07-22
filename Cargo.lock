@@ -2410,6 +2410,7 @@ dependencies = [
  "rezidnt-client",
  "rezidnt-fabric",
  "rezidnt-gate",
+ "rezidnt-mcp",
  "rezidnt-proto",
  "rezidnt-run",
  "rezidnt-state",

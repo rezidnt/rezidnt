@@ -103,6 +103,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GateCmd,
     },
+    /// Operator-only actions (DR-031/DR-032): explicit operator authorization
+    /// over the loopback-HTTP MCP surface, carrying the operator badge from the
+    /// 0600 lockfile.
+    Operator {
+        #[command(subcommand)]
+        cmd: OperatorCmd,
+    },
     /// The permit Policy Enforcement Point (DR-014 §Decision 1). claude-code's
     /// `PreToolUse` hook config invokes this: it reads the tool descriptor on
     /// stdin, asks the daemon PDP over `REZIDNT_SOCKET`, and writes the
@@ -111,6 +118,19 @@ enum Cmd {
     /// proceed, I6). Not a separate binary (I7) — a subcommand of `rezidnt`.
     #[command(name = "permit-hook")]
     PermitHook,
+}
+
+#[derive(Subcommand)]
+enum OperatorCmd {
+    /// Terminate a run (DR-032 §Decision 1): POST a `kill_run` `tools/call` over
+    /// the loopback-HTTP MCP surface, carrying the operator badge from the 0600
+    /// lockfile. DR-004 exits: 0 ok, 2 malformed run ULID (local input), 4
+    /// daemon-unreachable, 5 tool-refused (the daemon refused the kill).
+    #[command(name = "kill-run")]
+    KillRun {
+        /// The run ULID, as printed by `rezidnt open`.
+        run: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -164,6 +184,22 @@ fn main() {
         Cmd::Gate {
             cmd: GateCmd::Why { run, json },
         } => (1, gate_why(&run, json)),
+        Cmd::Operator {
+            cmd: OperatorCmd::KillRun { run },
+        } => {
+            // Local input phase (DR-004): a malformed/absent run ULID is exit 2,
+            // the same class `attach` gives a bad run id — rejected BEFORE any
+            // daemon traffic. The subcommand then owns its own 0/4/5 mapping
+            // (operator_kill_run exits internally), so a placeholder class here.
+            let run = match run.parse::<ulid::Ulid>() {
+                Ok(run) => run,
+                Err(e) => {
+                    eprintln!("rezidnt: run id {run:?} is not a ULID: {e}");
+                    std::process::exit(2);
+                }
+            };
+            (1, operator_kill_run(run))
+        }
         // The PEP emits its decision on stdout and fails closed to `ask`
         // internally; a hard error here (unreadable stdin / stdout write) is an
         // unexpected internal fault → 1.
@@ -871,6 +907,143 @@ fn gate_why(run: &str, as_json: bool) -> anyhow::Result<()> {
         );
     }
     std::process::exit(0);
+}
+
+/// The operator lockfile path: `REZIDNT_LOCKFILE` override (the test uses it),
+/// else the XDG default `~/.local/state/rezidnt/mcp.lock` (next to the log,
+/// mirroring [`db_path`]'s state dir). The daemon announces the loopback-HTTP
+/// port + operator badge here (the same 0600 lockfile `serve_http` writes).
+fn lockfile_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("REZIDNT_LOCKFILE") {
+        return PathBuf::from(explicit);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".local")
+        .join("state")
+        .join("rezidnt")
+        .join("mcp.lock")
+}
+
+/// `rezidnt operator kill-run <run>` (DR-032 §Decision 3). Reads the 0600
+/// lockfile (port + operator badge), then POSTs a `kill_run` `tools/call` over
+/// the loopback-HTTP MCP surface — NOT the bare socket (DR-032 §Decision 2: the
+/// socket's UDS-identity would bypass the explicit operator authorization
+/// DR-031 requires). Carries the operator badge from the lockfile.
+///
+/// This function OWNS its DR-004 exit codes (0/4/5) and exits internally
+/// (mirroring the gate verbs): 0 ok, 4 daemon-unreachable (no lockfile / a dead
+/// port), 5 tool-refused (the daemon refused the kill). The malformed-run input
+/// class (exit 2) is handled by the caller before this runs. The run ULID is
+/// already validated; it is passed as text on the wire.
+///
+/// I7: the loopback POST is a minimal hand-rolled HTTP/1.1 exchange over
+/// `std::net::TcpStream` — no HTTP crate is pulled in (one static binary, no new
+/// attack surface). The transport is loopback-only and lockfile-gated.
+fn operator_kill_run(run: ulid::Ulid) -> anyhow::Result<()> {
+    let path = lockfile_path();
+    // No lockfile / unreadable / unparseable ⇒ daemon-unreachable (exit 4). A
+    // client cannot reach a daemon it cannot locate (the class `tail`/`attach`
+    // use for an unreachable socket).
+    let lock = match rezidnt_mcp::lockfile::read(&path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "rezidnt: daemon unreachable: cannot read operator lockfile {}: {e}",
+                path.display()
+            );
+            std::process::exit(4);
+        }
+    };
+
+    // The JSON-RPC tools/call for kill_run, carrying the operator badge (§12)
+    // and the run. The badge TOKEN rides only the request body to the loopback
+    // daemon — never printed, never logged (§12/I2).
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "kill_run",
+            "arguments": {
+                "badge": lock.badge,
+                "run": run.to_string(),
+            },
+        },
+    });
+
+    // Dial the loopback port and POST. Any connect/IO failure is
+    // daemon-unreachable (exit 4): a lockfile pointing at a dead port is exactly
+    // the unreachable class.
+    let response = match loopback_post(lock.port, &request.to_string()) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!(
+                "rezidnt: daemon unreachable: kill_run POST to loopback:{} failed: {e:#}",
+                lock.port
+            );
+            std::process::exit(4);
+        }
+    };
+
+    // A JSON-RPC error object (protocol misuse) or an unparseable body is a
+    // daemon-side fault surfacing on the kill path — treat as tool-refused (the
+    // kill did not happen). A tool result with `isError: true` is the daemon
+    // REFUSING the kill (badge rejected, run not live) ⇒ exit 5.
+    let parsed: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rezidnt: kill_run refused: unparseable daemon response ({e})");
+            std::process::exit(5);
+        }
+    };
+    if let Some(err) = parsed.get("error") {
+        eprintln!("rezidnt: kill_run refused: {err}");
+        std::process::exit(5);
+    }
+    let result = &parsed["result"];
+    if result["isError"] == serde_json::json!(true) {
+        let detail = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("(no detail)");
+        eprintln!("rezidnt: kill_run refused: {detail}");
+        std::process::exit(5);
+    }
+    println!("killed run {run}");
+    std::process::exit(0);
+}
+
+/// Minimal hand-rolled loopback HTTP/1.1 POST to `127.0.0.1:<port>/mcp` (I7 — no
+/// HTTP crate). Writes the request, reads the full response, and returns the
+/// body (the bytes after the `\r\n\r\n` head/body split). Loopback-only; the
+/// port comes from the 0600 lockfile.
+fn loopback_post(port: u16, body: &str) -> anyhow::Result<String> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect loopback:{port}"))?;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .context("write kill_run request")?;
+    stream.flush().context("flush kill_run request")?;
+
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .context("read kill_run response")?;
+    // Split off the HTTP head; the body is the JSON-RPC response. A response
+    // with no head/body split is a malformed daemon reply (surfaced by the
+    // caller as a refusal).
+    match raw.split_once("\r\n\r\n") {
+        Some((_head, body)) => Ok(body.to_string()),
+        None => anyhow::bail!("daemon response had no HTTP head/body split"),
+    }
 }
 
 #[cfg(not(unix))]

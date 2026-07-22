@@ -151,6 +151,22 @@ pub struct OpenAck {
     pub correlation: String,
 }
 
+/// DR-032 §Decision 1: the substrate's acknowledgement of a driven kill — the
+/// reaper's returned stop description (`reaper::stop_with_escalation`). The
+/// emitted `agent.signaled` fact does NOT depend on these bytes for its
+/// operator attribution (that comes from the verified badge id + the caller's
+/// reason); these ride the fact's `signal`/`escalation` fields for the
+/// interrogable "how it was stopped" record.
+#[derive(Debug, Clone)]
+pub struct KillAck {
+    /// The signal the reaper delivered (`"SIGTERM"` / `"SIGKILL"`).
+    pub signal: String,
+    /// The escalation stage, when the reaper escalated (`"term"` → answered on
+    /// SIGTERM; `"kill"`/`Some("kill")` → escalated to SIGKILL). `None` when the
+    /// substrate reports no escalation detail.
+    pub escalation: Option<String>,
+}
+
 /// The resolved `[gates.permit]` verifier set for a run — the ordered verifier
 /// entries the PDP dispatches (SP-wire, DR-011; SP3 adds exec entries, DR-015).
 /// The daemon folds this from the applied spec (`workspace.spec.applied`, keyed
@@ -308,6 +324,15 @@ pub trait McpSubstrate: Send + Sync {
     /// the run maps to no configured permit gate — the PDP then degrades to
     /// escalate/deny, never a synthesized allow (I6).
     fn permit_config_for(&self, run: String) -> BoxFuture<Option<PermitConfig>>;
+
+    /// DR-032 §Decision 1: drive the EXISTING `reaper::stop_with_escalation`
+    /// (reaper.rs) to terminate the run's process, reporting the stop as a
+    /// [`KillAck`]. The core drives this ONLY after the operator-badge door
+    /// admits the caller (a refused kill never reaches here — no side effect,
+    /// I3), then emits ONE attributed `agent.signaled` fact through the single
+    /// writer. A `ToolRefusal` here (e.g. the run is not live) becomes a
+    /// machine-readable tool error and emits NO fact.
+    fn kill_run(&self, run: String) -> BoxFuture<Result<KillAck, ToolRefusal>>;
 }
 
 /// The transport-agnostic MCP core: one JSON-RPC request in, one response
@@ -492,6 +517,7 @@ impl McpCore {
         match name {
             "open_project" => self.call_open_project(args).await,
             "spawn_agent" => self.call_spawn_agent(args).await,
+            "kill_run" => self.call_kill_run(args).await,
             "request_permission" => self.call_request_permission(args).await,
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
@@ -658,6 +684,104 @@ impl McpCore {
             Ok(run) => Ok(tool_ok(json!({"run": run}))),
             Err(refusal) => Ok(tool_refused(&refusal.code, &refusal.message)),
         }
+    }
+
+    /// DR-032 §Decision 1 — the OPERATOR-ONLY §12 door. Unlike [`check_badge`]'s
+    /// DUAL path, this admits ONLY the opaque operator badge (DR-005 `BadgeBook`,
+    /// token-equality). A well-formed agent MACAROON — even one that would verify
+    /// for a spawn on this same (root-keyed) core — is REFUSED `BADGE_INVALID` on
+    /// POLICY: terminating a run is an operator action, not an agent
+    /// self-action. No badge → `BADGE_REQUIRED`. Checked BEFORE any side effect
+    /// (a refused kill emits no fact, I3). Returns the loggable operator badge id.
+    fn check_operator_badge(&self, args: &Value) -> Result<String, Value> {
+        let Some(presented) = args.get("badge").and_then(Value::as_str) else {
+            return Err(tool_refused(
+                codes::BADGE_REQUIRED,
+                "kill_run requires an operator badge argument (DR-032 §1, doc §12)",
+            ));
+        };
+        // ONLY the opaque operator badge (DR-005) admits. The macaroon path is
+        // deliberately NOT tried — an agent cannot self-kill (DR-032 §1). A
+        // presented value that is not an admitted operator token is refused,
+        // whether it is a well-formed macaroon or garbage.
+        let book = self
+            .badges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match book.id_for(presented) {
+            Some(id) => Ok(id.to_string()),
+            None => Err(tool_refused(
+                codes::BADGE_INVALID,
+                "kill_run is operator-only: an agent macaroon cannot terminate a run (DR-032 §1)",
+            )),
+        }
+    }
+
+    /// `kill_run` — DR-032 §Decision 1. The OPERATOR-ONLY mutating tool that
+    /// terminates a run. Door discipline (§12): the operator badge is checked
+    /// BEFORE any side effect ([`check_operator_badge`] rejects the macaroon
+    /// path on policy). On admit, the substrate drives the EXISTING reaper
+    /// (`stop_with_escalation`); then the core emits EXACTLY ONE `agent.signaled`
+    /// fact through the single writer (I3 — the client never writes the log),
+    /// carrying `operator_badge_id` = the VERIFIED operator id (never the token,
+    /// §12/I2) and the caller-supplied `reason`. A refused kill emits NO fact.
+    async fn call_kill_run(&self, args: Value) -> RpcOutcome {
+        // §12 door FIRST — operator-only. A refusal returns before any effect.
+        let operator_badge_id = match self.check_operator_badge(&args) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
+        // Deserialize THROUGH the advertised shape so the served inputSchema and
+        // the accepted args cannot diverge (doc §9 no-drift). The reason rides
+        // the fact when present (I6) and is omitted when the caller gave none —
+        // never synthesized.
+        let parsed: rezidnt_types::mcp::KillRunArgs = match serde_json::from_value(args.clone()) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(tool_refused(codes::ARGS_INVALID, "kill_run requires run")),
+        };
+        let run = parsed.run;
+        let reason = parsed.reason;
+
+        let Some(substrate) = &self.substrate else {
+            return Ok(tool_refused(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "no run substrate is wired to this MCP core",
+            ));
+        };
+        // Drive the reaper (behind the substrate seam). A substrate refusal
+        // (e.g. the run is not live) is a machine-readable tool error and emits
+        // NO fact — refuse before effect (I3).
+        let ack = match substrate.kill_run(run.clone()).await {
+            Ok(ack) => ack,
+            Err(refusal) => return Ok(tool_refused(&refusal.code, &refusal.message)),
+        };
+
+        // Emit EXACTLY ONE attributed `agent.signaled` fact through the single
+        // writer (I3). `operator_badge_id` is the loggable verified id, NEVER the
+        // token (§12/I2). `run`/`signal`/`escalation` follow the reaper's stop.
+        let mut payload = json!({
+            "run": run,
+            "signal": ack.signal,
+            "operator_badge_id": operator_badge_id,
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(escalation) = &ack.escalation {
+                obj.insert("escalation".to_string(), json!(escalation));
+            }
+            if let Some(reason) = &reason {
+                obj.insert("reason".to_string(), json!(reason));
+            }
+        }
+        self.publish_fact("agent.signaled", payload).await?;
+
+        let mut result = json!({
+            "run": run,
+            "signal": ack.signal,
+        });
+        if let (Some(escalation), Some(obj)) = (&ack.escalation, result.as_object_mut()) {
+            obj.insert("escalation".to_string(), json!(escalation));
+        }
+        Ok(tool_ok(result))
     }
 
     /// `request_permission` — the daemon IS the PDP (design §5, DR-008/DR-009).
@@ -1251,6 +1375,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "spawn_agent",
                 "description": "Spawn one spec agent in an open workspace (mutating: badge and idempotency key required).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::SpawnAgentArgs))?,
+            },
+            {
+                "name": "kill_run",
+                "description": "Terminate a run: OPERATOR-ONLY (DR-032 §1). Requires an operator badge; an agent macaroon is refused. Emits one attributed agent.signaled fact.",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::KillRunArgs))?,
             },
             {
                 "name": "request_permission",

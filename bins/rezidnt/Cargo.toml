@@ -14,6 +14,13 @@ clap.workspace = true
 rezidnt-cas.workspace = true
 rezidnt-gate.workspace = true
 rezidnt-fabric.workspace = true
+# rezidnt-mcp (DR-032): `operator kill-run` reads the daemon's 0600 loopback-HTTP
+# lockfile (port + operator badge) via the canonical `lockfile::Lockfile` type
+# and POSTs a `kill_run` tools/call. Reusing the daemon's lockfile shape avoids
+# drift (one definition of the announcement); the loopback POST is hand-rolled
+# over std::net (no HTTP crate — I7). The crate is already a workspace member
+# built for the daemon, so this adds no new external attack surface.
+rezidnt-mcp.workspace = true
 rezidnt-proto.workspace = true
 # rezidnt-client (DR-023): the shared socket-driving client — connect, check the
 # hello, send a Request, tail/read facts. The CLI's former private

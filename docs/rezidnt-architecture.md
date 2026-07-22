@@ -335,6 +335,8 @@ Estimates are mine, part-time-founder calibrated, moderate confidence, wide inte
 
 **Phase 3 — owned terminal substrate (3–6 months to herdr-2024 parity).** Assemble the permissive kernel — libghostty-vt (MIT, high confidence) or `alacritty_terminal`/`vte` (Apache-2.0/MIT family, moderate — verify at kickoff) + `portable-pty` (WezTerm lineage, high) — then the multiplexer, persistence, and agent-detection layer as a `TerminalSubstrate` impl behind the same trait herdr sits behind today. *S5 (can precede Phase 3):* ratatui read-only fleet board consuming only watch channels — the proof that I1 held. Phase 3 exit = golden path runs with `substrate = "native"` and herdr uninstalled.
 
+> **Amended by [DR-031](decisions/DR-031-board-read-only-operator-client-split.md).** The S5 board is read-only permanently; "build out the board" means richer read-only render only. Operator write actions (resolve an escalated permit, kill a run) live on a separate MCP write client — the operator-client seam — never the board.
+
 Sequencing law, restated because it is the project's most-violated invariant in the wild: **fabric → harness → terminal.** Any pressure to reorder is scope gravity and gets the phase-exit-demo test applied to it.
 
 ## 17. Repository, licensing, and the commercial seam
@@ -359,6 +361,8 @@ Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apach
 | Name fails a registry check | tonight's lookups | fallback string `rezident`, conventions unchanged |
 
 ## 19. Open decisions register
+
+> **Amended by [DR-031](decisions/DR-031-board-read-only-operator-client-split.md).** A separate operator write client (resolve-escalation, kill-run) is the sanctioned home for board-adjacent writes — distinct from the read-only board, DR-first, demand-gated.
 
 `rmcp` maturity (verify at S3; fallback: thin hand-rolled JSON-RPC). SQLite write amplification (revisit only past 10⁴ events/min). WASM verifiers as a third kind (post-Phase 2; exec contract already covers polyglot). Macaroon-attenuated badges (needs a real delegation use case). Komorebi IPC depth (verify at arranger implementation). First graphical client: ratatui board is S5; Tauri dashboard is demand-gated. Hash-chain externalization (periodic chain-head publication for third-party timestamping) — PROVISIONAL, compliance-driven.
 
@@ -398,8 +402,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-028](decisions/DR-028-c3-wire.md) | C3 run-loop wiring (c3-wire): compose C3a bwrap + c3bc egress dataplane into the live rezidnt open/spawn over ONE shared netns (pasta-outer, sealed-before-agent), daemon-owned composed child (S1), folded-from-spec first source (C6 preserved), three composed degrade facts. No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
 | [DR-029](decisions/DR-029-c3-egress-fold.md) | Real egress fold (c3-egress-fold): source a non-empty egress allowlist + brokered secrets from a project-spec `[egress]` block + a daemon-side `SecretSource` I4 seam (host-file MVP now, 1Password op-CLI backend fenced next) so a shipped run reaches the run-loop Mediated arm end-to-end (DR-026 crit 4 at run-loop level). C6 preserved; no invariant/posture/dep change; egress.*/credential.* subjects minted in a paired /subject | ACCEPTED | §16, §18 |
 | [DR-030](decisions/DR-030-c3-op-secrets.md) | 1Password op SecretSource backend (c3-op-secrets): a headless `OpSecretSource` behind the DR-029 seam resolving `op://vault/item/field` refs via exec'd `op read` (not linked, I7), authed by a vault-scoped service account (`OP_SERVICE_ACCOUNT_TOKEN`, env-only, never facted); `CompositeSecretSource` scheme-dispatch (op:// → op, else host-file); resolution daemon-side at fold time; op absent/token unset/read-fail ⇒ loud credential.dropped, never a fake secret. "1Password for Claude" connector explicitly OUT (wrong layer). No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
+| [DR-031](decisions/DR-031-board-read-only-operator-client-split.md) | Board read-only / operator-client split: `rezidnt-tui` stays read-only permanently (guarded by `crate_has_no_writer_dependency`, I1); the two operator write actions — resolve an escalated permit, kill a run — live on a SEPARATE explicitly-authorized MCP write client through the existing PDP (I2/I5), not on the board. "Build out the board" = richer READ-ONLY render only. Operator client is DR-first + demand-gated (Phase 3). No test weakened; the structural guard is promoted to a permanent invariant | ACCEPTED | §16, §19 |
 
-*The next record is DR-031.*
+*The next record is DR-032.*
 
 ---
 

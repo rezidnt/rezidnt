@@ -154,6 +154,15 @@ enum OperatorCmd {
         /// re-escalates. Absent = permanent (today's behavior).
         #[arg(long = "ttl-ms")]
         ttl_ms: Option<u64>,
+        /// Optional broad grant scope (DR-035 §Decision 2): `run_tool` makes the
+        /// resolution match ANY action on its `(run, tool)` (tool stays exact),
+        /// instead of the DR-033 exact request-scoped match. Absent = exact.
+        /// Rides the tool call verbatim — the daemon owns the semantics
+        /// (fail-closed on unknown values; a broad scope REQUIRES `--ttl-ms`, else
+        /// the daemon refuses with `scope.requires_ttl` — broad OR permanent,
+        /// never both).
+        #[arg(long = "scope")]
+        scope: Option<String>,
     },
 }
 
@@ -232,6 +241,7 @@ fn main() {
                     decision,
                     reason,
                     ttl_ms,
+                    scope,
                 },
         } => {
             // Local input phase (DR-004): a malformed/absent run ULID and a
@@ -252,7 +262,14 @@ fn main() {
             }
             (
                 1,
-                operator_resolve_permit(run, &request_id, &decision, reason.as_deref(), ttl_ms),
+                operator_resolve_permit(
+                    run,
+                    &request_id,
+                    &decision,
+                    reason.as_deref(),
+                    ttl_ms,
+                    scope.as_deref(),
+                ),
             )
         }
         // The PEP emits its decision on stdout and fails closed to `ask`
@@ -1082,9 +1099,11 @@ fn operator_kill_run(run: ulid::Ulid) -> anyhow::Result<()> {
 /// dead port), 5 tool-refused (the daemon refused the resolve). The malformed run
 /// / decision input class (exit 2) is handled by the caller before this runs. The
 /// run ULID is already validated; `<allow|deny>` maps to the tool's `decision`
-/// arg. The client sends only `{ badge, run, request_id, decision, reason? }`:
-/// the daemon DERIVES the escalation's `action`/`target` from the folded log by
-/// `request_id` (DR-033 §Design) — the CLI never fabricates a descriptor.
+/// arg. The client sends only `{ badge, run, request_id, decision, reason?,
+/// ttl_ms?, scope? }`: the daemon DERIVES the escalation's `action`/`target` from
+/// the folded log by `request_id` (DR-033 §Design) — the CLI never fabricates a
+/// descriptor, and passes `ttl_ms`/`scope` through verbatim (the daemon owns
+/// their semantics and the DR-035 coupling guard).
 ///
 /// I7: the loopback POST reuses the same minimal hand-rolled HTTP/1.1 exchange as
 /// `operator_kill_run` ([`loopback_post`]) — no HTTP crate is pulled in.
@@ -1094,6 +1113,7 @@ fn operator_resolve_permit(
     decision: &str,
     reason: Option<&str>,
     ttl_ms: Option<u64>,
+    scope: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = lockfile_path();
     // No lockfile / unreadable / unparseable ⇒ daemon-unreachable (exit 4).
@@ -1129,6 +1149,14 @@ fn operator_resolve_permit(
     // operator time-boxes the resolution; absent = permanent (today's behavior).
     if let (Some(ttl_ms), Some(obj)) = (ttl_ms, arguments.as_object_mut()) {
         obj.insert("ttl_ms".to_string(), serde_json::json!(ttl_ms));
+    }
+    // DR-035 §Decision 2: the optional broad scope rides the trimmed shape
+    // VERBATIM — the client passes it through, the daemon owns the semantics
+    // (fail-closed on unknown values; the coupling guard refuses broad-and-
+    // permanent). Absent = OMITTED (never null) = DR-033 exact request-scoped
+    // match. Mirrors the ttl_ms insert above.
+    if let (Some(scope), Some(obj)) = (scope, arguments.as_object_mut()) {
+        obj.insert("scope".to_string(), serde_json::json!(scope));
     }
     let request = serde_json::json!({
         "jsonrpc": "2.0",

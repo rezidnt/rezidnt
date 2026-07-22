@@ -71,12 +71,26 @@ fn run_resolve(
     decision: &str,
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
+    run_resolve_ext(run, request_id, decision, &[], env)
+}
+
+/// As [`run_resolve`], but appends `extra` flags after the positional args (e.g.
+/// `--scope`, `--ttl-ms`). Keeps the base helper a thin call so the existing
+/// exit-class tests are untouched.
+fn run_resolve_ext(
+    run: &str,
+    request_id: &str,
+    decision: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rezidnt"));
     cmd.arg("operator")
         .arg("resolve-permit")
         .arg(run)
         .arg(request_id)
-        .arg(decision);
+        .arg(decision)
+        .args(extra);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -86,6 +100,70 @@ fn run_resolve(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// One-shot loopback stub: bind :0, accept ONE connection, capture the POSTed
+/// JSON-RPC body, reply with a canned tool success so the CLI exits 0. Returns
+/// (port, body-receiver, join-handle). Factored from
+/// `request_body_carries_no_fabricated_target` so the DR-035 `--scope`/`--ttl-ms`
+/// body-shape tests reuse the exact same capture path.
+fn oneshot_capture_stub() -> (u16, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    let (tx, rx) = mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw);
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("Content-Length:")
+                                        .or_else(|| l.strip_prefix("content-length:"))
+                                })
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            let _ = tx.send(body);
+            let resp_body = r#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[{"type":"text","text":"{}"}]}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, rx, handle)
+}
+
+/// Write a stub lockfile at `path` pointing the CLI at the loopback `port` (the
+/// shape `rezidnt_mcp::lockfile::read` parses: pid, port, url, badge).
+fn write_stub_lockfile(path: &std::path::Path, port: u16) {
+    let lock_json = format!(
+        r#"{{"pid":1,"port":{port},"url":"http://127.0.0.1:{port}/mcp","badge":"deadbeefcafef00d"}}"#
+    );
+    std::fs::write(path, lock_json).expect("write stub lockfile");
 }
 
 /// A syntactically-invalid ULID — rejected as a LOCAL input error BEFORE any
@@ -230,72 +308,12 @@ fn wellformed_decisions_are_not_input_errors() {
 /// `REZIDNT_LOCKFILE`; no UDS. NOT `#![cfg(unix)]`-gated.
 #[test]
 fn request_body_carries_no_fabricated_target() {
-    // One-shot loopback stub: bind :0, hand the CLI a lockfile pointing here,
-    // accept one connection, capture the POST body, reply with a JSON-RPC ok.
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback stub");
-    let port = listener.local_addr().expect("stub addr").port();
-
-    let (tx, rx) = mpsc::channel::<String>();
-    let handle = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            // Read the request (Connection: close ⇒ read to EOF is fine, but the
-            // client keeps the stream open for the response, so read the headers
-            // + body up to Content-Length by draining what is available first).
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 4096];
-            // Read until we have the full head+body. The client sends the whole
-            // request then waits for a reply, so a bounded read loop that stops
-            // once the body is complete avoids blocking on the half-open stream.
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        raw.extend_from_slice(&buf[..n]);
-                        let text = String::from_utf8_lossy(&raw);
-                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                            let len = head
-                                .lines()
-                                .find_map(|l| {
-                                    l.strip_prefix("Content-Length:")
-                                        .or_else(|| l.strip_prefix("content-length:"))
-                                })
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .unwrap_or(0);
-                            if body.len() >= len {
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let text = String::from_utf8_lossy(&raw).into_owned();
-            let body = text
-                .split_once("\r\n\r\n")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            let _ = tx.send(body);
-
-            // Canned JSON-RPC tool success so the CLI exits 0 (not an error path).
-            let resp_body = r#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[{"type":"text","text":"{}"}]}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                resp_body.len(),
-                resp_body
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-
-    // A lockfile pointing at the stub (the shape rezidnt_mcp::lockfile::read
-    // parses: pid, port, url, badge).
+    // One-shot loopback stub + stub lockfile (shared with the DR-035 body-shape
+    // tests): capture the POSTed body, reply with a canned JSON-RPC success.
+    let (port, rx, handle) = oneshot_capture_stub();
     let dir = tempfile::tempdir().expect("tempdir");
     let lock_path = dir.path().join("mcp.lock");
-    let lock_json = format!(
-        r#"{{"pid":1,"port":{port},"url":"http://127.0.0.1:{port}/mcp","badge":"deadbeefcafef00d"}}"#
-    );
-    std::fs::write(&lock_path, lock_json).expect("write stub lockfile");
+    write_stub_lockfile(&lock_path, port);
 
     let (code, _out, stderr) = run_resolve(
         WELLFORMED_RUN,
@@ -345,5 +363,95 @@ fn request_body_carries_no_fabricated_target() {
         args["decision"],
         serde_json::json!("allow"),
         "the human decision rides the body verbatim (the input verb, not coerced)"
+    );
+}
+
+/// DR-035 §Decision 2 (CLI parity — `--scope` rides the body VERBATIM) — the MCP
+/// `resolve_permit` tool accepts an optional broad `scope`, but the shipped
+/// subcommand only wired `--ttl-ms`, so a broad grant was reachable ONLY via raw
+/// MCP. This pins that `--scope run_tool` (paired with `--ttl-ms`, per the
+/// coupling guard) rides the POSTed body as `scope` verbatim — the client passes
+/// it through, NOT interpreting it. The daemon owns the semantics: fail-closed on
+/// unknown values and the `SCOPE_REQUIRES_TTL` coupling
+/// (`crates/rezidnt-mcp/src/lib.rs`), so the CLI stays a thin conduit (no local
+/// scope validation, preserving I5 forward-compat for a future second axis).
+#[test]
+fn scope_flag_rides_body_verbatim() {
+    let (port, rx, handle) = oneshot_capture_stub();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock_path = dir.path().join("mcp.lock");
+    write_stub_lockfile(&lock_path, port);
+
+    // A broad grant MUST be time-boxed (the coupling guard), so pair --scope with
+    // --ttl-ms — the daemon would refuse broad-and-permanent (SCOPE_REQUIRES_TTL).
+    let (code, _out, stderr) = run_resolve_ext(
+        WELLFORMED_RUN,
+        WELLFORMED_REQ,
+        "allow",
+        &["--scope", "run_tool", "--ttl-ms", "60000"],
+        &[("REZIDNT_LOCKFILE", lock_path.to_str().unwrap())],
+    );
+
+    let body = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the CLI must POST a resolve_permit body carrying --scope — captured none \
+                 (flag absent or never dialed?); exit {code:?}, stderr: {stderr}"
+            )
+        });
+    let _ = handle.join();
+
+    let req: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("POST body must be JSON-RPC ({e}): {body}"));
+    let args = &req["params"]["arguments"];
+    assert_eq!(
+        args["scope"],
+        serde_json::json!("run_tool"),
+        "`--scope run_tool` must ride the resolve_permit body as `scope` VERBATIM (DR-035 \
+         §Decision 2) — the client passes it through, not interpreting it. body: {body}"
+    );
+    // The paired TTL still rides too (the coupling the daemon enforces).
+    assert_eq!(
+        args["ttl_ms"],
+        serde_json::json!(60000),
+        "`--ttl-ms` rides alongside `--scope` (the broad grant is time-boxed). body: {body}"
+    );
+}
+
+/// DR-035 §Decision 2 (negative control — absent `--scope` OMITS the key) — with
+/// no `--scope` flag the POSTed body carries NO `scope` key (OMITTED, never null),
+/// so the daemon keeps the DR-033 exact request-scoped match. Mirrors the
+/// `permit.resolved` emit rule (`scope` present ONLY on a broad grant) so a narrow
+/// grant is never misreported as broad.
+#[test]
+fn absent_scope_flag_omits_key() {
+    let (port, rx, handle) = oneshot_capture_stub();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock_path = dir.path().join("mcp.lock");
+    write_stub_lockfile(&lock_path, port);
+
+    let (code, _out, stderr) = run_resolve_ext(
+        WELLFORMED_RUN,
+        WELLFORMED_REQ,
+        "allow",
+        &[],
+        &[("REZIDNT_LOCKFILE", lock_path.to_str().unwrap())],
+    );
+
+    let body = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            panic!("the CLI must POST a body; captured none. exit {code:?}, stderr: {stderr}")
+        });
+    let _ = handle.join();
+
+    let req: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("POST body must be JSON-RPC ({e}): {body}"));
+    let args = &req["params"]["arguments"];
+    assert!(
+        args.get("scope").is_none(),
+        "with no --scope flag the body must OMIT `scope` (never null) — the DR-033 exact \
+         request-scoped match is unchanged (the negative control). body: {body}"
     );
 }

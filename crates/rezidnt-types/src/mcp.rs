@@ -71,6 +71,45 @@ pub struct KillRunArgs {
     pub reason: Option<String>,
 }
 
+/// `resolve_permit` — DR-033 §Decision 1 (slice 2): the OPERATOR-ONLY mutating
+/// tool by which a human resolves a previously-escalated permit. Mutating:
+/// requires an operator badge (doc §12 / DR-033 §Design), checked before any
+/// side effect; the agent-macaroon path is rejected on policy (resolving is an
+/// operator action, not agent self-action — mirrors `kill_run`, DR-032 §1). On
+/// admit the daemon emits ONE `permit.resolved` fact the PDP later APPLIES on the
+/// agent's next ask for the same action `(run, tool, action/target)`.
+///
+/// The operator supplies NO `action` and NO `target` — the DAEMON DERIVES them
+/// from the log by `request_id` (DR-033 §Design, /debrief FAIL close): a
+/// hardcoded operator `target` broke the PDP action-identity match. The trimmed
+/// shape is `{ badge, run, request_id, decision, reason? }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ResolvePermitArgs {
+    /// Operator badge token (hex), doc §12 / DR-033 §Design. The operator
+    /// identity checked before any fact is emitted; never logged (the verified id
+    /// rides `permit.resolved.operator_badge_id`, not the token, §12/I2).
+    pub badge: String,
+    /// Run ULID (canonical 26-char text form) the escalated permit belongs to —
+    /// half the `(run, tool, action/target)` match key the PDP applies on. The
+    /// run the daemon folds to DERIVE `(action, target)` by `request_id`.
+    pub run: String,
+    /// The ESCALATED ask's `request_id` — the audit correlation (which escalation
+    /// this resolution answers) AND the lookup key the daemon derives
+    /// `(action, target)` from. Rides the fact and, once applied, the outcome's
+    /// `resolved_from` (NOT the match key: `request_id` is re-minted per ask,
+    /// DR-033 §Context).
+    pub request_id: String,
+    /// The human's binding choice, the override the PDP applies: the INPUT VERB
+    /// `"allow"` | `"deny"` (never `granted`/`denied` — that is the PDP outcome
+    /// subject, DR-033 §Decision; the CLI edge enforces the closed two-value set).
+    pub decision: String,
+    /// Optional operator-supplied reason: rides the emitted `permit.resolved` fact
+    /// when present (I6 interrogability), omitted when the caller gave none —
+    /// never synthesized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// `request_permission` — the harness PEP asks the daemon PDP "may this action
 /// proceed?" and gets back a three-valued decision (`allow | deny | ask`),
 /// NEVER coerced (I6, design §5).

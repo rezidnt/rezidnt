@@ -18,6 +18,9 @@
       "permit_ledger": {
         "01SP0ESCNCRCEPERMFXXRQ001": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Bash"
+          },
           "decision": "escalated",
           "policy_ref": "e5ca1a7e0000000000000000000000000000000000000000000000n0c0erce",
           "reason": "no policy matched"

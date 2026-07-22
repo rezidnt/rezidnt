@@ -19,6 +19,9 @@
       "permit_ledger": {
         "01SPW1REAGGDENYRQ000000001": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Edit"
+          },
           "decision": "denied",
           "policy_ref": "pa7hsc0p3d3c1d1n67h3aggr3g4700000000000000000000000000000wire01",
           "reason": "path /etc/shadow outside allowed scope"

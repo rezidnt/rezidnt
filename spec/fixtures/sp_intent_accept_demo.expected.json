@@ -21,12 +21,18 @@
       "permit_ledger": {
         "01SPNTENTACCEPTDEMRQ00FF01": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Bash"
+          },
           "decision": "escalated",
           "policy_ref": "n7en7l0ckp0l1cy00000000000000000000000000000000000000000d3m0p1",
           "reason": "off-task tool Bash not in declared intent [Read, Grep, Glob]"
         },
         "01SPNTENTACCEPTDEMRQ00N001": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Read"
+          },
           "decision": "granted",
           "policy_ref": "n7en7l0ckp0l1cy00000000000000000000000000000000000000000d3m0p1",
           "reason": null

@@ -518,6 +518,7 @@ impl McpCore {
             "open_project" => self.call_open_project(args).await,
             "spawn_agent" => self.call_spawn_agent(args).await,
             "kill_run" => self.call_kill_run(args).await,
+            "resolve_permit" => self.call_resolve_permit(args).await,
             "request_permission" => self.call_request_permission(args).await,
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
@@ -784,6 +785,86 @@ impl McpCore {
         Ok(tool_ok(result))
     }
 
+    /// `resolve_permit` — DR-033 §Decision 1 (slice 2). The OPERATOR-ONLY
+    /// mutating tool by which a human resolves a previously-escalated permit.
+    /// Door discipline (§12): the operator badge is checked BEFORE any side effect
+    /// ([`check_operator_badge`] rejects the macaroon path on policy — resolving
+    /// is an operator action, not agent self-action, mirroring `kill_run`). A
+    /// refused resolve emits NO fact (I3). Unlike `kill_run`, a resolution is a
+    /// PURE fact emit — NO substrate seam: on admit the core emits EXACTLY ONE
+    /// `permit.resolved` fact through the single writer, carrying
+    /// `operator_badge_id` = the VERIFIED operator id (never the token, §12/I2),
+    /// the human `decision` verbatim (never coerced — the PDP coerces on the next
+    /// ask, I6), the escalated `request_id`, and the DAEMON-DERIVED
+    /// `action`/`target` descriptor (the next-ask match key). The operator
+    /// supplies NEITHER: the daemon folds the run and looks the escalation up by
+    /// `request_id`, stamping the REAL `(action, target)` the operator never types
+    /// (DR-033 §Design, /debrief FAIL close — a hardcoded operator `target` broke
+    /// the PDP action-identity match). An UNKNOWN `request_id` (no folded
+    /// `permit.requested` to derive from) is REFUSED, NO fact emitted (I3/I6).
+    /// `reason` rides when supplied.
+    async fn call_resolve_permit(&self, args: Value) -> RpcOutcome {
+        // §12 door FIRST — operator-only. A refusal returns before any effect.
+        let operator_badge_id = match self.check_operator_badge(&args) {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
+        // Deserialize THROUGH the advertised (TRIMMED) shape so the served
+        // inputSchema and the accepted args cannot diverge (doc §9 no-drift). The
+        // operator supplies NO action/target — the daemon derives them. The reason
+        // rides the fact when present (I6), omitted when absent — never synthesized.
+        let parsed: rezidnt_types::mcp::ResolvePermitArgs =
+            match serde_json::from_value(args.clone()) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Ok(tool_refused(
+                        codes::ARGS_INVALID,
+                        "resolve_permit requires badge, run, request_id, decision",
+                    ));
+                }
+            };
+
+        // DERIVE `(action, target)` from the log by `request_id` (DR-033 §Design).
+        // Fold the run and look the escalation up in the permit ledger. If ABSENT
+        // (no `permit.requested` folded for this request_id) the daemon cannot
+        // derive a match key and REFUSES with the honest unknown-escalation code
+        // (NOT `ARGS_INVALID` — the args parsed fine), emitting NO fact (I3/I6).
+        let folded = self.fold_run_state(&parsed.run).await?;
+        let (action, target) = match folded.permit_ledger.get(&parsed.request_id) {
+            Some(entry) if !entry.action.is_empty() => (entry.action.clone(), entry.target.clone()),
+            _ => {
+                return Ok(tool_refused(
+                    codes::RUN_UNKNOWN,
+                    "resolve_permit: no escalation with that request_id on the run's log — \
+                     the daemon cannot derive an action/target and will not fabricate one",
+                ));
+            }
+        };
+
+        // Emit EXACTLY ONE `permit.resolved` fact through the single writer (I3).
+        // `operator_badge_id` is the loggable verified id, NEVER the token
+        // (§12/I2). `action`/`target` are DAEMON-DERIVED (not operator inputs).
+        // `decision` is the human input verb, folded verbatim (I6).
+        let mut payload = json!({
+            "run": parsed.run,
+            "request_id": parsed.request_id,
+            "action": action,
+            "target": target.unwrap_or_else(|| json!({})),
+            "decision": parsed.decision,
+            "operator_badge_id": operator_badge_id,
+        });
+        if let (Some(reason), Some(obj)) = (&parsed.reason, payload.as_object_mut()) {
+            obj.insert("reason".to_string(), json!(reason));
+        }
+        self.publish_fact("permit.resolved", payload).await?;
+
+        Ok(tool_ok(json!({
+            "run": parsed.run,
+            "request_id": parsed.request_id,
+            "decision": parsed.decision,
+        })))
+    }
+
     /// `request_permission` — the daemon IS the PDP (design §5, DR-008/DR-009).
     /// Ordering (§12 door discipline): badge FIRST (the caller of an
     /// authorization decision must be identified), then the request fact, then
@@ -925,6 +1006,55 @@ impl McpCore {
             .fold_run_state(&run)
             .await
             .map_err(|(_, m)| PdpError::Internal(m))?;
+
+        // 2b. DR-033 §Decision 1 (slice 2) — the PDP LEDGER-CHECK (the crux):
+        //     BEFORE verifier dispatch, consult the folded log. If a human
+        //     `permit.resolved` answers this exact action `(run, tool,
+        //     action/target)`, APPLY the human decision — emit `permit.granted`
+        //     (allow) / `permit.denied` (deny) carrying `resolved_from` = the
+        //     resolution's `request_id` — instead of re-escalating. The match keys
+        //     on ACTION IDENTITY, not `request_id` (re-minted per ask, §Context).
+        //     Request-scoped (§Decision 3): a resolution for one action never
+        //     grants another — `resolution_for` returns `None` and the normal
+        //     verifier path runs. The applied outcome is a REAL logged decision
+        //     fact (I3 — interrogable, `resolved_from` chains to WHO/WHY, I6), NOT
+        //     a silent coercion of the escalation (a RECORDED human override).
+        //     An unrecognized human verb (neither `allow` nor `deny`) is NEVER
+        //     coerced to a grant (I6): it does not apply, so control falls through
+        //     to the verifier path (which escalates an empty set). Resolve the
+        //     applied `(subject, decision, resolved_from)` first so the borrow of
+        //     `folded` ends before the async emit/fallthrough.
+        let applied = folded
+            .resolution_for(&action, &tool)
+            .and_then(|resolution| {
+                let (subject, decision) = match resolution.decision.as_str() {
+                    "allow" => ("permit.granted", Decision::Allow),
+                    "deny" => ("permit.denied", Decision::Deny),
+                    _ => return None,
+                };
+                Some((subject, decision, resolution.request_id.clone()))
+            });
+        if let Some((subject, decision, resolved_from)) = applied {
+            // The applied fact carries `resolved_from` = the resolution's
+            // `request_id` so "granted via human resolution X" is a structured,
+            // log-derivable read (I6). No `policy_ref`: a human resolution is
+            // neither a policy nor a CAS blob (ontology permit.granted.resolved_from
+            // — deliberately NOT overloaded onto policy_ref).
+            let payload = json!({
+                "run": run,
+                "request_id": request_id,
+                "resolved_from": resolved_from,
+            });
+            self.publish_fact(subject, payload)
+                .await
+                .map_err(|(_, m)| PdpError::Internal(m))?;
+
+            return Ok(PermitOutcome {
+                request_id,
+                decision,
+                reason: None,
+            });
+        }
 
         // 3. The request axis + folded state as pinned params. Each verifier's
         //    own config (`allow`, caps, knobs) rides its `PermitVerifierSpec`
@@ -1214,6 +1344,16 @@ impl McpCore {
                 if let Some(reason) = payload.get("reason") {
                     obj.insert("reason".to_string(), reason.clone());
                 }
+                // DR-033 §Decision 1 (slice 2): surface `resolved_from` when the
+                // applied decision fact carries it (a human-resolved grant/denial),
+                // so a reader tells a human override from a policy grant and can
+                // chain to the resolution's operator_badge_id/reason (I6). Present
+                // ONLY on a resolution-applied fact; ABSENT on an ordinary
+                // verifier-decided grant — never synthesized (a phantom
+                // resolved_from would misreport the deciding authority).
+                if let Some(resolved_from) = payload.get("resolved_from") {
+                    obj.insert("resolved_from".to_string(), resolved_from.clone());
+                }
             }
             e
         } else {
@@ -1380,6 +1520,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "kill_run",
                 "description": "Terminate a run: OPERATOR-ONLY (DR-032 §1). Requires an operator badge; an agent macaroon is refused. Emits one attributed agent.signaled fact.",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::KillRunArgs))?,
+            },
+            {
+                "name": "resolve_permit",
+                "description": "Resolve a previously-escalated permit: OPERATOR-ONLY (DR-033 §1). Requires an operator badge; an agent macaroon is refused. Emits one permit.resolved fact the PDP applies on the next ask.",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::ResolvePermitArgs))?,
             },
             {
                 "name": "request_permission",

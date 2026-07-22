@@ -23,24 +23,36 @@
       "permit_ledger": {
         "01S5BB0ARDPERMFXTRERQ001": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Read"
+          },
           "decision": "granted",
           "policy_ref": "a11a2000000000000000000000000000000000000000000000000000gr4n7d",
           "reason": null
         },
         "01S5BB0ARDPERMFXTRERQ002": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Bash"
+          },
           "decision": "denied",
           "policy_ref": "d3n1ed00000000000000000000000000000000000000000000000000den1ed",
           "reason": "path outside allowed scope"
         },
         "01S5BB0ARDPERMFXTRERQ003": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "WebFetch"
+          },
           "decision": "escalated",
           "policy_ref": "e5ca1a7ed000000000000000000000000000000000000000000000e5ca1a7e",
           "reason": "cumulative spend crossed soft cap"
         },
         "01S5BB0ARDPERMFXTRERQ004": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Edit"
+          },
           "decision": null,
           "policy_ref": null,
           "reason": null

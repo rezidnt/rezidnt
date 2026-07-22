@@ -194,6 +194,13 @@ pub struct PermitLedgerEntry {
     /// The requested action kind (`permit.requested.action`, e.g.
     /// `"tool.invoke"`), recorded verbatim.
     pub action: String,
+    /// The requested action target (`permit.requested.target`, e.g.
+    /// `{"tool": "Bash"}`), recorded verbatim so `resolve_permit` can DERIVE the
+    /// `(action, target)` match key by `request_id` (DR-033 §Design). `None`
+    /// while the request has not folded (a decision may fold first, out of
+    /// order). Additive; `#[serde(default)]` keeps pre-existing fixtures parsing.
+    #[serde(default)]
+    pub target: Option<serde_json::Value>,
     /// The decision, once one lands: `"granted" | "denied" | "escalated"`.
     /// `None` while the request is pending (requested but not yet decided).
     pub decision: Option<String>,
@@ -203,6 +210,48 @@ pub struct PermitLedgerEntry {
     pub policy_ref: Option<String>,
     /// Denial / escalation reason, recorded verbatim (`permit.denied.reason`
     /// / `permit.escalated.reason`); `None` for grants and while pending.
+    pub reason: Option<String>,
+}
+
+/// DR-033 §Decision 1 (slice 2): one folded `permit.resolved` fact — the durable
+/// HUMAN-OVERRIDE record that an operator resolved a previously-escalated permit
+/// via the `resolve_permit` operator-badged MCP tool. NOT a PDP verdict: the
+/// recorded human decision the PDP's pre-verifier ledger-check APPLIES on the
+/// agent's NEXT ask for the same action `(run, tool, action/target)`, emitting
+/// the corresponding `permit.granted`/`permit.denied` citing this resolution
+/// (`resolved_from` = [`Self::request_id`]) as authority (I6). Folded VERBATIM —
+/// the reducer never re-derives: `decision` stays the human INPUT VERB
+/// (`"allow"`/`"deny"`), NEVER coerced to `granted`/`denied` (that coercion is
+/// the PDP's, on the next ask). Appended in log order onto
+/// [`AgentRunState::resolutions`]; a new resolution for the same action stands as
+/// the applied one (last-matching-wins, DR-033 §Decision 2 "a new resolve
+/// overrides"). Rebuild-stable via the same `#[serde(default)]` discipline the
+/// other DR-* fields use (I3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PermitResolution {
+    /// The ESCALATED ask's `request_id` — the AUDIT correlation (which escalation
+    /// this resolution answers), NOT the match key (`request_id` is re-minted per
+    /// ask, DR-033 §Context). The applied grant/denial cites this as
+    /// `resolved_from`.
+    pub request_id: String,
+    /// The requested action kind (`permit.requested.action`, e.g.
+    /// `"tool.invoke"`) — half the `(run, tool, action/target)` match key.
+    pub action: String,
+    /// The action target descriptor (`permit.requested.target`, e.g.
+    /// `{"tool": "Bash"}`) — the other half of the match key, folded VERBATIM as
+    /// the raw JSON so the PDP compares descriptor-to-descriptor with no shape
+    /// translation (I2: a small inline descriptor, never bulk bytes).
+    pub target: serde_json::Value,
+    /// The human's binding choice, the override the PDP applies — the INPUT VERB
+    /// `"allow"`/`"deny"`, folded VERBATIM (never coerced to `granted`/`denied`;
+    /// that is the PDP's job on the next ask, I6).
+    pub decision: String,
+    /// The loggable operator badge id of the human who resolved this
+    /// (`hex(blake3(sig)[..8])` / DR-005 opaque operator id), folded VERBATIM —
+    /// NEVER the token (§12/I2). `None` when the fact omitted it.
+    pub operator_badge_id: Option<String>,
+    /// The operator-supplied reason, folded VERBATIM (I6 interrogability). `None`
+    /// when absent — never synthesized.
     pub reason: Option<String>,
 }
 
@@ -399,6 +448,19 @@ pub struct AgentRunState {
     /// `#[serde(default)]` keeps every pre-DR-032 golden fixture unedited (I3).
     #[serde(default)]
     pub kill_reason: Option<String>,
+    /// DR-033 §Decision 1 (slice 2): this run's folded `permit.resolved` human
+    /// overrides (see [`PermitResolution`]), in append (log) order so the
+    /// override history replays deterministically (I3). The PDP ledger-check finds
+    /// the applicable resolution by ACTION identity `(run, tool, action/target)`
+    /// via [`AgentRunState::resolution_for`] — a re-ask carries a fresh
+    /// `request_id`, so the match keys on the action descriptor, not the id
+    /// (DR-033 §Context/§Decision 3). A NEW resolution for the same action appends
+    /// and wins (last-matching-wins, DR-033 §Decision 2). `#[serde(default)]` keeps
+    /// every pre-DR-033 golden fixture parsing (and comparing equal) unedited — the
+    /// exact rebuild-stability discipline `delegations` / `integrity_alarms` /
+    /// `permit_ledger` already use (I3).
+    #[serde(default)]
+    pub resolutions: Vec<PermitResolution>,
 }
 
 impl AgentRunState {
@@ -408,6 +470,20 @@ impl AgentRunState {
     /// enforced (the honesty the `gate_explain` distinction rests on, I4).
     pub fn pep_enforced(&self) -> bool {
         self.pep.as_deref() == Some("enforced")
+    }
+
+    /// DR-033 §Decision 1/3 (slice 2): the resolution the PDP would APPLY for an
+    /// incoming ask matching `(action, tool)` on this run — the LATEST folded
+    /// `permit.resolved` whose `action` and `target.tool` match (last-matching-
+    /// wins, DR-033 §Decision 2). `None` when no resolution answers this action
+    /// (the request-scoped guard: a resolution for one action never grants
+    /// another, DR-033 §Decision 3). The match keys on ACTION identity, NOT
+    /// `request_id` (which is re-minted per ask, DR-033 §Context).
+    pub fn resolution_for(&self, action: &str, tool: &str) -> Option<&PermitResolution> {
+        self.resolutions.iter().rev().find(|r| {
+            r.action == action
+                && r.target.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+        })
     }
 }
 
@@ -758,18 +834,57 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     .permit_ledger
                     .entry(request_id)
                     .or_default();
-                // Record the requested action; a decision may already have
-                // folded first (out-of-order log), so only fill the action —
-                // never clobber a decision (the log is truth, I3).
+                // Record the requested action and target; a decision may
+                // already have folded first (out-of-order log), so only fill the
+                // request fields — never clobber a decision (the log is truth,
+                // I3). The `target` is what `resolve_permit` DERIVES the match
+                // key from by `request_id` (DR-033 §Design).
                 entry.action = event.payload()["action"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
+                let target = &event.payload()["target"];
+                if !target.is_null() {
+                    entry.target = Some(target.clone());
+                }
             }
         }
         "permit.granted" => apply_permit_decision(graph, event, "granted"),
         "permit.denied" => apply_permit_decision(graph, event, "denied"),
         "permit.escalated" => apply_permit_decision(graph, event, "escalated"),
+        // DR-033 §Decision 1 (slice 2): the `permit.resolved` human-override
+        // fact. Keyed on the payload `run`; appends one [`PermitResolution`] in
+        // log order so the override history replays and a NEW resolution for the
+        // same action wins (last-matching-wins via `resolution_for`'s reverse
+        // scan, DR-033 §Decision 2). The fact folds VERBATIM (the reducer never
+        // re-derives — `decision` stays the human input verb `allow`/`deny`, I3;
+        // `operator_badge_id`/`reason` are the loggable attribution, never the
+        // token). A keyless fact (missing `run`) folds counters-only / no-op,
+        // never mints a run, never panics — the established permit/intent
+        // discipline (I3, never guess a key). `target` folds as the raw JSON
+        // descriptor (the next-ask match key).
+        "permit.resolved" => {
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                let record = PermitResolution {
+                    request_id: payload["request_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    action: payload["action"].as_str().unwrap_or_default().to_string(),
+                    target: payload["target"].clone(),
+                    decision: payload["decision"].as_str().unwrap_or_default().to_string(),
+                    operator_badge_id: payload["operator_badge_id"].as_str().map(String::from),
+                    reason: payload["reason"].as_str().map(String::from),
+                };
+                graph
+                    .agent_runs
+                    .entry(run)
+                    .or_default()
+                    .resolutions
+                    .push(record);
+            }
+        }
         // DR-010 run-intent reducer (the run-intent axis). Keyed by the payload
         // `run`; folds onto `AgentRunState::intent` the pinned state the future
         // `intent-lock` verifier reads. A payload without `run` folds as

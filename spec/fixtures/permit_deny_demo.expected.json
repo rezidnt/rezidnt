@@ -19,6 +19,9 @@
       "permit_ledger": {
         "01SP1DENYDEM0FXXRQ00001": {
           "action": "tool.invoke",
+          "target": {
+            "tool": "Bash"
+          },
           "decision": "denied",
           "policy_ref": "70014110w1157000000000000000000000000000000000000000d3ny70011s",
           "reason": "tool Bash not in allowlist"

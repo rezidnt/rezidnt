@@ -131,6 +131,24 @@ enum OperatorCmd {
         /// The run ULID, as printed by `rezidnt open`.
         run: String,
     },
+    /// Resolve a previously-escalated permit (DR-033 §Decision 1): POST a
+    /// `resolve_permit` `tools/call` over the loopback-HTTP MCP surface, carrying
+    /// the operator badge from the 0600 lockfile. The daemon records a
+    /// `permit.resolved` fact the PDP applies on the agent's next ask. DR-004
+    /// exits: 0 ok, 2 malformed run ULID / decision (local input), 4
+    /// daemon-unreachable, 5 tool-refused (the daemon refused the resolve).
+    #[command(name = "resolve-permit")]
+    ResolvePermit {
+        /// The run ULID the escalated permit belongs to.
+        run: String,
+        /// The escalated ask's request_id (the audit correlation this answers).
+        request_id: String,
+        /// The human decision: `allow` or `deny` (the closed two-value set).
+        decision: String,
+        /// Optional operator reason: rides the emitted permit.resolved fact.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +217,36 @@ fn main() {
                 }
             };
             (1, operator_kill_run(run))
+        }
+        Cmd::Operator {
+            cmd:
+                OperatorCmd::ResolvePermit {
+                    run,
+                    request_id,
+                    decision,
+                    reason,
+                },
+        } => {
+            // Local input phase (DR-004): a malformed/absent run ULID and a
+            // decision that is not `allow`/`deny` are BOTH exit 2 (the closed
+            // two-value enum on the CLI edge), rejected BEFORE any daemon traffic.
+            // The subcommand then owns its own 0/4/5 mapping (operator_resolve_permit
+            // exits internally), so a placeholder class here.
+            let run = match run.parse::<ulid::Ulid>() {
+                Ok(run) => run,
+                Err(e) => {
+                    eprintln!("rezidnt: run id {run:?} is not a ULID: {e}");
+                    std::process::exit(2);
+                }
+            };
+            if decision != "allow" && decision != "deny" {
+                eprintln!("rezidnt: decision {decision:?} is not allow|deny (DR-033 §Decision 1)");
+                std::process::exit(2);
+            }
+            (
+                1,
+                operator_resolve_permit(run, &request_id, &decision, reason.as_deref()),
+            )
         }
         // The PEP emits its decision on stdout and fails closed to `ask`
         // internally; a hard error here (unreadable stdin / stdout write) is an
@@ -1011,6 +1059,108 @@ fn operator_kill_run(run: ulid::Ulid) -> anyhow::Result<()> {
         std::process::exit(5);
     }
     println!("killed run {run}");
+    std::process::exit(0);
+}
+
+/// `rezidnt operator resolve-permit <run> <request_id> <allow|deny> [--reason …]`
+/// (DR-033 §Decision 1). Reads the 0600 lockfile (port + operator badge), then
+/// POSTs a `resolve_permit` `tools/call` over the loopback-HTTP MCP surface — NOT
+/// the bare socket (DR-032 §Decision 2: the socket's UDS-identity would bypass the
+/// explicit operator authorization DR-031 requires). The daemon records a
+/// `permit.resolved` fact the PDP applies on the agent's NEXT ask for the same
+/// action.
+///
+/// This function OWNS its DR-004 exit codes (0/4/5) and exits internally
+/// (mirroring `operator_kill_run`): 0 ok, 4 daemon-unreachable (no lockfile / a
+/// dead port), 5 tool-refused (the daemon refused the resolve). The malformed run
+/// / decision input class (exit 2) is handled by the caller before this runs. The
+/// run ULID is already validated; `<allow|deny>` maps to the tool's `decision`
+/// arg. The client sends only `{ badge, run, request_id, decision, reason? }`:
+/// the daemon DERIVES the escalation's `action`/`target` from the folded log by
+/// `request_id` (DR-033 §Design) — the CLI never fabricates a descriptor.
+///
+/// I7: the loopback POST reuses the same minimal hand-rolled HTTP/1.1 exchange as
+/// `operator_kill_run` ([`loopback_post`]) — no HTTP crate is pulled in.
+fn operator_resolve_permit(
+    run: ulid::Ulid,
+    request_id: &str,
+    decision: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = lockfile_path();
+    // No lockfile / unreadable / unparseable ⇒ daemon-unreachable (exit 4).
+    let lock = match rezidnt_mcp::lockfile::read(&path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "rezidnt: daemon unreachable: cannot read operator lockfile {}: {e}",
+                path.display()
+            );
+            std::process::exit(4);
+        }
+    };
+
+    // The JSON-RPC tools/call for resolve_permit, carrying the operator badge
+    // (§12) and the resolution args. The badge TOKEN rides only the request body
+    // to the loopback daemon — never printed, never logged (§12/I2).
+    // The client sends only the trimmed shape { badge, run, request_id,
+    // decision, reason? }: the operator supplies NO action/target — the DAEMON
+    // DERIVES them from the log by request_id (DR-033 §Design). A hardcoded
+    // action/target here was the /debrief FAIL (the fabricated empty target broke
+    // the PDP action-identity match).
+    let mut arguments = serde_json::json!({
+        "badge": lock.badge,
+        "run": run.to_string(),
+        "request_id": request_id,
+        "decision": decision,
+    });
+    if let (Some(reason), Some(obj)) = (reason, arguments.as_object_mut()) {
+        obj.insert("reason".to_string(), serde_json::json!(reason));
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "resolve_permit", "arguments": arguments },
+    });
+
+    // Dial the loopback port and POST. Any connect/IO failure is
+    // daemon-unreachable (exit 4): a lockfile pointing at a dead port is exactly
+    // the unreachable class.
+    let response = match loopback_post(lock.port, &request.to_string()) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!(
+                "rezidnt: daemon unreachable: resolve_permit POST to loopback:{} failed: {e:#}",
+                lock.port
+            );
+            std::process::exit(4);
+        }
+    };
+
+    // A JSON-RPC error object (protocol misuse) / unparseable body ⇒ tool-refused
+    // (the resolve did not happen). A tool result with `isError: true` is the
+    // daemon REFUSING the resolve (badge rejected) ⇒ exit 5.
+    let parsed: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rezidnt: resolve_permit refused: unparseable daemon response ({e})");
+            std::process::exit(5);
+        }
+    };
+    if let Some(err) = parsed.get("error") {
+        eprintln!("rezidnt: resolve_permit refused: {err}");
+        std::process::exit(5);
+    }
+    let result = &parsed["result"];
+    if result["isError"] == serde_json::json!(true) {
+        let detail = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("(no detail)");
+        eprintln!("rezidnt: resolve_permit refused: {detail}");
+        std::process::exit(5);
+    }
+    println!("resolved permit for run {run} ({decision})");
     std::process::exit(0);
 }
 

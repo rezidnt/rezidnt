@@ -1,13 +1,14 @@
-# Handoff — 2026-07-21 (session 18: c3-op-secrets DONE — 1Password op backend; C3 credential-brokering arc complete; next = owner-gated live-op proof / Platform backends)
+# Handoff — 2026-07-21 (session 18: c3-op-secrets DONE — 1Password op backend; C3 COMPLETE + live-op proof PASSED; next = owner's steer)
 
 ## State of play
 **`c3-op-secrets` is DONE.** The C3 credential-brokering arc is now COMPLETE end-to-end: a shipped `rezidnt open`
 run mediates egress AND brokers a secret the agent never holds, sourced from EITHER a host file OR **1Password**
 (`op read op://vault/item/field`, exec'd not linked, vault-scoped service account) — both behind the DR-029
 `SecretSource` I4 seam, dispatched by reference scheme. DR-030 ratified, implementation landed + audited + a
-seam-cleanup round (removed trait pollution). Host `/vet` PASS, op suites green host+WSL, WSL crit-5 (live op)
-honest-skips, `/debrief` PASS (no blocking defects). High autonomy ON ([[autonomy-high-trust]]). `current-slice`
-= `c3-op-secrets` (**done**). Pushed to `origin/main` (push is the last step of this handoff).
+seam-cleanup round (removed trait pollution). Host `/vet` PASS, op suites green host+WSL, `/debrief` PASS (no
+blocking defects). **Crit 5 (live op-injected run) is now PROVEN LIVE (owner ran it 2026-07-21 — see below); C3 is
+ALL-GREEN, nothing gated remains.** High autonomy ON ([[autonomy-high-trust]]). `current-slice` = `c3-op-secrets`
+(**done**). Pushed to `origin/main`.
 
 ## Current slice & criteria
 `c3-op-secrets` — DONE. DR-030's five criteria: (1) scheme-dispatch (`op://` → OpSecretSource, plain →
@@ -16,19 +17,23 @@ redaction; (3) honest degrade taxonomy — op absent ⇒ UNAVAILABLE (spawn err)
 op read other-nonzero ⇒ RESOLUTION_FAIL — each DROPS with a DISTINGUISHING `credential.dropped` reason, never a
 fake token; (4) leak-discipline — `OP_SERVICE_ACCOUNT_TOKEN` + resolved value in NO fact/log/trace/RunError/agent-env,
 `.expose()` single call-site. Crit 1–4 → GREEN (21 host op tests; also green on WSL). (5) live op-injected mediated
-run → WSL `#[cfg(unix)]` `egress_fold_op_mediated_run_c3_wire`, **OWNER-GATED** (honest-skips 2/2 until the owner
-provides live op + token). `/debrief` = PASS. Auditor's one flagged nit (trait pollution) was FIXED this session.
+run → WSL `#[cfg(unix)]` `egress_fold_op_mediated_run_c3_wire` → **PROVEN LIVE 2026-07-21 (2/2 pass, no SKIP)**.
+`/debrief` = PASS. Auditor's one flagged nit (trait pollution) was FIXED this session.
 
-## THE OWNER-GATED PROOF (the one open thread on C3)
-Criterion 5 — a LIVE `op`-injected mediated run — is the only C3 arm not yet proven, and it needs the OWNER to
-provision on the WSL box: **(a)** the `op` CLI installed on PATH, **(b)** a vault-scoped `OP_SERVICE_ACCOUNT_TOKEN`
-in the daemon env, **(c)** `REZIDNT_TEST_OP_REF` pointing at a real vault item (e.g. `op://rezidnt/GitHub/token`).
-Then it's a one-command proof:
-`cargo build -p rezidnt-run --example op_fake` (already built) then
-`cargo test -p rezidentd --test egress_fold_op_mediated_run_c3_wire -- --test-threads=1` (currently honest-SKIPs
-without a/b/c, exactly like the pasta/bwrap gates). Until provisioned, it skips — NOT a failure. **NB the "1Password
-for Claude" connector (Desktop/Chrome, human-in-the-loop) is the WRONG tool here — the daemon needs the `op` CLI +
-a service account; see [[secret-source-1password-direction]].**
+## THE LIVE-OP PROOF — DONE (2026-07-21)
+Criterion 5 is PROVEN LIVE. The owner installed `op` v2.35.0 on the WSL box, created a vault-scoped 1Password
+**service account** (User Type SERVICE_ACCOUNT), granted it a vault `rezident-test` (NOTE the spelling: `rezident`,
+not `rezidnt`) holding an API-Credential item `github-token` with a `credential` field, and ran the suite with
+`OP_SERVICE_ACCOUNT_TOKEN` + `REZIDNT_TEST_OP_REF='op://rezident-test/github-token/credential'` set —
+**both tests passed, no SKIP**: the run reached the Mediated arm, the op-resolved token was injected upstream, and
+NO log fact carried the value (only the `op://` ref). The honest-degrade path was ALSO seen live: a bad-token run
+emitted `credential.dropped` (not a fake injection), exactly the fail-closed behavior. Re-run any time with the
+service-account token exported + the ref above; without them it honest-SKIPs (the pasta/bwrap gate pattern). **NB
+the "1Password for Claude" connector (Desktop/Chrome, human-in-the-loop) is the WRONG tool — the daemon needs the
+`op` CLI + a service account; see [[secret-source-1password-direction]].** Setup gotchas that bit us: (i) service
+accounts need a 1Password Business/Teams plan; (ii) the token is shown once at creation; (iii) the `op://…/<field>`
+name is item-type-specific (API Credential → `credential`); (iv) don't paste the placeholder `ops_...` — it's
+non-empty so the gate RUNS and then DROPS on the bad token (looks like a crit-5 failure but is really a bad token).
 
 ## What changed this session (git log since c3-wire handoff `2e43ef3`)
 - `7737b8e`/`f2c7fc9`/`a9e443d` **c3-egress-fold** (DR-029): `[egress]` block + `SecretSource` seam + host-file MVP;
@@ -79,10 +84,11 @@ doc headers (a wrapped line starting with `+`/`-`). **Sweep stray `*.rlib` from 
 [[secret-source-1password-direction]] records the connector-vs-op-CLI distinction.
 
 ---
-**NEXT ACTION → C3 core is COMPLETE (sandbox + inescapable egress + credential brokering via host-file AND 1Password
-`op`, Linux/WSL). The one open thread is the OWNER-GATED live-op proof (crit 5): once the owner puts `op` +
-`OP_SERVICE_ACCOUNT_TOKEN` (vault-scoped) + `REZIDNT_TEST_OP_REF` on the WSL box, run
-`cargo test -p rezidentd --test egress_fold_op_mediated_run_c3_wire -- --test-threads=1` (honest-skips until then).
-Otherwise the roadmap MAY STOP after C3 (DR-025 precedent) — next slice is the owner's steer: macOS/Windows backends,
-S5 fleet board, or the benchmark harness. `current-slice` = c3-op-secrets (done). High autonomy ON. For WSL-only
-evidence re-run it yourself; build dev-only example bins first; lint `#[cfg(unix)]` bodies on WSL.**
+**NEXT ACTION → C3 is COMPLETE AND FULLY PROVEN (sandbox + inescapable egress + credential brokering via host-file
+AND live 1Password `op`, Linux/WSL — crit 5 proven live 2026-07-21, nothing gated remains). The roadmap MAY STOP
+after C3 (DR-025 precedent). Next slice is the OWNER'S STEER — no forced next: (1) macOS/Windows sandbox+egress
+backends (each own DR; Windows ↔ deferred Platform phase); (2) S5 ratatui read-only fleet board (the I1 proof, can
+precede Phase 3); (3) the benchmark harness (DR-022); or (4) the carried non-blocking nits below (trybuild no-widening
+fixture, stale sandbox.rs doc-strings, op_fake_bin existence-assert). `current-slice` = c3-op-secrets (done). High
+autonomy ON. For WSL-only evidence re-run it yourself; build dev-only example bins first; lint `#[cfg(unix)]` bodies
+on WSL.**

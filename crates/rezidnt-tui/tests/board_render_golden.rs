@@ -28,18 +28,22 @@
 //! so colors do not survive the snapshot. Every assertion here is
 //! text/structure-only so the suite stays deterministic.
 //!
-//! RED MODE (assert-red, DR-031 richer-render amendment):
-//! 1. The committed goldens (`s5_board_render.golden.txt`,
-//!    `s5b_board_permit_render.golden.txt`) have been reset to a single sentinel
-//!    line that NO real render can ever equal, so the snapshot tests FAIL until
-//!    the implementer ships the bordered-table `draw` and re-blesses.
-//! 2. The structural tests below (`*_is_bordered_and_tabular`) assert
-//!    box-drawing characters (panels exist) and per-section table header
-//!    strings that the CURRENT flat `place()` render does NOT emit — so they
-//!    FAIL against today's `draw`, independent of the golden.
+//! STATUS (GREEN): the richer bordered-table `draw` shipped (DR-031 §Decision 3),
+//! so both goldens hold REAL blessed renders and every test here passes. The
+//! suite guards the shipped render on two independent axes so it is not a bare
+//! byte-snapshot:
+//! 1. Byte snapshots — the committed goldens (`s5_board_render.golden.txt`,
+//!    `s5b_board_permit_render.golden.txt`) pin the exact TestBackend text dump;
+//!    regenerate them ONLY via the bless mechanism below, never by hand.
+//! 2. Layout-independent structural proofs that hold regardless of exact byte
+//!    layout: `*_is_bordered_and_tabular` asserts box-drawing chrome + per-section
+//!    table headers; `permit_panel_*` asserts the permit panel appears iff a run
+//!    has permit activity; `every_projected_subject_is_visible_not_clipped`
+//!    asserts no projected subject clips off-screen.
 //!
-//! This is the S4/DR-006 scaffold discipline: the API is real, the assertions
-//! pin behavior that does not exist yet, the tests fail honestly.
+//! When a future change legitimately alters the render, the byte snapshots go
+//! RED first (S4/DR-006 scaffold discipline) and are re-blessed deliberately —
+//! never hand-fabricated to paper over a broken render (test honesty).
 //!
 //! WIDTH/HEIGHT: widened from 80x24 to 100x40. Bordered `Table` widgets consume
 //! two columns (left/right border) and two rows (top border + header, bottom
@@ -49,12 +53,11 @@
 //! panels with their header rows without truncating the run-id prefix or the
 //! numeric columns. Documented per the task's size-justification requirement.
 //!
-//! GOLDEN BLESS MECHANISM (unchanged from the prior oracle): with
-//! `REZIDNT_BLESS_GOLDEN=1` set, each snapshot test WRITES its golden from the
-//! real `draw` output and panics (telling you to unset it); otherwise it reads
-//! the committed golden and asserts equality. The golden is regenerated the
-//! project way — ONCE, by the implementer, after the bordered-table `draw`
-//! exists — never hand-fabricated to paper over a broken render (test honesty).
+//! GOLDEN BLESS MECHANISM: with `REZIDNT_BLESS_GOLDEN=1` set, each snapshot test
+//! WRITES its golden from the real `draw` output and panics (telling you to unset
+//! it); otherwise it reads the committed golden and asserts equality. The golden
+//! is regenerated the project way — deliberately, only when the render
+//! intentionally changes — never hand-fabricated to paper over a broken render.
 
 use std::path::PathBuf;
 

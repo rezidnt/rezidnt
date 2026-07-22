@@ -112,6 +112,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SpecCmd,
     },
+    /// Read-only environment preflight (DR-036 sub-slice `onboarding-doctor`).
+    /// Checks the §11 golden-path substrate assumptions — `git` resolvable on
+    /// PATH, the chosen agent harness resolvable on PATH, the daemon
+    /// socket/lockfile path writable, WSL2 reachable — and prints per-check
+    /// findings. A pure LOCAL, read-only preflight: it dials NO daemon, opens NO
+    /// socket, makes NO network call, emits NO fabric fact, and sends NO
+    /// telemetry (I3/I7). Each finding carries a status from the closed set
+    /// {pass, inconclusive, fail}; an unprobeable/unsatisfiable check is NEVER
+    /// coerced to pass (I6). DR-004 exits: 0 all-pass, 3 any non-pass (fail OR
+    /// inconclusive — a substrate fault, the class `rebuild` uses; `doctor` is
+    /// NOT a gate, so never 5).
+    Doctor {
+        /// Emit the machine-readable findings object on stdout
+        /// (`{ "checks": [ { "name", "status" }, … ] }`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Operator-only actions (DR-031/DR-032): explicit operator authorization
     /// over the loopback-HTTP MCP surface, carrying the operator badge from the
     /// 0600 lockfile.
@@ -261,6 +278,13 @@ fn main() {
                     force,
                 },
         } => (1, spec_init(dir.as_deref(), defaults, force)),
+        // `doctor` is a read-only preflight (DR-036): it dials no daemon, opens
+        // no socket, emits no fact (I3/I7). It OWNS its DR-004 exit codes and
+        // exits internally (0 all-pass, 3 any non-pass — the substrate-fault
+        // class `rebuild` uses; NEVER 5, doctor is not a gate) — like the
+        // gate/operator verbs — so a placeholder class here. An unexpected
+        // internal fault (e.g. stdout write) folds into 1 via the table.
+        Cmd::Doctor { json } => (1, doctor(json)),
         Cmd::Operator {
             cmd: OperatorCmd::KillRun { run },
         } => {
@@ -475,6 +499,295 @@ fn render_spec_toml(f: &SpecFields) -> String {
         harness = q(&f.harness),
         worktree = q(&f.worktree),
     )
+}
+
+// ===========================================================================
+// `rezidnt doctor` (DR-036 sub-slice `onboarding-doctor`) — a read-only §11
+// environment preflight. NO daemon dial, NO socket, NO network, NO fabric fact,
+// NO telemetry (I3/I7). Each check yields a status from the CLOSED set below; an
+// unprobeable/unsatisfiable check is NEVER coerced to pass (I6).
+// ===========================================================================
+
+/// A single preflight finding. `status` is drawn from the closed honesty set
+/// {pass, inconclusive, fail} — there is no fourth value, and an unknown check
+/// is `inconclusive`, never a coerced `pass` (I6).
+#[derive(Clone, Copy)]
+enum CheckStatus {
+    Pass,
+    Inconclusive,
+    Fail,
+}
+
+impl CheckStatus {
+    /// The pinned wire string (matched by the oracle). Lowercase, closed set.
+    fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Pass => "pass",
+            CheckStatus::Inconclusive => "inconclusive",
+            CheckStatus::Fail => "fail",
+        }
+    }
+}
+
+/// A named preflight finding: `name` (the check label the oracle matches by
+/// case-insensitive substring), `status`, and a human `detail` line (the
+/// human-mode message; not part of the pinned JSON status contract).
+struct Check {
+    name: &'static str,
+    status: CheckStatus,
+    detail: String,
+}
+
+/// `rezidnt doctor [--json]` — run the §11 golden-path preflight, print findings
+/// (JSON object `{ "checks": [ { "name", "status" }, … ] }` under `--json`, one
+/// human line per check otherwise), and exit per DR-004: 0 when every check
+/// passes, 3 when any check is non-pass (fail OR inconclusive — the substrate
+/// fault class `rebuild` uses; `doctor` is not a gate, so never 5). A non-pass is
+/// never coerced toward 0/pass (I6). This owns its exit codes and exits
+/// internally. Read-only and daemon-free: it probes PATH and the filesystem only.
+fn doctor(as_json: bool) -> anyhow::Result<()> {
+    let checks = vec![
+        check_git(),
+        check_harness(),
+        check_socket_writable(),
+        check_wsl(),
+    ];
+
+    // DR-004 exit class: clean preflight (every check pass) → 0; any non-pass
+    // (fail OR inconclusive) → 3. An inconclusive is never coerced toward 0/pass
+    // (I6); `doctor` is not a gate, so 5 is never emitted.
+    let all_pass = checks.iter().all(|c| matches!(c.status, CheckStatus::Pass));
+    let code = if all_pass { 0 } else { 3 };
+
+    if as_json {
+        let out = serde_json::json!({
+            "checks": checks
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{out}");
+    } else {
+        for c in &checks {
+            println!("[{}] {}: {}", c.status.as_str(), c.name, c.detail);
+        }
+    }
+
+    std::process::exit(code);
+}
+
+/// `git` present/resolvable on PATH (§11 line 252 — git worktrees are the repo
+/// substrate). A pure PATH-directory scan (no subprocess, side-effect-free):
+/// resolvable → pass; not on PATH → fail (a required substrate is absent). This
+/// discriminates deterministically off the injected `PATH` seam.
+fn check_git() -> Check {
+    match resolve_on_path("git") {
+        Some(dir) => Check {
+            name: "git",
+            status: CheckStatus::Pass,
+            detail: format!("git resolvable on PATH ({})", dir.display()),
+        },
+        None => Check {
+            name: "git",
+            status: CheckStatus::Fail,
+            detail: "git is not resolvable on PATH (the golden path allocates git \
+                     worktrees, §11)"
+                .to_string(),
+        },
+    }
+}
+
+/// The chosen agent harness resolvable on PATH (§11 — agents run under capture).
+/// The generated spec's default harness is `claude-code` (DEFAULT_HARNESS); this
+/// probes for it on PATH. Resolvable → pass; absent → inconclusive (the operator
+/// may run a differently-named harness, so a missing default bin is UNKNOWN, not
+/// a hard fault — but never coerced to pass, I6).
+fn check_harness() -> Check {
+    match resolve_on_path(DEFAULT_HARNESS) {
+        Some(dir) => Check {
+            name: "harness",
+            status: CheckStatus::Pass,
+            detail: format!(
+                "agent harness `{DEFAULT_HARNESS}` resolvable on PATH ({})",
+                dir.display()
+            ),
+        },
+        None => Check {
+            name: "harness",
+            status: CheckStatus::Inconclusive,
+            detail: format!(
+                "agent harness `{DEFAULT_HARNESS}` not resolvable on PATH — set up the \
+                 chosen harness before a governed run (unknown, not a hard fault)"
+            ),
+        },
+    }
+}
+
+/// The daemon socket/lockfile transport PATH is writable (§11 line 240): can the
+/// daemon create its socket/lockfile there? Reads the EXISTING `REZIDNT_SOCKET` /
+/// `REZIDNT_LOCKFILE` env vars (the same seams `lockfile_path()` honors) and
+/// probes the PARENT directory's writability with a temp-file create+remove — a
+/// filesystem probe ONLY, it NEVER binds or connects the socket (I3/criterion 3),
+/// and NEVER probes a hardcoded XDG path (the env seams must force both legs).
+/// Writable parent → pass; missing/read-only parent → fail (I6: an unwritable
+/// path is never coerced to pass).
+fn check_socket_writable() -> Check {
+    // Prefer REZIDNT_SOCKET; fall back to REZIDNT_LOCKFILE (the daemon needs BOTH
+    // paths' parents writable, and the tests point both into the same dir). The
+    // parent of either is the transport directory whose writability we probe.
+    let target = std::env::var_os("REZIDNT_SOCKET")
+        .or_else(|| std::env::var_os("REZIDNT_LOCKFILE"))
+        .map(PathBuf::from);
+
+    let Some(target) = target else {
+        // Neither seam set and no daemon to ask: the transport path is UNKNOWN,
+        // not writable — inconclusive, never coerced to pass (I6).
+        return Check {
+            name: "socket-writable",
+            status: CheckStatus::Inconclusive,
+            detail: "neither REZIDNT_SOCKET nor REZIDNT_LOCKFILE is set — the daemon \
+                     socket/lockfile path is unknown (cannot probe writability)"
+                .to_string(),
+        };
+    };
+
+    let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Check {
+            name: "socket-writable",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "socket/lockfile path {} has no parent directory to write into",
+                target.display()
+            ),
+        };
+    };
+
+    match probe_dir_writable(parent) {
+        true => Check {
+            name: "socket-writable",
+            status: CheckStatus::Pass,
+            detail: format!(
+                "daemon socket/lockfile parent {} is writable",
+                parent.display()
+            ),
+        },
+        false => Check {
+            name: "socket-writable",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "daemon socket/lockfile parent {} is not writable (the daemon could not \
+                 create its transport there)",
+                parent.display()
+            ),
+        },
+    }
+}
+
+/// WSL2 reachable (§11 line 252 — the daemon+substrates run in WSL2). This is the
+/// inherently environment-dependent, honest inconclusive-capable check: on Linux
+/// (incl. WSL) we can positively observe the kernel is Microsoft-flavored (a
+/// WSL2 kernel names itself so); off Linux the reachability of a WSL2 backend is
+/// genuinely UNPROBEABLE from here without dialing something, so it is
+/// `inconclusive` — NEVER coerced to pass (I6). Read-only, no subprocess.
+fn check_wsl() -> Check {
+    // On a WSL2 guest the kernel release string contains "microsoft" (or "WSL").
+    // Reading /proc/sys/kernel/osrelease is a pure filesystem read (no subprocess).
+    // Off Linux (host Windows/macOS) the reachability of a WSL2 backend cannot be
+    // determined without dialing it — inconclusive, never coerced to pass (I6).
+    #[cfg(target_os = "linux")]
+    let status = wsl_status_linux();
+    #[cfg(not(target_os = "linux"))]
+    let status = (
+        CheckStatus::Inconclusive,
+        "WSL2 reachability is not probeable from this host without dialing the WSL \
+         backend (read-only preflight)"
+            .to_string(),
+    );
+
+    let (status, detail) = status;
+    Check {
+        name: "wsl",
+        status,
+        detail,
+    }
+}
+
+/// The Linux leg of the WSL2 check: read the kernel release (a pure filesystem
+/// read, no subprocess) and classify. A Microsoft/WSL-flavored kernel → pass;
+/// native Linux → inconclusive (the daemon runs here, but WSL2-backend
+/// reachability is not probeable from a preflight); an unreadable release →
+/// inconclusive. Never coerced to pass (I6).
+#[cfg(target_os = "linux")]
+fn wsl_status_linux() -> (CheckStatus, String) {
+    match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(release) => {
+            let lc = release.to_lowercase();
+            if lc.contains("microsoft") || lc.contains("wsl") {
+                (
+                    CheckStatus::Pass,
+                    format!("running under a WSL2 kernel ({})", release.trim()),
+                )
+            } else {
+                (
+                    CheckStatus::Inconclusive,
+                    format!(
+                        "native Linux kernel ({}) — not a WSL2 guest; WSL2 reachability is \
+                         not probeable from here",
+                        release.trim()
+                    ),
+                )
+            }
+        }
+        Err(e) => (
+            CheckStatus::Inconclusive,
+            format!("could not read kernel release to detect WSL2: {e}"),
+        ),
+    }
+}
+
+/// Resolve the directory containing `bin` on the current `PATH`, or None. A pure
+/// filesystem walk of `PATH` (no subprocess) — mirrors the oracle's `which_dir`.
+/// On Windows also tries the `PATHEXT`-style executable suffixes so a bare name
+/// resolves. Side-effect-free and read-only.
+fn resolve_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat", ".com"]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let candidate = dir.join(format!("{bin}{ext}"));
+            if candidate.is_file() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Probe whether `dir` is a writable directory by creating and removing a
+/// uniquely-named temp file inside it. A filesystem probe ONLY — it binds/connects
+/// nothing. Returns false when the dir does not exist or the create fails
+/// (read-only / missing parent). The probe file is best-effort removed.
+fn probe_dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    // A unique probe name so concurrent doctors never collide.
+    let probe = dir.join(format!(".rezidnt-doctor-probe-{}", ulid::Ulid::new()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Read and parse the spec file locally: the success line needs

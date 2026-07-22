@@ -363,6 +363,8 @@ Public repo `rezidnt/rezidnt` from first push: Apache-2.0 at root, `MIT OR Apach
 ## 19. Open decisions register
 
 > **Amended by [DR-031](decisions/DR-031-board-read-only-operator-client-split.md).** A separate operator write client (resolve-escalation, kill-run) is the sanctioned home for board-adjacent writes — distinct from the read-only board, DR-first, demand-gated.
+>
+> **Amended by [DR-032](decisions/DR-032-operator-client-kill-run.md).** Operator client slice 1: `rezidnt operator kill-run <run>` over loopback MCP-HTTP (badged `kill_run` tool → existing reaper → `agent.signaled`). Resolve-escalation sequenced to slice 2.
 
 `rmcp` maturity (verify at S3; fallback: thin hand-rolled JSON-RPC). SQLite write amplification (revisit only past 10⁴ events/min). WASM verifiers as a third kind (post-Phase 2; exec contract already covers polyglot). Macaroon-attenuated badges (needs a real delegation use case). Komorebi IPC depth (verify at arranger implementation). First graphical client: ratatui board is S5; Tauri dashboard is demand-gated. Hash-chain externalization (periodic chain-head publication for third-party timestamping) — PROVISIONAL, compliance-driven.
 
@@ -403,8 +405,9 @@ BINDING items change only through a dated decision record. Records live one per 
 | [DR-029](decisions/DR-029-c3-egress-fold.md) | Real egress fold (c3-egress-fold): source a non-empty egress allowlist + brokered secrets from a project-spec `[egress]` block + a daemon-side `SecretSource` I4 seam (host-file MVP now, 1Password op-CLI backend fenced next) so a shipped run reaches the run-loop Mediated arm end-to-end (DR-026 crit 4 at run-loop level). C6 preserved; no invariant/posture/dep change; egress.*/credential.* subjects minted in a paired /subject | ACCEPTED | §16, §18 |
 | [DR-030](decisions/DR-030-c3-op-secrets.md) | 1Password op SecretSource backend (c3-op-secrets): a headless `OpSecretSource` behind the DR-029 seam resolving `op://vault/item/field` refs via exec'd `op read` (not linked, I7), authed by a vault-scoped service account (`OP_SERVICE_ACCOUNT_TOKEN`, env-only, never facted); `CompositeSecretSource` scheme-dispatch (op:// → op, else host-file); resolution daemon-side at fold time; op absent/token unset/read-fail ⇒ loud credential.dropped, never a fake secret. "1Password for Claude" connector explicitly OUT (wrong layer). No invariant/posture/dep/ontology change | ACCEPTED | §16, §18 |
 | [DR-031](decisions/DR-031-board-read-only-operator-client-split.md) | Board read-only / operator-client split: `rezidnt-tui` stays read-only permanently (guarded by `crate_has_no_writer_dependency`, I1); the two operator write actions — resolve an escalated permit, kill a run — live on a SEPARATE explicitly-authorized MCP write client through the existing PDP (I2/I5), not on the board. "Build out the board" = richer READ-ONLY render only. Operator client is DR-first + demand-gated (Phase 3). No test weakened; the structural guard is promoted to a permanent invariant | ACCEPTED | §16, §19 |
+| [DR-032](decisions/DR-032-operator-client-kill-run.md) | Operator client, slice 1 (kill-run): a badged MCP `kill_run { run }` tool behind the §12 operator-badge door (operator badge REQUIRED, agent macaroons NOT admitted — kill is an operator action) driving the existing reaper `stop_with_escalation` and emitting `agent.signaled` through the single writer; NO new PDP path (refines DR-031's PDP-route language for the non-decision kill action); a `rezidnt operator kill-run <run>` subcommand over loopback MCP-HTTP (not the bare socket — explicit authorization over ambient UDS identity), distinct from the read-only board (I1 proof untouched). REUSE `agent.signaled` + additive operator attribution (paired /subject). Resolve-escalation SEQUENCED to slice 2 (partitioned per DR-027, not weakened). No invariant/posture/dep change | ACCEPTED | §16, §19 |
 
-*The next record is DR-032.*
+*The next record is DR-033.*
 
 ---
 

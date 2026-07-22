@@ -17,7 +17,7 @@ The control plane for the two operator actions in view — resolving an escalate
 ## Decision
 
 1. The `rezidnt-tui` fleet board is **read-only permanently**. No writer / socket-write / emit dependency may ever be added to it; `crate_has_no_writer_dependency` is the BINDING guard and must stay green.
-2. Operator write actions — resolving an escalated permit, killing a run — live on a **separate, explicitly-authorized MCP write client** (its own crate / bin mode), architecturally distinct from the board, carrying the operator badge and routing through the existing PDP. This is the "operator-client seam." Building it is DR-first when actually undertaken.
+2. Operator write actions — resolving an escalated permit, killing a run — live on a **separate, explicitly-authorized MCP write client** (its own crate / bin mode), architecturally distinct from the board, carrying the operator badge and routing through the existing PDP. This is the "operator-client seam." Building it is DR-first when actually undertaken. *Refined by [DR-032](DR-032-operator-client-kill-run.md): the "routing through the existing PDP" clause binds the resolve-escalation action (a permit decision); kill-run is a lifecycle action with no PDP path. DR-032 ships kill-run as slice 1.*
 3. "Build out the board" may only mean **richer read-only render** (I1 preserved), which amends the S5 render golden and runs the normal /oracle → implementer → /vet → /debrief loop.
 
 ## Consequences

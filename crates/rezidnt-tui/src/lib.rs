@@ -168,120 +168,183 @@ pub fn project(graph: &Graph) -> BoardView {
 /// Render a [`BoardView`] onto a ratatui frame. PURE given the view — testable
 /// with `ratatui::backend::TestBackend` golden buffers, no real terminal.
 ///
-/// S5 render semantics (pinned by `tests/board_render_golden.rs`): a fleet
-/// summary line (events folded, open/closed workspace counts), a per-run table
-/// (run id, status, cost), and a per-worktree table (path, status). The exact
-/// cells are the committed golden buffer.
+/// S5 RICHER render semantics (DR-031 §Decision 3, pinned by
+/// `tests/board_render_golden.rs`): a stack of bordered rounded panels
+/// (`Block` + `BorderType::Rounded`) — a fleet-summary panel (events folded,
+/// open/closed workspace counts, subject histogram), a runs `Table` (run id,
+/// status, cost usd, tokens, alarms), a permit `Table` rendered ONLY when at
+/// least one run has permit activity ([`run_has_permit_activity`]) so a
+/// permit-free fleet shows NO permit panel, and a worktrees `Table` (path,
+/// status, branch, last diff). Colored status cells are allowed but never
+/// asserted — the golden is a text-only `TestBackend` dump.
+///
+/// This is a PURE, NON-INTERACTIVE function of ONE `BoardView` snapshot: no
+/// selection, cursor, focus, or detail pane (interactivity is Phase 3 /
+/// demand-gated, out of scope per DR-031). Every value is carried verbatim
+/// from the projected view (I3): the render re-interprets nothing.
 pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
-    use ratatui::text::Text;
-    use ratatui::widgets::Paragraph;
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("rezidnt fleet board (read-only)".to_string());
-    lines.push(format!(
-        "events folded: {}   workspaces: {} open / {} closed",
-        view.events_folded, view.workspaces_open, view.workspaces_closed
-    ));
-    lines.push(String::new());
+    // Rounded bordered panel with a titled top edge. The title strings carry
+    // the section words the golden's structural proof asserts (`fleet`, `runs`,
+    // `permit`, `worktrees`) — ONLY the permit panel ever contains "permit".
+    let panel = |title: String| -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(title)
+    };
 
-    // Runs section: header + one row per run. Columns are placed at fixed
-    // offsets so the board reads as a table without box-drawing chrome.
-    lines.push("runs".to_string());
-    let mut header = String::new();
-    place(&mut header, 2, "run");
-    place(&mut header, 30, "status");
-    place(&mut header, 42, "cost usd");
-    place(&mut header, 53, "in/out tokens");
-    place(&mut header, 68, "alarms");
-    lines.push(header);
-    for row in &view.runs {
-        let mut line = String::new();
-        // The run ULID is 26 chars; the fixed board shows a recognizable
-        // prefix (21) so the columns stay aligned at 80 cols.
-        place(&mut line, 2, truncate(&row.run, 21));
-        place(&mut line, 25, &row.status);
-        place(
-            &mut line,
-            40,
-            &row.total_usd
-                .map(|v| format!("{v:.6}"))
-                .unwrap_or_else(|| "-".to_string()),
-        );
-        place(&mut line, 56, &tokens(row.input_tokens, row.output_tokens));
-        place(&mut line, 66, &row.integrity_alarms.to_string());
-        lines.push(line);
-    }
-
-    // Permit section (S5b): a read-only PERMIT column carrying already-folded
-    // permit decision counts, pending requests, and delegation depth per run.
-    // Rendered ONLY when at least one run has permit activity, so a permit-free
-    // fleet (e.g. the pre-permit S5 contract) renders byte-identically to
-    // before. Every value is carried verbatim from the projected RunRow (I3).
+    // The permit panel appears iff a run has permit activity, so a permit-free
+    // fleet renders no permit chrome at all (the golden's absence proof).
     let any_permit = view.runs.iter().any(run_has_permit_activity);
+
+    // Stack the panels vertically, sized for the 100x40 canvas the oracle sets.
+    // Each Table panel spends 2 rows on border + 1 on its header row; the
+    // summary panel holds a fixed 3-line body. Heights are the row count plus
+    // the border chrome; the runs/permit/worktrees panels take the remaining
+    // space split proportionally so long fleets scroll within their own panel.
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(5), // fleet summary: border(2) + 3 body lines
+        Constraint::Min(6),    // runs table
+    ];
     if any_permit {
-        lines.push(String::new());
-        lines.push("permit".to_string());
-        let mut p_header = String::new();
-        place(&mut p_header, 2, "run");
-        place(&mut p_header, 30, "granted/denied/escalated");
-        place(&mut p_header, 58, "pending");
-        place(&mut p_header, 68, "delegated");
-        lines.push(p_header);
-        for row in &view.runs {
-            if !run_has_permit_activity(row) {
-                continue;
-            }
-            let mut line = String::new();
-            place(&mut line, 2, truncate(&row.run, 21));
-            place(
-                &mut line,
-                30,
-                &format!(
-                    "{}/{}/{}",
-                    row.permit_granted, row.permit_denied, row.permit_escalated
-                ),
-            );
-            place(&mut line, 58, &row.permit_pending.to_string());
-            place(&mut line, 68, &row.delegated.to_string());
-            lines.push(line);
-        }
+        constraints.push(Constraint::Min(5)); // permit table
     }
+    constraints.push(Constraint::Min(5)); // worktrees table
+    let areas = Layout::vertical(constraints).split(frame.area());
 
-    lines.push(String::new());
-
-    // Worktrees section.
-    lines.push("worktrees".to_string());
-    let mut wt_header = String::new();
-    place(&mut wt_header, 2, "path");
-    place(&mut wt_header, 35, "status");
-    place(&mut wt_header, 45, "last diff");
-    lines.push(wt_header);
-    for wt in &view.worktrees {
-        let mut line = String::new();
-        place(&mut line, 2, &wt.path);
-        place(&mut line, 35, &wt.status);
-        place(
-            &mut line,
-            45,
-            wt.last_diff
-                .as_deref()
-                .map(|d| truncate(d, 12))
-                .unwrap_or(""),
-        );
-        lines.push(line);
+    // --- Fleet summary panel -------------------------------------------------
+    let summary_block = panel(" fleet summary ".to_string());
+    let mut subjects = view
+        .counts_by_subject
+        .iter()
+        .map(|(subject, count)| format!("{subject}={count}"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    if subjects.is_empty() {
+        subjects.push('-');
     }
+    let summary = Paragraph::new(format!(
+        "events folded: {}\nworkspaces: {} open / {} closed\nsubjects: {subjects}",
+        view.events_folded, view.workspaces_open, view.workspaces_closed
+    ))
+    .block(summary_block);
+    frame.render_widget(summary, areas[0]);
 
-    let text = Text::from(lines.join("\n"));
-    frame.render_widget(Paragraph::new(text), frame.area());
+    // --- Runs table ----------------------------------------------------------
+    let runs_widths = [
+        Constraint::Length(28), // run id
+        Constraint::Length(11), // status
+        Constraint::Length(12), // cost usd
+        Constraint::Length(16), // tokens (in/out)
+        Constraint::Length(8),  // alarms
+    ];
+    let runs_header = Row::new(["run", "status", "cost usd", "tokens", "alarms"]);
+    let runs_rows = view.runs.iter().map(|row| {
+        Row::new([
+            Cell::from(truncate(&row.run, 26).to_string()),
+            status_cell(&row.status),
+            Cell::from(
+                row.total_usd
+                    .map(|v| format!("{v:.6}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::from(tokens(row.input_tokens, row.output_tokens)),
+            Cell::from(row.integrity_alarms.to_string()),
+        ])
+    });
+    let runs_table = Table::new(runs_rows, runs_widths)
+        .header(runs_header)
+        .block(panel(format!(" runs ({}) ", view.runs.len())));
+    frame.render_widget(runs_table, areas[1]);
+
+    // --- Permit table (conditional) ------------------------------------------
+    // Rendered ONLY when at least one run has permit activity. A permit-free
+    // fleet shows no permit panel — and no other panel/label ever contains the
+    // word "permit", so the absence is a clean text proof. Values are carried
+    // verbatim from the RunRow (I3); `escalated` is surfaced on its own, never
+    // coerced into `granted` (I6).
+    let next = if any_permit {
+        let permit_widths = [
+            Constraint::Length(28), // run id
+            Constraint::Length(10), // granted
+            Constraint::Length(10), // denied
+            Constraint::Length(11), // escalated
+            Constraint::Length(9),  // pending
+            Constraint::Length(11), // delegated
+        ];
+        let permit_header = Row::new([
+            "run",
+            "granted",
+            "denied",
+            "escalated",
+            "pending",
+            "delegated",
+        ]);
+        let permit_rows = view
+            .runs
+            .iter()
+            .filter(|row| run_has_permit_activity(row))
+            .map(|row| {
+                Row::new([
+                    Cell::from(truncate(&row.run, 26).to_string()),
+                    Cell::from(row.permit_granted.to_string()),
+                    Cell::from(row.permit_denied.to_string()),
+                    Cell::from(row.permit_escalated.to_string()),
+                    Cell::from(row.permit_pending.to_string()),
+                    Cell::from(row.delegated.to_string()),
+                ])
+            });
+        let permit_table = Table::new(permit_rows, permit_widths)
+            .header(permit_header)
+            .block(panel(" permit decisions ".to_string()));
+        frame.render_widget(permit_table, areas[2]);
+        3
+    } else {
+        2
+    };
+
+    // --- Worktrees table -----------------------------------------------------
+    let wt_widths = [
+        Constraint::Length(34), // path
+        Constraint::Length(11), // status
+        Constraint::Length(18), // branch
+        Constraint::Min(14),    // last diff
+    ];
+    let wt_header = Row::new(["path", "status", "branch", "last diff"]);
+    let wt_rows = view.worktrees.iter().map(|wt| {
+        Row::new([
+            Cell::from(truncate(&wt.path, 32).to_string()),
+            status_cell(&wt.status),
+            Cell::from(wt.branch.clone().unwrap_or_else(|| "-".to_string())),
+            Cell::from(
+                wt.last_diff
+                    .as_deref()
+                    .map(|d| truncate(d, 12).to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+        ])
+    });
+    let wt_table = Table::new(wt_rows, wt_widths)
+        .header(wt_header)
+        .block(panel(format!(" worktrees ({}) ", view.worktrees.len())));
+    frame.render_widget(wt_table, areas[next]);
 }
 
-/// Write `text` into `line` starting at column `col`, left-padding with spaces
-/// (never overwriting earlier content — columns are laid out left to right).
-fn place(line: &mut String, col: usize, text: &str) {
-    if line.len() < col {
-        line.push_str(&" ".repeat(col - line.len()));
-    }
-    line.push_str(text);
+/// A status `Cell`, colored by status kind. The color is decorative only — the
+/// golden is a text dump that drops style, so correctness never depends on it.
+fn status_cell(status: &str) -> ratatui::widgets::Cell<'static> {
+    use ratatui::style::{Color, Style};
+    let color = match status {
+        "completed" | "merged" | "verified" => Color::Green,
+        "running" | "open" => Color::Cyan,
+        "spawning" | "pending" => Color::Yellow,
+        "failed" | "closed" => Color::Red,
+        _ => Color::Gray,
+    };
+    ratatui::widgets::Cell::from(status.to_string()).style(Style::default().fg(color))
 }
 
 /// First `max` chars of `s` (byte-truncation is safe here: run ULIDs and

@@ -1,10 +1,40 @@
-rezidnt fleet board (read-only)
-events folded: 9   workspaces: 0 open / 0 closed
-
-runs
-  run                         status      cost usd   in/out tokens  alarms
-  01S4VER1F1ED000000000  completed      0.001000        1/1       0
-
-worktrees
-  path                             status    last diff
-  /tmp/rezidnt-s4/impl             merged    1d50030ca17a
+╭ fleet summary ───────────────────────────────────────────────────────────────────────────────────╮
+│events folded: 9                                                                                  │
+│workspaces: 0 open / 0 closed                                                                     │
+│subjects: agent.completed=1  agent.spawned=1  diff.merged=1  diff.ready=1  gate.entered=2  gate.pa│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ runs (1) ────────────────────────────────────────────────────────────────────────────────────────╮
+│run                          status      cost usd     tokens           alarms                     │
+│01S4VER1F1ED00000000000R01   completed   0.001000     1/1              0                          │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ worktrees (1) ───────────────────────────────────────────────────────────────────────────────────╮
+│path                               status      branch             last diff                       │
+│/tmp/rezidnt-s4/impl               merged      rezidnt/impl       1d50030ca17a                    │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

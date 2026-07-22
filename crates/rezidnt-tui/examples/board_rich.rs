@@ -111,7 +111,7 @@ impl App {
         let idx = (self.roll() as usize) % self.view.runs.len();
         let bump_in = self.roll() % 900;
         let bump_out = self.roll() % 400;
-        let alarm = self.roll() % 23 == 0;
+        let alarm = self.roll().is_multiple_of(23);
         let run = &mut self.view.runs[idx];
         if run.status == "running" || run.status == "spawning" {
             run.input_tokens = Some(run.input_tokens.unwrap_or(0) + bump_in);

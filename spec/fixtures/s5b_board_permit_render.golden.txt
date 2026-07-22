@@ -1,13 +1,40 @@
-rezidnt fleet board (read-only)
-events folded: 11   workspaces: 0 open / 0 closed
-
-runs
-  run                         status      cost usd   in/out tokens  alarms
-  01S5BB0ARDPERMFXTRE00  spawning       -               -/-       0
-
-permit
-  run                         granted/denied/escalated    pending   delegated
-  01S5BB0ARDPERMFXTRE00       1/1/1                       1         2
-
-worktrees
-  path                             status    last diff
+╭ fleet summary ───────────────────────────────────────────────────────────────────────────────────╮
+│events folded: 11                                                                                 │
+│workspaces: 0 open / 0 closed                                                                     │
+│subjects: action.metered=1  agent.spawned=1  permit.delegated=2  permit.denied=1  permit.escalated│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ runs (1) ────────────────────────────────────────────────────────────────────────────────────────╮
+│run                          status      cost usd     tokens           alarms                     │
+│01S5BB0ARDPERMFXTRE000RN01   spawning    -            -/-              0                          │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ permit decisions ────────────────────────────────────────────────────────────────────────────────╮
+│run                          granted    denied     escalated   pending   delegated                │
+│01S5BB0ARDPERMFXTRE000RN01   1          1          1           1         2                        │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ worktrees (0) ───────────────────────────────────────────────────────────────────────────────────╮
+│path                               status      branch             last diff                       │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

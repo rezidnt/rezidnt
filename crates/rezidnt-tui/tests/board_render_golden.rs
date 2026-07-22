@@ -1,36 +1,82 @@
-//! S5 oracle — golden render. Fold a fixture event log -> project -> `draw`
-//! onto a fixed-size `ratatui::backend::TestBackend` -> assert the terminal
-//! buffer matches the committed golden snapshot. Deterministic: no real
-//! terminal, no clock, no color-dependent assertions (text cells only).
+//! S5 oracle — golden render (RICHER read-only board, DR-031 §Decision 3).
+//! Fold a fixture event log -> project -> `draw` onto a fixed-size
+//! `ratatui::backend::TestBackend` -> assert the terminal buffer matches the
+//! committed golden snapshot AND satisfies layout-independent structural
+//! proofs. Deterministic: no real terminal, no clock, no color-dependent
+//! assertions (text cells only).
 //!
-//! Criterion: the read-only fleet board renders the derived fleet state. The
-//! render path takes a `BoardView` (never an `Event`) — this suite proves the
-//! rendered surface is a pure function of that view.
+//! Criterion: the read-only fleet board renders the derived fleet state as a
+//! RICHER surface — bordered rounded panels (ratatui `Block` +
+//! `BorderType::Rounded`) for the fleet summary and for each of the
+//! runs / permit / worktrees sections, with the runs and worktrees sections
+//! rendered as ratatui `Table` widgets carrying a header row. This replaces the
+//! prior flat `place()`-column text render. The render path still takes a
+//! `BoardView` (never an `Event`) and stays a PURE, NON-INTERACTIVE function of
+//! that single snapshot — no selection, no cursor, no focus/Tab, no
+//! selected-row detail pane. Interactivity is Phase 3 / demand-gated (DR-031,
+//! roadmap §16/§19) and OUT of scope.
 //!
-//! RED MODE: assert-red. `draw` exists (oracle scaffold) but paints NOTHING,
-//! so the TestBackend buffer stays blank and diverges from the committed
-//! golden below. Mirrors the S4/DR-006 scaffold discipline: the API is real,
-//! the body is a stub, the test fails on assertion.
+//! Same DATA as before (no field dropped or added): fleet summary
+//! (events_folded, workspaces open/closed, counts_by_subject), the runs table
+//! (run id, status, cost usd, in/out tokens, integrity alarms), the permit
+//! section (granted/denied/escalated, pending, delegated) that appears ONLY
+//! when at least one run has permit activity, and the worktrees table (path,
+//! status, branch?, last_diff?).
 //!
-//! Golden fixture reused: `spec/fixtures/s4_verified_run.jsonl` (a verified run
-//! + a merged worktree — the fleet has something to show).
+//! Colored status cells are ALLOWED in the real `draw` but are NEVER asserted:
+//! the golden is a TestBackend TEXT dump (`buffer_to_text` below drops style),
+//! so colors do not survive the snapshot. Every assertion here is
+//! text/structure-only so the suite stays deterministic.
 //!
-//! The golden is committed as `spec/fixtures/s5_board_render.golden.txt`
-//! (named for the behavior it pins, per the fixture-hygiene rule). It is the
-//! expected TEXT content of the TestBackend buffer, row by row. Regenerate
-//! deliberately with `REZIDNT_BLESS_GOLDEN=1` once the implementer's `draw` is
-//! real — never to make a broken render pass (test honesty).
+//! RED MODE (assert-red, DR-031 richer-render amendment):
+//! 1. The committed goldens (`s5_board_render.golden.txt`,
+//!    `s5b_board_permit_render.golden.txt`) have been reset to a single sentinel
+//!    line that NO real render can ever equal, so the snapshot tests FAIL until
+//!    the implementer ships the bordered-table `draw` and re-blesses.
+//! 2. The structural tests below (`*_is_bordered_and_tabular`) assert
+//!    box-drawing characters (panels exist) and per-section table header
+//!    strings that the CURRENT flat `place()` render does NOT emit — so they
+//!    FAIL against today's `draw`, independent of the golden.
+//!
+//! This is the S4/DR-006 scaffold discipline: the API is real, the assertions
+//! pin behavior that does not exist yet, the tests fail honestly.
+//!
+//! WIDTH/HEIGHT: widened from 80x24 to 100x40. Bordered `Table` widgets consume
+//! two columns (left/right border) and two rows (top border + header, bottom
+//! border) per panel, and four panels stack vertically (summary, runs, permit,
+//! worktrees). 80x24 is too tight for the run-id + cost + tokens columns once
+//! the border chrome and header row are added; 100x40 fits the four bordered
+//! panels with their header rows without truncating the run-id prefix or the
+//! numeric columns. Documented per the task's size-justification requirement.
+//!
+//! GOLDEN BLESS MECHANISM (unchanged from the prior oracle): with
+//! `REZIDNT_BLESS_GOLDEN=1` set, each snapshot test WRITES its golden from the
+//! real `draw` output and panics (telling you to unset it); otherwise it reads
+//! the committed golden and asserts equality. The golden is regenerated the
+//! project way — ONCE, by the implementer, after the bordered-table `draw`
+//! exists — never hand-fabricated to paper over a broken render (test honesty).
 
 use std::path::PathBuf;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rezidnt_state::{Graph, fold};
-use rezidnt_tui::{draw, project};
+use rezidnt_tui::{BoardView, draw, project};
 use rezidnt_types::Event;
 
-const WIDTH: u16 = 80;
-const HEIGHT: u16 = 24;
+/// Widened for the bordered-table layout — see module header for the
+/// justification. The richer panels do not fit the prior 80x24.
+const WIDTH: u16 = 100;
+const HEIGHT: u16 = 40;
+
+/// Box-drawing characters that a `Block` border (rounded or square) paints into
+/// the buffer. Presence of ANY of these proves at least one bordered panel
+/// exists — the flat `place()` render paints none.
+const BOX_DRAWING: &[char] = &[
+    '─', '│', '╭', '╮', '╰', '╯', // rounded corners + edges
+    '┌', '┐', '└', '┘', // square corners (Block default, still a border)
+    '├', '┤', '┬', '┴', '┼', // junctions (table column separators, if used)
+];
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/fixtures")
@@ -46,8 +92,23 @@ fn graph_from_fixture(name: &str) -> Graph {
     fold(events.iter())
 }
 
+/// Fold a fixture, project it, and render onto a fresh TestBackend of the
+/// richer size. Returns the terminal so callers can pull either the styled
+/// buffer or the plain-text dump.
+fn render_fixture(name: &str) -> (BoardView, Terminal<TestBackend>) {
+    let graph = graph_from_fixture(name);
+    let view = project(&graph);
+    let backend = TestBackend::new(WIDTH, HEIGHT);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal
+        .draw(|frame| draw(frame, &view))
+        .expect("draw onto the test backend");
+    (view, terminal)
+}
+
 /// Flatten a TestBackend buffer to newline-joined, right-trimmed rows of plain
-/// text — style-independent so the golden pins CONTENT, not colors.
+/// text — style-independent so the golden pins CONTENT, not colors. (Colored
+/// status cells, if the implementer adds them, are dropped here on purpose.)
 fn buffer_to_text(terminal: &Terminal<TestBackend>) -> String {
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
@@ -62,38 +123,41 @@ fn buffer_to_text(terminal: &Terminal<TestBackend>) -> String {
     lines.join("\n").trim_end().to_string() + "\n"
 }
 
-/// Render the s4 verified-run fixture and compare to the committed golden. On
-/// `REZIDNT_BLESS_GOLDEN=1` the golden is (re)written instead of asserted —
-/// used ONCE when the real `draw` lands, never to paper over a regression.
-#[test]
-fn board_render_matches_golden_snapshot() {
-    let graph = graph_from_fixture("s4_verified_run.jsonl");
-    let view = project(&graph);
-
-    let backend = TestBackend::new(WIDTH, HEIGHT);
-    let mut terminal = Terminal::new(backend).expect("test backend");
-    terminal
-        .draw(|frame| draw(frame, &view))
-        .expect("draw onto the test backend");
-
-    let got = buffer_to_text(&terminal);
-    let golden_path = fixtures_dir().join("s5_board_render.golden.txt");
-
+/// Assert-and-write helper for a golden snapshot: on `REZIDNT_BLESS_GOLDEN=1`
+/// writes `got` to the golden and panics; otherwise reads the committed golden
+/// and asserts equality. Centralizes the bless discipline for both snapshots.
+fn assert_or_bless_golden(got: &str, golden_name: &str) {
+    let golden_path = fixtures_dir().join(golden_name);
     if std::env::var_os("REZIDNT_BLESS_GOLDEN").is_some() {
-        std::fs::write(&golden_path, &got).expect("write golden");
+        std::fs::write(&golden_path, got).expect("write golden");
         panic!(
             "REZIDNT_BLESS_GOLDEN set: wrote golden to {} — unset it to assert",
             golden_path.display()
         );
     }
-
     let expected = std::fs::read_to_string(&golden_path)
         .unwrap_or_else(|e| panic!("golden {} must exist: {e}", golden_path.display()));
-
     assert_eq!(
         got, expected,
-        "rendered board buffer diverged from the committed golden (bless deliberately with REZIDNT_BLESS_GOLDEN=1 once draw is real)"
+        "rendered board buffer diverged from the committed golden `{golden_name}` \
+         (bless deliberately with REZIDNT_BLESS_GOLDEN=1 ONCE the bordered-table draw is real)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S5 — the verified-run fleet board (no permit activity → no permit panel).
+// Golden reused fixture: `spec/fixtures/s4_verified_run.jsonl`.
+// ---------------------------------------------------------------------------
+
+/// Byte snapshot: render the s4 verified-run fixture and compare to the
+/// committed golden. RED now — the committed golden is a sentinel placeholder
+/// the flat render can never equal; GREEN once the implementer ships the
+/// bordered-table `draw` and re-blesses with REZIDNT_BLESS_GOLDEN=1.
+#[test]
+fn board_render_matches_golden_snapshot() {
+    let (_view, terminal) = render_fixture("s4_verified_run.jsonl");
+    let got = buffer_to_text(&terminal);
+    assert_or_bless_golden(&got, "s5_board_render.golden.txt");
 }
 
 /// Content spot-checks independent of exact layout: the rendered buffer must
@@ -101,17 +165,9 @@ fn board_render_matches_golden_snapshot() {
 /// if the golden is regenerated — a blank frame fails these outright.
 #[test]
 fn rendered_buffer_names_the_run_and_its_status() {
-    let graph = graph_from_fixture("s4_verified_run.jsonl");
-    let view = project(&graph);
-
-    let backend = TestBackend::new(WIDTH, HEIGHT);
-    let mut terminal = Terminal::new(backend).expect("test backend");
-    terminal
-        .draw(|frame| draw(frame, &view))
-        .expect("draw onto the test backend");
-
+    let (_view, terminal) = render_fixture("s4_verified_run.jsonl");
     let text = buffer_to_text(&terminal);
-    // The run id is 26 chars; a fixed 80-col board may truncate it, so assert a
+    // The run id is 26 chars; a fixed board may truncate it, so assert a
     // recognizable prefix rather than the whole ULID.
     assert!(
         text.contains("01S4VER1F1ED"),
@@ -127,86 +183,165 @@ fn rendered_buffer_names_the_run_and_its_status() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S5b oracle — the PERMIT column renders. `draw` must paint the per-run permit
-// info (granted/denied/escalated decision counts, pending, delegation depth) as
-// a column/cell in the runs table. Pinned against a NEW golden generated from a
-// permit-bearing fixture — the pre-permit S5 golden
-// (`s5_board_render.golden.txt`) is left UNTOUCHED (it pins the S5 contract).
-//
-// TARGET API the implementer must build: extend `draw` (the runs table) to
-// place the permit cell(s) for each RunRow — the exact layout is whatever the
-// blessed golden captures once the column lands.
-//
-// GOLDEN BLESS MECHANISM (mirrors `board_render_matches_golden_snapshot`
-// above): with `REZIDNT_BLESS_GOLDEN=1` set, the test WRITES the golden and
-// panics (telling you to unset it); otherwise it reads the committed golden and
-// asserts equality. The golden must be GENERATED from the real `draw` output
-// ONCE the column paints — never hand-fabricated (test honesty).
-//
-// RED until then: the committed placeholder golden
-// (`s5b_board_permit_render.golden.txt`) is a single sentinel line that the real
-// render can never equal, so this test FAILS until the implementer (a) paints
-// the permit column and (b) blesses the golden with REZIDNT_BLESS_GOLDEN=1.
-
-/// Render the S5b permit-bearing fixture and compare to its OWN committed
-/// golden (never the S5 one). Criterion 3: the board renders the permit column.
+/// STRUCTURAL richer-render proof (DR-031): the board is bordered and tabular,
+/// not flat text. Fails against the current `place()` render (which paints no
+/// box-drawing chrome and no `Table` header row), passes once the implementer
+/// ships bordered `Block`s + `Table` widgets.
+///
+/// Assertions (all text/structure, color-free):
+/// - the buffer contains box-drawing characters → at least one bordered panel;
+/// - the fleet-summary, runs, and worktrees panels carry a legible title;
+/// - the runs and worktrees tables carry a header row (column labels present);
+/// - every run id in the projected `BoardView` appears in the buffer (the
+///   table did not silently drop a row).
 #[test]
-fn board_render_permit_column_matches_golden_snapshot() {
-    let graph = graph_from_fixture("s5b_board_permit.jsonl");
-    let view = project(&graph);
+fn board_render_is_bordered_and_tabular() {
+    let (view, terminal) = render_fixture("s4_verified_run.jsonl");
+    let text = buffer_to_text(&terminal);
 
-    let backend = TestBackend::new(WIDTH, HEIGHT);
-    let mut terminal = Terminal::new(backend).expect("test backend");
-    terminal
-        .draw(|frame| draw(frame, &view))
-        .expect("draw onto the test backend");
+    // Panels exist: at least one border character is painted.
+    assert!(
+        text.chars().any(|c| BOX_DRAWING.contains(&c)),
+        "richer render must paint bordered panels (box-drawing chars) — the flat \
+         place() render paints none; got:\n{text}"
+    );
 
-    let got = buffer_to_text(&terminal);
-    let golden_path = fixtures_dir().join("s5b_board_permit_render.golden.txt");
-
-    if std::env::var_os("REZIDNT_BLESS_GOLDEN").is_some() {
-        std::fs::write(&golden_path, &got).expect("write golden");
-        panic!(
-            "REZIDNT_BLESS_GOLDEN set: wrote golden to {} — unset it to assert",
-            golden_path.display()
+    // The three always-present sections are titled (Block titles). The permit
+    // panel is asserted separately (it is conditional).
+    let lower = text.to_lowercase();
+    for title in ["fleet", "runs", "worktrees"] {
+        assert!(
+            lower.contains(title),
+            "richer render must title the `{title}` panel; got:\n{text}"
         );
     }
 
-    let expected = std::fs::read_to_string(&golden_path)
-        .unwrap_or_else(|e| panic!("golden {} must exist: {e}", golden_path.display()));
+    // Table header rows: the runs and worktrees `Table` widgets carry column
+    // headers. These labels are the header-row proof (a bare Paragraph of rows
+    // with no header would omit them).
+    for header in ["status", "cost usd", "tokens", "alarms"] {
+        assert!(
+            lower.contains(header),
+            "runs table must carry a `{header}` column header; got:\n{text}"
+        );
+    }
+    for header in ["path", "branch"] {
+        assert!(
+            lower.contains(header),
+            "worktrees table must carry a `{header}` column header; got:\n{text}"
+        );
+    }
 
-    assert_eq!(
-        got, expected,
-        "rendered permit-board buffer diverged from the committed golden (bless deliberately with REZIDNT_BLESS_GOLDEN=1 ONCE the permit column paints)"
+    // Every projected run id appears in the buffer — no row dropped by the
+    // table. Run ULIDs may be truncated to a prefix, so assert a 12-char prefix.
+    assert!(
+        !view.runs.is_empty(),
+        "fixture must project at least one run"
+    );
+    for row in &view.runs {
+        let prefix = &row.run[..row.run.len().min(12)];
+        assert!(
+            text.contains(prefix),
+            "runs table dropped run `{}` (prefix `{prefix}` absent); got:\n{text}",
+            row.run
+        );
+    }
+}
+
+/// The permit panel is ABSENT for a permit-free fleet. The s4 fixture folds no
+/// permit activity, so the projection carries zero permit counts on every run —
+/// the render must show no permit panel (byte-identical omission preserved in
+/// spirit). Guards against the richer render always drawing a (possibly empty)
+/// permit panel.
+#[test]
+fn permit_panel_absent_when_no_permit_activity() {
+    let (view, terminal) = render_fixture("s4_verified_run.jsonl");
+    // Precondition: the fixture genuinely has no permit activity, so this test
+    // is exercising the absence path, not a coincidence.
+    let any_permit = view.runs.iter().any(|r| {
+        r.permit_granted != 0
+            || r.permit_denied != 0
+            || r.permit_escalated != 0
+            || r.permit_pending != 0
+            || r.delegated != 0
+    });
+    assert!(
+        !any_permit,
+        "s4 fixture must have no permit activity for this absence test to be meaningful"
+    );
+
+    let text = buffer_to_text(&terminal);
+    // No permit panel title anywhere. `fleet`/`runs`/`worktrees` may contain no
+    // substring "permit", so a plain contains-check is a sound absence proof.
+    assert!(
+        !text.to_lowercase().contains("permit"),
+        "a permit-free fleet must render NO permit panel; got:\n{text}"
     );
 }
 
-/// Layout-independent spot-check: once the permit column paints, the rendered
-/// buffer must surface this run's permit decision counts somewhere. A blank /
-/// permit-less frame fails this outright, so it stays honest even across a
-/// deliberate golden re-bless. The S5b fixture folds granted=1 / denied=1 /
-/// escalated=1 / pending=1 / delegated=2.
+// ---------------------------------------------------------------------------
+// S5b — the permit-bearing fleet board (permit panel PRESENT).
+// Fixture: `spec/fixtures/s5b_board_permit.jsonl` (granted=1 / denied=1 /
+// escalated=1 / pending=1 / delegated=2). Its OWN golden is never the S5 one.
+// ---------------------------------------------------------------------------
+
+/// Byte snapshot for the permit-bearing board. RED now (sentinel golden);
+/// GREEN once the bordered-table + bordered-permit-panel `draw` is real and the
+/// implementer re-blesses.
+#[test]
+fn board_render_permit_column_matches_golden_snapshot() {
+    let (_view, terminal) = render_fixture("s5b_board_permit.jsonl");
+    let got = buffer_to_text(&terminal);
+    assert_or_bless_golden(&got, "s5b_board_permit_render.golden.txt");
+}
+
+/// Layout-independent spot-check: once the permit panel paints, the rendered
+/// buffer must surface this run's permit decision counts. A blank / permit-less
+/// frame fails this outright, so it stays honest across a deliberate re-bless.
 #[test]
 fn rendered_buffer_shows_permit_counts() {
-    let graph = graph_from_fixture("s5b_board_permit.jsonl");
-    let view = project(&graph);
-
-    let backend = TestBackend::new(WIDTH, HEIGHT);
-    let mut terminal = Terminal::new(backend).expect("test backend");
-    terminal
-        .draw(|frame| draw(frame, &view))
-        .expect("draw onto the test backend");
-
+    let (_view, terminal) = render_fixture("s5b_board_permit.jsonl");
     let text = buffer_to_text(&terminal);
-    // The run must appear (prefix, since a 26-char ULID may be truncated).
     assert!(
         text.contains("01S5BB0ARDPERM"),
         "the board must render the permit-bearing run id (prefix); got:\n{text}"
     );
-    // A "permit" column header/label must be present so the column is legible.
     assert!(
         text.to_lowercase().contains("permit"),
-        "the board must label the permit column; got:\n{text}"
+        "the board must label the permit panel; got:\n{text}"
+    );
+}
+
+/// STRUCTURAL: the permit panel is PRESENT (bordered + titled) exactly when a
+/// run has permit activity, and the runs/worktrees tables are still bordered
+/// and tabular in the permit case. Fails against the current flat render.
+#[test]
+fn permit_panel_present_and_bordered_when_permit_activity() {
+    let (view, terminal) = render_fixture("s5b_board_permit.jsonl");
+    let text = buffer_to_text(&terminal);
+
+    // Precondition: the fixture genuinely folds permit activity.
+    let any_permit = view.runs.iter().any(|r| {
+        r.permit_granted != 0
+            || r.permit_denied != 0
+            || r.permit_escalated != 0
+            || r.permit_pending != 0
+            || r.delegated != 0
+    });
+    assert!(
+        any_permit,
+        "s5b fixture must fold permit activity for this presence test to be meaningful"
+    );
+
+    // Bordered panels exist.
+    assert!(
+        text.chars().any(|c| BOX_DRAWING.contains(&c)),
+        "richer permit-board must paint bordered panels; got:\n{text}"
+    );
+
+    // The permit panel is titled — it appears iff a run has permit activity.
+    assert!(
+        text.to_lowercase().contains("permit"),
+        "permit-bearing fleet must render a titled permit panel; got:\n{text}"
     );
 }

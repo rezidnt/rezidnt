@@ -108,6 +108,15 @@ pub struct ResolvePermitArgs {
     /// never synthesized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// DR-035 §Decision 1 — optional TTL, a millisecond DURATION relative to the
+    /// resolution's OWN envelope-ULID timestamp. When present, the PDP applies this
+    /// resolution only while an incoming request's envelope timestamp is at or
+    /// before `resolution_envelope_ms + ttl_ms`; past that the request re-escalates
+    /// (log-derived expiry, no decision-time wall-clock — I3). ABSENT = permanent
+    /// (DR-033 §Decision 2, today's behavior). Additive-optional so `schema_for!`
+    /// stays doc §9 no-drift: absent = OMITTED, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
 }
 
 /// `request_permission` — the harness PEP asks the daemon PDP "may this action

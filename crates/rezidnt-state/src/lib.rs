@@ -253,6 +253,26 @@ pub struct PermitResolution {
     /// The operator-supplied reason, folded VERBATIM (I6 interrogability). `None`
     /// when absent — never synthesized.
     pub reason: Option<String>,
+    /// DR-035 §Decision 1 — the optional TTL, a millisecond DURATION relative to
+    /// this resolution's OWN envelope-ULID timestamp ([`Self::resolved_at_ms`]).
+    /// The expiry deadline is `resolved_at_ms + ttl_ms`; a resolution applies to
+    /// an incoming request iff the request's envelope-ULID timestamp is `<=` that
+    /// deadline (inclusive), else it is skipped and the request re-escalates.
+    /// `None` = permanent (DR-033 §Decision 2 behavior, never filtered). Folded
+    /// VERBATIM from the fact; `#[serde(default)]` so a pre-DR-035 fixture (no
+    /// `ttl_ms`) parses unchanged and folds identically (additive, rebuild-stable,
+    /// I3).
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// DR-035 §Decision 1 — T0, the anchor the TTL deadline is measured from: this
+    /// resolution's OWN envelope-ULID timestamp (`event.id.timestamp_ms()`),
+    /// captured at fold time. NOT a payload field (there is no `created_at` on the
+    /// fact — DR-035 §Decision 1 derives it from the envelope ULID already on the
+    /// log, so expiry stays a pure fold with no hidden clock, I3). `#[serde(default)]`
+    /// = `0` for a pre-DR-035 fixture: harmless because such a fixture also has no
+    /// `ttl_ms`, so the deadline is never consulted (permanent).
+    #[serde(default)]
+    pub resolved_at_ms: u64,
 }
 
 /// A run's per-session permit accumulators: the running state the *contextual*
@@ -479,10 +499,61 @@ impl AgentRunState {
     /// (the request-scoped guard: a resolution for one action never grants
     /// another, DR-033 §Decision 3). The match keys on ACTION identity, NOT
     /// `request_id` (which is re-minted per ask, DR-033 §Context).
-    pub fn resolution_for(&self, action: &str, tool: &str) -> Option<&PermitResolution> {
+    ///
+    /// DR-035 §Decision 1 — the log-derived EXPIRY FILTER. `incoming_ms` is the
+    /// incoming `permit.requested`'s OWN envelope-ULID timestamp (both sides of the
+    /// comparison come from event ULIDs already on the log, so this stays a pure
+    /// fold — no `SystemTime::now()`, replay-deterministic, I3). A resolution with
+    /// `ttl_ms == Some(n)` is SKIPPED when `incoming_ms > resolved_at_ms + n`
+    /// (past its deadline → the request re-escalates); the deadline is INCLUSIVE
+    /// (`<=` applies). A resolution with `ttl_ms == None` is PERMANENT and never
+    /// filtered (DR-033 §Decision 2, unchanged). Last-matching-wins holds among the
+    /// still-VALID resolutions (an expired one is passed over, so an older
+    /// permanent resolution below it can still win — the reverse scan filters, it
+    /// does not stop). Saturating arithmetic on `resolved_at_ms + n` so a
+    /// pathological `u64` ttl cannot overflow (a saturated deadline of `u64::MAX`
+    /// simply means "always applies", the intended sense of an absurd ttl).
+    pub fn resolution_for(
+        &self,
+        action: &str,
+        tool: &str,
+        incoming_ms: u64,
+    ) -> Option<&PermitResolution> {
         self.resolutions.iter().rev().find(|r| {
             r.action == action
                 && r.target.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                && match r.ttl_ms {
+                    // Permanent (DR-033 §Decision 2) — never filtered.
+                    None => true,
+                    // Expiry deadline is INCLUSIVE (`<=`, DR-035 §Decision 1).
+                    Some(n) => incoming_ms <= r.resolved_at_ms.saturating_add(n),
+                }
+        })
+    }
+
+    /// DR-035 §Invariants I6 — the interrogability COMPANION to
+    /// [`Self::resolution_for`]: the resolution that WOULD have matched
+    /// `(action, tool)` at `incoming_ms` but was SKIPPED because its TTL had
+    /// expired (`ttl_ms == Some(n)` AND `incoming_ms > resolved_at_ms + n`). This
+    /// is what lets `gate why`/`debrief` say "not applied: resolution expired at
+    /// ULID T → re-escalated" instead of a silent vanish — an expired override is
+    /// EXPLAINABLE, never a silent coercion (mirrors how `resolved_from` makes an
+    /// APPLIED resolution interrogable). Returns the NEWEST such expired match
+    /// (reverse scan, same last-matching order as the applied path), or `None`
+    /// when no matching resolution exists OR the newest match is still live (in
+    /// which case `resolution_for` returns it — the two are complementary). A
+    /// permanent resolution (`ttl_ms == None`) is never "expired", so it is never
+    /// reported here. Same saturating-deadline discipline as the filter.
+    pub fn expired_resolution_for(
+        &self,
+        action: &str,
+        tool: &str,
+        incoming_ms: u64,
+    ) -> Option<&PermitResolution> {
+        self.resolutions.iter().rev().find(|r| {
+            r.action == action
+                && r.target.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                && matches!(r.ttl_ms, Some(n) if incoming_ms > r.resolved_at_ms.saturating_add(n))
         })
     }
 }
@@ -876,6 +947,13 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     decision: payload["decision"].as_str().unwrap_or_default().to_string(),
                     operator_badge_id: payload["operator_badge_id"].as_str().map(String::from),
                     reason: payload["reason"].as_str().map(String::from),
+                    // DR-035 §Decision 1: the optional TTL folds VERBATIM (absent =
+                    // permanent, DR-033 §Decision 2). `resolved_at_ms` is T0 — this
+                    // resolution's OWN envelope-ULID timestamp, captured from
+                    // `event.id` (NOT a payload field; DR-035 derives the anchor from
+                    // the envelope ULID already on the log so expiry is a pure fold).
+                    ttl_ms: payload["ttl_ms"].as_u64(),
+                    resolved_at_ms: event.id.timestamp_ms(),
                 };
                 graph
                     .agent_runs

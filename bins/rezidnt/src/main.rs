@@ -148,6 +148,12 @@ enum OperatorCmd {
         /// Optional operator reason: rides the emitted permit.resolved fact.
         #[arg(long)]
         reason: Option<String>,
+        /// Optional TTL (ms) time-boxing the resolution (DR-035 §Decision 1): the
+        /// PDP applies it only while an incoming ask's envelope timestamp is at or
+        /// before this resolution's own timestamp + `ttl_ms`; past that the ask
+        /// re-escalates. Absent = permanent (today's behavior).
+        #[arg(long = "ttl-ms")]
+        ttl_ms: Option<u64>,
     },
 }
 
@@ -225,6 +231,7 @@ fn main() {
                     request_id,
                     decision,
                     reason,
+                    ttl_ms,
                 },
         } => {
             // Local input phase (DR-004): a malformed/absent run ULID and a
@@ -245,7 +252,7 @@ fn main() {
             }
             (
                 1,
-                operator_resolve_permit(run, &request_id, &decision, reason.as_deref()),
+                operator_resolve_permit(run, &request_id, &decision, reason.as_deref(), ttl_ms),
             )
         }
         // The PEP emits its decision on stdout and fails closed to `ask`
@@ -1086,6 +1093,7 @@ fn operator_resolve_permit(
     request_id: &str,
     decision: &str,
     reason: Option<&str>,
+    ttl_ms: Option<u64>,
 ) -> anyhow::Result<()> {
     let path = lockfile_path();
     // No lockfile / unreadable / unparseable ⇒ daemon-unreachable (exit 4).
@@ -1116,6 +1124,11 @@ fn operator_resolve_permit(
     });
     if let (Some(reason), Some(obj)) = (reason, arguments.as_object_mut()) {
         obj.insert("reason".to_string(), serde_json::json!(reason));
+    }
+    // DR-035 §Decision 1: the optional TTL rides the trimmed shape when the
+    // operator time-boxes the resolution; absent = permanent (today's behavior).
+    if let (Some(ttl_ms), Some(obj)) = (ttl_ms, arguments.as_object_mut()) {
+        obj.insert("ttl_ms".to_string(), serde_json::json!(ttl_ms));
     }
     let request = serde_json::json!({
         "jsonrpc": "2.0",

@@ -589,6 +589,13 @@ mod unix_daemon {
         );
         let deadline = Duration::from_millis(budget_ms);
         let held_id = escalated.request_id.clone();
+        // DR-035: the HELD request's ORIGINAL `permit.requested` envelope-ULID
+        // timestamp — the anchor the TTL filter measures a landing resolution's
+        // deadline against (the request happened once, on the first pass). A
+        // resolution that lands DURING the hold is necessarily newer than this, so
+        // its deadline is always past the anchor and it always applies; TTL only
+        // bites the honored-on-a-later-next-ask path (a fresh `decide_permit`).
+        let held_requested_ms = escalated.requested_ms;
 
         let waited = tokio::time::timeout(deadline, async {
             // Subscribe FIRST, then do an immediate re-decide: a resolution that
@@ -596,7 +603,7 @@ mod unix_daemon {
             // fold (`recheck_resolution` re-folds the whole log), not missed.
             let mut sub = daemon.fabric.subscribe();
             if let Some(outcome) = pdp
-                .recheck_resolution(run, action, tool, &held_id)
+                .recheck_resolution(run, action, tool, &held_id, held_requested_ms)
                 .await
                 .context("permit live-unblock recheck")?
             {
@@ -615,7 +622,7 @@ mod unix_daemon {
                             continue;
                         }
                         if let Some(outcome) = pdp
-                            .recheck_resolution(run, action, tool, &held_id)
+                            .recheck_resolution(run, action, tool, &held_id, held_requested_ms)
                             .await
                             .context("permit live-unblock recheck")?
                         {
@@ -628,7 +635,7 @@ mod unix_daemon {
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(dropped = n, "permit-unblock subscriber lagged; re-folding");
                         if let Some(outcome) = pdp
-                            .recheck_resolution(run, action, tool, &held_id)
+                            .recheck_resolution(run, action, tool, &held_id, held_requested_ms)
                             .await
                             .context("permit live-unblock recheck")?
                         {

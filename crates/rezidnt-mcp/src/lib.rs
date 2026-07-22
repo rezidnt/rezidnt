@@ -287,6 +287,14 @@ pub struct PermitOutcome {
     /// Why, on a deny/ask (the deciding verifier's message); absent on a
     /// trivially-granted allow.
     pub reason: Option<String>,
+    /// DR-035 §Decision 1 — the incoming `permit.requested`'s envelope-ULID
+    /// timestamp (ms), the anchor the DR-034 live-unblock threads BACK into
+    /// `recheck_resolution` so a resolution's TTL is measured against the HELD
+    /// request's ORIGINAL ask time (the request happened once, on the first pass).
+    /// Captured from the `permit.requested` event this decision emitted; `0` on a
+    /// re-decide path that did not mint a fresh request (the value is only read by
+    /// the escalate→hold path, which always carries the first-pass timestamp).
+    pub requested_ms: u64,
 }
 
 /// PDP-domain errors from [`McpCore::decide_permit`] (thiserror per lib
@@ -856,6 +864,14 @@ impl McpCore {
         if let (Some(reason), Some(obj)) = (&parsed.reason, payload.as_object_mut()) {
             obj.insert("reason".to_string(), json!(reason));
         }
+        // DR-035 §Decision 1: the optional TTL rides the fact VERBATIM when the
+        // operator time-boxes the resolution; absent = permanent (DR-033 §Decision
+        // 2). The reducer folds it onto `PermitResolution.ttl_ms` and anchors the
+        // deadline at THIS fact's envelope ULID (`resolved_at_ms`), so expiry is a
+        // pure fold with no created_at on the fact (I3, DR-035 §Decision 1).
+        if let (Some(ttl_ms), Some(obj)) = (parsed.ttl_ms, payload.as_object_mut()) {
+            obj.insert("ttl_ms".to_string(), json!(ttl_ms));
+        }
         self.publish_fact("permit.resolved", payload).await?;
 
         Ok(tool_ok(json!({
@@ -974,9 +990,16 @@ impl McpCore {
         if let Some(ref cref) = context_ref {
             requested["context_ref"] = json!(cref);
         }
-        self.publish_fact("permit.requested", requested)
+        // DR-035: capture THIS request's envelope-ULID timestamp — the anchor the
+        // TTL expiry filter compares against a resolution's deadline. It is the
+        // same ULID that lands on the log, so the comparison is a pure fold of
+        // on-log timestamps (I3), and it flows onto the returned `PermitOutcome`
+        // so DR-034's live-unblock re-checks against the ORIGINAL held ask time.
+        let requested_ms = self
+            .publish_fact("permit.requested", requested)
             .await
-            .map_err(|(_, m)| PdpError::Internal(m))?;
+            .map_err(|(_, m)| PdpError::Internal(m))?
+            .timestamp_ms();
 
         // SP-wire (DR-011): dispatch the CONFIGURED `[gates.permit]` verifier
         // set — not a hardcoded single verifier — and aggregate via
@@ -1023,7 +1046,7 @@ impl McpCore {
         //     live-unblock re-decide (`recheck_resolution`) applies the SAME
         //     ledger-check without re-running the `permit.requested`/verifier path.
         if let Some(outcome) = self
-            .apply_folded_resolution(&folded, &run, &action, &tool, &request_id)
+            .apply_folded_resolution(&folded, &run, &action, &tool, &request_id, requested_ms)
             .await?
         {
             return Ok(outcome);
@@ -1194,6 +1217,11 @@ impl McpCore {
             request_id,
             decision,
             reason,
+            // DR-035: the first-pass `permit.requested` anchor. On an `ask`
+            // outcome the socket's live-unblock threads this back into
+            // `recheck_resolution` so a landing resolution's TTL is measured
+            // against the ORIGINAL held ask time, not a fresh re-decide clock.
+            requested_ms,
         })
     }
 
@@ -1220,12 +1248,22 @@ impl McpCore {
         action: &str,
         tool: &str,
         request_id: &str,
+        // DR-035: the HELD request's ORIGINAL `permit.requested` envelope-ULID
+        // timestamp (the request happened once, on the first pass). The TTL filter
+        // measures a landing resolution's deadline against THIS anchor, not a fresh
+        // wake clock. Natural interplay: a resolution that lands DURING a live hold
+        // is necessarily NEWER than the held request, so its deadline
+        // (`resolved_at_ms + ttl >= resolved_at_ms > requested_ms`) is always past
+        // the anchor and it always applies — TTL only bites the honored-on-a-
+        // LATER-next-ask case, which flows through `decide_permit` with its own
+        // fresh anchor. This falls out of the shared filter; no special-casing.
+        requested_ms: u64,
     ) -> Result<Option<PermitOutcome>, PdpError> {
         let folded = self
             .fold_run_state(run)
             .await
             .map_err(|(_, m)| PdpError::Internal(m))?;
-        self.apply_folded_resolution(&folded, run, action, tool, request_id)
+        self.apply_folded_resolution(&folded, run, action, tool, request_id, requested_ms)
             .await
     }
 
@@ -1251,15 +1289,23 @@ impl McpCore {
         action: &str,
         tool: &str,
         request_id: &str,
+        // DR-035: the incoming request's envelope-ULID timestamp — the anchor the
+        // TTL expiry filter compares against each resolution's deadline
+        // (`resolved_at_ms + ttl_ms`). An EXPIRED resolution is passed over here so
+        // `resolution_for` returns `None` and the request re-escalates (I6: the
+        // re-escalation is a recorded fact, never a silent grant).
+        incoming_ms: u64,
     ) -> Result<Option<PermitOutcome>, PdpError> {
-        let applied = folded.resolution_for(action, tool).and_then(|resolution| {
-            let (subject, decision) = match resolution.decision.as_str() {
-                "allow" => ("permit.granted", Decision::Allow),
-                "deny" => ("permit.denied", Decision::Deny),
-                _ => return None,
-            };
-            Some((subject, decision, resolution.request_id.clone()))
-        });
+        let applied = folded
+            .resolution_for(action, tool, incoming_ms)
+            .and_then(|resolution| {
+                let (subject, decision) = match resolution.decision.as_str() {
+                    "allow" => ("permit.granted", Decision::Allow),
+                    "deny" => ("permit.denied", Decision::Deny),
+                    _ => return None,
+                };
+                Some((subject, decision, resolution.request_id.clone()))
+            });
         let Some((subject, decision, resolved_from)) = applied else {
             return Ok(None);
         };
@@ -1275,7 +1321,68 @@ impl McpCore {
             request_id: request_id.to_string(),
             decision,
             reason: None,
+            // The APPLIED path (grant/deny) is terminal — it never enters the
+            // live-unblock hold, so this anchor is never re-read. Echo the caller's
+            // incoming timestamp for fidelity rather than a fresh `0`.
+            requested_ms: incoming_ms,
         }))
+    }
+
+    /// DR-035 §Invariants I6 — build the `expired_resolution` note for a
+    /// re-escalation, or `None` when no genuinely-expired resolution explains it.
+    /// Derived PURELY from the already-replayed `events` (no second replay, no
+    /// synthesis): the escalation's `request_id` finds its `permit.requested`
+    /// (the action/tool match key + the anchor timestamp — the ask's OWN envelope
+    /// ULID, DR-035 §Decision 1); the folded run's
+    /// [`rezidnt_state::AgentRunState::expired_resolution_for`] reports the newest
+    /// matching resolution that had EXPIRED by that anchor. The note names WHICH
+    /// resolution (`resolved_from`), its operator + reason (chaining WHO/WHY, as an
+    /// applied resolution does), and the deadline it lapsed at — so a reader sees
+    /// "not applied: resolution X expired at ULID T → re-escalated", never a silent
+    /// vanish (I6). Absent when the escalation is an ordinary first-time ask (no
+    /// matching resolution) or the matching resolution is permanent/live.
+    async fn expired_resolution_note(
+        &self,
+        events: &[rezidnt_types::Event],
+        run: &str,
+        escalated: &rezidnt_types::Event,
+    ) -> Option<Value> {
+        let request_id = escalated.payload()["request_id"].as_str()?;
+        // The escalation's own `permit.requested` carries the action/target AND
+        // the anchor (its envelope-ULID timestamp — the ask that expired).
+        let requested = events.iter().find(|e| {
+            e.subject.as_str() == "permit.requested"
+                && e.payload()["request_id"].as_str() == Some(request_id)
+                && e.payload()["run"] == json!(run)
+        })?;
+        let action = requested.payload()["action"].as_str()?;
+        let tool = requested.payload()["target"]["tool"].as_str()?;
+        let incoming_ms = requested.id.timestamp_ms();
+
+        // Fold the run and ask the pure state whether a matching resolution had
+        // lapsed by the ask time (the same anchor the filter uses).
+        let folded = self.fold_run_state(run).await.ok()?;
+        let expired = folded.expired_resolution_for(action, tool, incoming_ms)?;
+        let deadline_ms = expired
+            .resolved_at_ms
+            .saturating_add(expired.ttl_ms.unwrap_or(0));
+        let mut note = json!({
+            "status": "not applied: resolution expired → re-escalated",
+            "resolved_from": expired.request_id,
+            "resolved_at_ms": expired.resolved_at_ms,
+            "ttl_ms": expired.ttl_ms,
+            "deadline_ms": deadline_ms,
+            "request_ms": incoming_ms,
+        });
+        if let Some(obj) = note.as_object_mut() {
+            if let Some(badge) = &expired.operator_badge_id {
+                obj.insert("operator_badge_id".to_string(), json!(badge));
+            }
+            if let Some(reason) = &expired.reason {
+                obj.insert("reason".to_string(), json!(reason));
+            }
+        }
+        Some(note)
     }
 
     /// Fold this run's per-run state (intent allowlist + permit accumulators)
@@ -1298,8 +1405,16 @@ impl McpCore {
     }
 
     /// Append one fact through the fabric off the async threads (SQLite is
-    /// blocking; rust-conventions: no blocking in async).
-    async fn publish_fact(&self, subject: &str, payload: Value) -> Result<(), (i64, String)> {
+    /// blocking; rust-conventions: no blocking in async). Returns the minted
+    /// event's envelope ULID so a caller that needs the fact's on-log timestamp
+    /// (DR-035: the `permit.requested` anchor for the TTL expiry filter) reads it
+    /// from `id.timestamp_ms()` without a second `now()` — the same ULID that
+    /// lands on the log (I3, no divergent clock).
+    async fn publish_fact(
+        &self,
+        subject: &str,
+        payload: Value,
+    ) -> Result<ulid::Ulid, (i64, String)> {
         let event = rezidnt_types::Event::new(
             rezidnt_types::SourceId::new("rezidnt-mcp"),
             None,
@@ -1310,12 +1425,13 @@ impl McpCore {
             payload,
         )
         .map_err(|e| (-32603, format!("construct {subject}: {e}")))?;
+        let id = event.id;
         let fabric = Arc::clone(&self.fabric);
         tokio::task::spawn_blocking(move || fabric.publish(event))
             .await
             .map_err(|e| (-32603, format!("publish {subject} task panicked: {e}")))?
             .map_err(|e| (-32603, format!("append {subject}: {e}")))?;
-        Ok(())
+        Ok(id)
     }
 
     /// I6 interrogability (doc §8): the recorded verdict, the failing
@@ -1407,6 +1523,20 @@ impl McpCore {
                 // resolved_from would misreport the deciding authority).
                 if let Some(resolved_from) = payload.get("resolved_from") {
                     obj.insert("resolved_from".to_string(), resolved_from.clone());
+                }
+                // DR-035 §Invariants I6 — expiry is EXPLAINABLE, never a silent
+                // vanish. On a re-escalation (`permit.escalated`), if the log holds
+                // a resolution that WOULD have matched this action but had EXPIRED
+                // by the escalation's own envelope time, surface it: "not applied:
+                // resolution X expired at ULID T → re-escalated". Derived purely
+                // from the log (the escalation's `permit.requested` gives the
+                // action/tool + anchor; the folded run gives the expired
+                // resolution) — no synthesis, present ONLY when a genuinely-expired
+                // match exists, so an ordinary first-time escalate carries nothing.
+                if fact.subject.as_str() == "permit.escalated"
+                    && let Some(note) = self.expired_resolution_note(&events, run, fact).await
+                {
+                    obj.insert("expired_resolution".to_string(), note);
                 }
             }
             e

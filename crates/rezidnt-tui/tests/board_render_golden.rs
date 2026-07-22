@@ -248,6 +248,52 @@ fn board_render_is_bordered_and_tabular() {
     }
 }
 
+/// STRUCTURAL clip-regression proof (DR-031 §Decision 3 visibility gap): EVERY
+/// subject in the projected `BoardView.counts_by_subject` histogram must appear
+/// in the rendered text buffer. Today the fleet-summary subjects are a single
+/// non-wrapped `Paragraph` line that clips at the right border, so the tail of
+/// the histogram — e.g. `gate.passed=2` and `worktree.allocated=1` from the s4
+/// fixture — never reaches the buffer even though the projection carries them
+/// verbatim. This is the guard that keeps the coming subjects-panel fix honest
+/// and blocks any future clip regression.
+///
+/// RED now: at least one projected subject key is absent from the buffer
+/// (clipped off-screen). GREEN once the implementer renders every subject on
+/// screen (e.g. a bordered `Table` panel that lists each `counts_by_subject`
+/// entry on its own line instead of one clipping row), then re-blesses the byte
+/// goldens.
+///
+/// Layout-independent: asserts substring PRESENCE of each subject key, not exact
+/// bytes — so it survives the implementer's re-bless of the snapshot goldens.
+#[test]
+fn every_projected_subject_is_visible_not_clipped() {
+    let (view, terminal) = render_fixture("s4_verified_run.jsonl");
+    let text = buffer_to_text(&terminal);
+
+    // Precondition: the projection genuinely carries subjects, so the loop below
+    // cannot pass vacuously. `.0` is the subject string of each histogram entry.
+    assert!(
+        !view.counts_by_subject.is_empty(),
+        "s4 fixture must project a non-empty subject histogram for this \
+         clip-regression test to be meaningful"
+    );
+
+    // Every projected subject string must be present in the rendered buffer.
+    // A subject carried in `counts_by_subject` but absent from the buffer is a
+    // clip — the render dropped state the projection surfaced. Assert the whole
+    // subject string (subjects are short `noun.verb[.qualifier]`, never
+    // truncated the way a 26-char run ULID is).
+    for (subject, _count) in &view.counts_by_subject {
+        assert!(
+            text.contains(subject.as_str()),
+            "subject `{subject}` is in the projected counts_by_subject but absent \
+             from the rendered buffer — it was clipped off-screen. Render every \
+             subject on its own line (e.g. a bordered subjects Table) so no \
+             histogram entry is lost; got:\n{text}"
+        );
+    }
+}
+
 /// The permit panel is ABSENT for a permit-free fleet. The s4 fixture folds no
 /// permit activity, so the projection carries zero permit counts on every run —
 /// the render must show no permit panel (byte-identical omission preserved in

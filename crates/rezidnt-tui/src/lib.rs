@@ -171,12 +171,14 @@ pub fn project(graph: &Graph) -> BoardView {
 /// S5 RICHER render semantics (DR-031 §Decision 3, pinned by
 /// `tests/board_render_golden.rs`): a stack of bordered rounded panels
 /// (`Block` + `BorderType::Rounded`) — a fleet-summary panel (events folded,
-/// open/closed workspace counts, subject histogram), a runs `Table` (run id,
-/// status, cost usd, tokens, alarms), a permit `Table` rendered ONLY when at
-/// least one run has permit activity ([`run_has_permit_activity`]) so a
-/// permit-free fleet shows NO permit panel, and a worktrees `Table` (path,
-/// status, branch, last diff). Colored status cells are allowed but never
-/// asserted — the golden is a text-only `TestBackend` dump.
+/// open/closed workspace counts), a subjects `Table` (subject, count — one row
+/// per `counts_by_subject` entry so EVERY subject is visible, not clipped off a
+/// single summary line), a runs `Table` (run id, status, cost usd, tokens,
+/// alarms), a permit `Table` rendered ONLY when at least one run has permit
+/// activity ([`run_has_permit_activity`]) so a permit-free fleet shows NO permit
+/// panel, and a worktrees `Table` (path, status, branch, last diff). Colored
+/// status cells are allowed but never asserted — the golden is a text-only
+/// `TestBackend` dump.
 ///
 /// This is a PURE, NON-INTERACTIVE function of ONE `BoardView` snapshot: no
 /// selection, cursor, focus, or detail pane (interactivity is Phase 3 /
@@ -202,36 +204,61 @@ pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
 
     // Stack the panels vertically, sized for the 100x40 canvas the oracle sets.
     // Each Table panel spends 2 rows on border + 1 on its header row; the
-    // summary panel holds a fixed 3-line body. Heights are the row count plus
-    // the border chrome; the runs/permit/worktrees panels take the remaining
-    // space split proportionally so long fleets scroll within their own panel.
+    // summary panel holds a fixed 2-line body. The subjects panel is sized to
+    // its own row count so EVERY subject is visible (no clip — the histogram
+    // moved off the single clipping summary line into its own bordered Table).
+    // The runs/permit/worktrees panels take the remaining space split
+    // proportionally so long fleets scroll within their own panel.
+    //
+    // Subjects panel height: border(2) + header(1) + one row per subject. A
+    // permit-free fleet (s4) stacks 4 panels; a permit-bearing fleet (s5b)
+    // stacks 5. Both fixtures carry 7 subjects → the subjects panel is 10 rows;
+    // fixed chrome is 4 (summary) + 10 (subjects) = 14, leaving 26 rows on the
+    // 40-row canvas for the remaining Min-sized tables. Comfortable.
+    let subjects_body = view.counts_by_subject.len().max(1) as u16;
     let mut constraints: Vec<Constraint> = vec![
-        Constraint::Length(5), // fleet summary: border(2) + 3 body lines
-        Constraint::Min(6),    // runs table
+        Constraint::Length(4), // fleet summary: border(2) + 2 body lines
+        Constraint::Length(subjects_body + 3), // subjects: border(2) + header(1) + rows
+        Constraint::Min(4),    // runs table
     ];
     if any_permit {
-        constraints.push(Constraint::Min(5)); // permit table
+        constraints.push(Constraint::Min(4)); // permit table
     }
-    constraints.push(Constraint::Min(5)); // worktrees table
+    constraints.push(Constraint::Min(4)); // worktrees table
     let areas = Layout::vertical(constraints).split(frame.area());
 
     // --- Fleet summary panel -------------------------------------------------
+    // Carries the heartbeat + workspace split ONLY; the subject histogram now
+    // lives in its own bordered panel below so no entry clips off the right edge.
     let summary_block = panel(" fleet summary ".to_string());
-    let mut subjects = view
-        .counts_by_subject
-        .iter()
-        .map(|(subject, count)| format!("{subject}={count}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    if subjects.is_empty() {
-        subjects.push('-');
-    }
     let summary = Paragraph::new(format!(
-        "events folded: {}\nworkspaces: {} open / {} closed\nsubjects: {subjects}",
+        "events folded: {}\nworkspaces: {} open / {} closed",
         view.events_folded, view.workspaces_open, view.workspaces_closed
     ))
     .block(summary_block);
     frame.render_widget(summary, areas[0]);
+
+    // --- Subjects panel ------------------------------------------------------
+    // One row per `counts_by_subject` entry, in the projection's existing
+    // deterministic order. Rendered as a `Table` (like runs/worktrees) so every
+    // short `noun.verb[.qualifier]` subject appears in FULL — the clip-regression
+    // guard (`every_projected_subject_is_visible_not_clipped`) asserts each
+    // subject string reaches the buffer. Values carried verbatim (I3).
+    let subjects_widths = [
+        Constraint::Length(40), // subject (short noun.verb[.qualifier])
+        Constraint::Length(12), // count
+    ];
+    let subjects_header = Row::new(["subject", "count"]);
+    let subjects_rows = view.counts_by_subject.iter().map(|(subject, count)| {
+        Row::new([Cell::from(subject.clone()), Cell::from(count.to_string())])
+    });
+    let subjects_table = Table::new(subjects_rows, subjects_widths)
+        .header(subjects_header)
+        .block(panel(format!(
+            " subjects ({}) ",
+            view.counts_by_subject.len()
+        )));
+    frame.render_widget(subjects_table, areas[1]);
 
     // --- Runs table ----------------------------------------------------------
     let runs_widths = [
@@ -258,7 +285,7 @@ pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
     let runs_table = Table::new(runs_rows, runs_widths)
         .header(runs_header)
         .block(panel(format!(" runs ({}) ", view.runs.len())));
-    frame.render_widget(runs_table, areas[1]);
+    frame.render_widget(runs_table, areas[2]);
 
     // --- Permit table (conditional) ------------------------------------------
     // Rendered ONLY when at least one run has permit activity. A permit-free
@@ -300,10 +327,10 @@ pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
         let permit_table = Table::new(permit_rows, permit_widths)
             .header(permit_header)
             .block(panel(" permit decisions ".to_string()));
-        frame.render_widget(permit_table, areas[2]);
-        3
+        frame.render_widget(permit_table, areas[3]);
+        4
     } else {
-        2
+        3
     };
 
     // --- Worktrees table -----------------------------------------------------

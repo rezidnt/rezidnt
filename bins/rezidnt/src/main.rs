@@ -112,6 +112,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SpecCmd,
     },
+    /// First-run wrapper (DR-036 sub-slice `init-wrapper`): chain
+    /// `doctor -> spec init -> open` IN-PROCESS so a cold-machine operator reaches a
+    /// first gated run with ONE command, zero config edits. Runs the environment
+    /// preflight (gating on a `fail`, warning on an `inconclusive` — I6), generates
+    /// `<DIR>/rezidnt.toml` (or leaves a present one byte-unchanged unless `--force`,
+    /// the wrapper clobber nuance), then opens it. Invents NO new failure code — each
+    /// step surfaces its own DR-004 class (doctor fail → 3, open refusal → 3, open
+    /// unreachable → 4, clap usage → 2). NOT a new binary (I7).
+    Init {
+        /// Target directory; absent = the current working directory. The file
+        /// written/opened is always `<DIR>/rezidnt.toml` (the §13 filename `open` reads).
+        dir: Option<PathBuf>,
+        /// Forwarded to the spec-init step: write the minimal valid spec with NO
+        /// prompts (non-interactive).
+        #[arg(long)]
+        defaults: bool,
+        /// Forwarded to the spec-init step: regenerate an existing `rezidnt.toml`.
+        /// Without it, a present spec is left byte-unchanged and simply opened.
+        #[arg(long)]
+        force: bool,
+    },
     /// Read-only environment preflight (DR-036 sub-slice `onboarding-doctor`).
     /// Checks the §11 golden-path substrate assumptions — `git` resolvable on
     /// PATH, the chosen agent harness resolvable on PATH, the daemon
@@ -278,6 +299,17 @@ fn main() {
                     force,
                 },
         } => (1, spec_init(dir.as_deref(), defaults, force)),
+        // `init` (DR-036 sub-slice `init-wrapper`) chains doctor -> spec init ->
+        // open IN-PROCESS. Its terminal steps exit internally with their own DR-004
+        // class (doctor fail → 3; open refusal → 3, INSIDE `open`), so the only
+        // failure that folds through this table is the open step's connection
+        // failure — an `Err` mapped to 4 (daemon-unreachable), matching `Open`'s
+        // class. The wrapper invents no new code.
+        Cmd::Init {
+            dir,
+            defaults,
+            force,
+        } => (4, init(dir.as_deref(), defaults, force)),
         // `doctor` is a read-only preflight (DR-036): it dials no daemon, opens
         // no socket, emits no fact (I3/I7). It OWNS its DR-004 exit codes and
         // exits internally (0 all-pass, 3 any non-pass — the substrate-fault
@@ -382,6 +414,19 @@ fn spec_init(dir: Option<&Path>, defaults: bool, force: bool) -> anyhow::Result<
         std::process::exit(2);
     }
 
+    generate_spec(&path, defaults)?;
+    println!("wrote {}", path.display());
+    std::process::exit(0);
+}
+
+/// Generate a §13 `rezidnt.toml` and write it to `path`, overwriting whatever is
+/// there (the CALLER owns the clobber decision — bare `spec init` refuses at exit
+/// 2, the `init` wrapper skips or forces). Non-interactive default under
+/// `defaults`; otherwise plain-CLI stdin/stdout prompts (I1 — line prompts, NOT a
+/// TUI). Re-parses the bytes through the REAL `ProjectSpec` before writing, so a
+/// generator that drifts from what `open` accepts fails HERE, not at open. A pure
+/// local file writer: it dials no daemon and emits no fabric fact (I3).
+fn generate_spec(path: &Path, defaults: bool) -> anyhow::Result<()> {
     // Build the spec fields — non-interactive default, or plain-CLI prompts.
     let spec = if defaults {
         SpecFields::default()
@@ -398,10 +443,85 @@ fn spec_init(dir: Option<&Path>, defaults: bool, force: bool) -> anyhow::Result<
     rezidnt_run::spec::ProjectSpec::from_toml_str(&toml)
         .context("internal: generated spec does not parse into ProjectSpec (generator drift)")?;
 
-    std::fs::write(&path, &toml)
+    std::fs::write(path, &toml)
         .with_context(|| format!("write generated spec {}", path.display()))?;
-    println!("wrote {}", path.display());
-    std::process::exit(0);
+    Ok(())
+}
+
+/// `rezidnt init [DIR] [--defaults] [--force]` — the thin wrapper that chains
+/// `doctor -> spec init -> open` IN-PROCESS (DR-036 sub-slice `init-wrapper`), so a
+/// cold-machine operator reaches a first gated run with one command. It CALLS the
+/// internal step functions directly (no shelling out to the `rezidnt` binary, I7 —
+/// one binary), REUSING the same check-runner, generator, and open path the bare
+/// verbs use. It invents NO new failure code: every non-zero exit is a sub-step's
+/// DR-004 class, and each terminal step exits internally (mirroring `doctor` and
+/// the operator/gate verbs), so `main`'s fold-through code is never the surfaced
+/// one on the wrapper's own aborts.
+///
+/// The chain and its exit discipline:
+///   - doctor step: run the shared checks (`run_doctor_checks`). Any `Fail` →
+///     print the failing finding(s) and ABORT with doctor's class (exit 3); no spec
+///     is generated, `open` is never reached. Any `Inconclusive` (none failing) →
+///     WARN on stderr and PROCEED (I6 posture: inconclusive is surfaced, never
+///     coerced away, but it does not gate). All-pass → proceed.
+///   - spec init step: if `<DIR>/rezidnt.toml` already exists AND NOT `--force` →
+///     SKIP generation, leave the file BYTE-UNCHANGED, and PROCEED to open it (the
+///     WRAPPER nuance — NOT bare `spec init`'s exit-2 clobber refusal). `--force` →
+///     regenerate. No existing file → generate (interactive unless `--defaults`).
+///   - open step: open `<DIR>/rezidnt.toml` via the existing `open` path, surfacing
+///     its DR-004 classes UNCHANGED (daemon-side refusal → 3 internally; a
+///     connection failure bubbles as `Err`, which this step maps to 4,
+///     daemon-unreachable). On success the chain reaches a first gated run → exit 0.
+fn init(dir: Option<&Path>, defaults: bool, force: bool) -> anyhow::Result<()> {
+    let target_dir = dir.unwrap_or_else(|| Path::new("."));
+    let path = target_dir.join(SPEC_FILENAME);
+
+    // --- doctor step: gate on fail, warn on inconclusive (I6). ---
+    let checks = run_doctor_checks();
+    let failing: Vec<&Check> = checks
+        .iter()
+        .filter(|c| matches!(c.status, CheckStatus::Fail))
+        .collect();
+    if !failing.is_empty() {
+        for c in &failing {
+            eprintln!(
+                "rezidnt init: doctor check `{}` failed: {}",
+                c.name, c.detail
+            );
+        }
+        eprintln!("rezidnt init: environment preflight failed; not generating a spec or opening");
+        // Surface doctor's DR-004 class (3) unchanged — no spec written, no open.
+        std::process::exit(3);
+    }
+    for c in checks
+        .iter()
+        .filter(|c| matches!(c.status, CheckStatus::Inconclusive))
+    {
+        eprintln!(
+            "rezidnt init: warning — doctor check `{}` inconclusive: {} (proceeding)",
+            c.name, c.detail
+        );
+    }
+
+    // --- spec init step: generate, or SKIP a present spec (wrapper clobber nuance). ---
+    if path.exists() && !force {
+        // The WRAPPER skips a present spec (byte-unchanged) and proceeds to open —
+        // it does NOT reproduce bare `spec init`'s exit-2 clobber refusal.
+        println!(
+            "rezidnt init: {} already exists; leaving it unchanged and opening it (pass --force to regenerate)",
+            path.display()
+        );
+    } else {
+        generate_spec(&path, defaults)?;
+        println!("rezidnt init: wrote {}", path.display());
+    }
+
+    // --- open step: reuse the existing open path; surface its DR-004 classes. ---
+    // A daemon-side refusal exits 3 INSIDE `open`; a connection failure bubbles as
+    // `Err` here, which the caller in `main` maps to 4 (daemon-unreachable).
+    let (name, spec_toml) = read_spec(&path)
+        .with_context(|| format!("read the spec `init` is about to open ({})", path.display()))?;
+    open(&name, spec_toml)
 }
 
 /// The §13 fields the generator emits: a `[project]` (name + repo) and one
@@ -538,6 +658,20 @@ struct Check {
     detail: String,
 }
 
+/// Produce the §11 golden-path preflight findings — the shared check-runner both
+/// `doctor` (which prints + exits on them) and the `init` wrapper (which gates on
+/// them) consume, so the wrapper sees exactly the findings `doctor` would. Pure
+/// and read-only: probes PATH and the filesystem only, dials no daemon, emits no
+/// fact (I3/I7).
+fn run_doctor_checks() -> Vec<Check> {
+    vec![
+        check_git(),
+        check_harness(),
+        check_socket_writable(),
+        check_wsl(),
+    ]
+}
+
 /// `rezidnt doctor [--json]` — run the §11 golden-path preflight, print findings
 /// (JSON object `{ "checks": [ { "name", "status" }, … ] }` under `--json`, one
 /// human line per check otherwise), and exit per DR-004: 0 when every check
@@ -546,12 +680,7 @@ struct Check {
 /// never coerced toward 0/pass (I6). This owns its exit codes and exits
 /// internally. Read-only and daemon-free: it probes PATH and the filesystem only.
 fn doctor(as_json: bool) -> anyhow::Result<()> {
-    let checks = vec![
-        check_git(),
-        check_harness(),
-        check_socket_writable(),
-        check_wsl(),
-    ];
+    let checks = run_doctor_checks();
 
     // DR-004 exit class: clean preflight (every check pass) → 0; any non-pass
     // (fail OR inconclusive) → 3. An inconclusive is never coerced toward 0/pass
@@ -636,11 +765,16 @@ fn check_harness() -> Check {
 /// Writable parent → pass; missing/read-only parent → fail (I6: an unwritable
 /// path is never coerced to pass).
 fn check_socket_writable() -> Check {
-    // Prefer REZIDNT_SOCKET; fall back to REZIDNT_LOCKFILE (the daemon needs BOTH
-    // paths' parents writable, and the tests point both into the same dir). The
-    // parent of either is the transport directory whose writability we probe.
-    let target = std::env::var_os("REZIDNT_SOCKET")
-        .or_else(|| std::env::var_os("REZIDNT_LOCKFILE"))
+    // The daemon creates its lockfile at REZIDNT_LOCKFILE (the path this CLI's
+    // `lockfile_path()` actually honors) and its socket at REZIDNT_SOCKET; the
+    // transport DIRECTORY whose writability the daemon needs is the parent of the
+    // path it will create there. Prefer REZIDNT_LOCKFILE (the lockfile is the path
+    // this process is authoritative about); fall back to REZIDNT_SOCKET. In the
+    // usual case both point into the same transport dir; where they diverge (e.g. a
+    // caller passing a dead REZIDNT_SOCKET purely as an unreachable dial target) the
+    // lockfile parent is the honest writability probe.
+    let target = std::env::var_os("REZIDNT_LOCKFILE")
+        .or_else(|| std::env::var_os("REZIDNT_SOCKET"))
         .map(PathBuf::from);
 
     let Some(target) = target else {

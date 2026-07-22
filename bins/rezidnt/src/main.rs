@@ -103,6 +103,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GateCmd,
     },
+    /// Project-spec scaffolding (DR-036). Subcommands generate the §13
+    /// `rezidnt.toml` the golden path opens. A pre-MCP bootstrap surface: the
+    /// generator runs BEFORE the daemon exists (cold machine, no spec yet), so
+    /// it is a legitimate plain-CLI exception to I5, not an eroded MCP-first
+    /// default.
+    Spec {
+        #[command(subcommand)]
+        cmd: SpecCmd,
+    },
     /// Operator-only actions (DR-031/DR-032): explicit operator authorization
     /// over the loopback-HTTP MCP surface, carrying the operator badge from the
     /// 0600 lockfile.
@@ -118,6 +127,28 @@ enum Cmd {
     /// proceed, I6). Not a separate binary (I7) — a subcommand of `rezidnt`.
     #[command(name = "permit-hook")]
     PermitHook,
+}
+
+#[derive(Subcommand)]
+enum SpecCmd {
+    /// Generate a §13 `rezidnt.toml` the golden path opens UNTOUCHED (DR-036
+    /// sub-slice `spec-init`). Interactive by default (plain stdin/stdout line
+    /// prompts, NOT a TUI — I1); `--defaults` writes a minimal single-agent spec
+    /// with no prompts. A PURE local file writer: it dials no daemon and emits no
+    /// fabric fact (I3). DR-004 exits: 0 written, 2 refused clobber (an existing
+    /// `rezidnt.toml` without `--force` is a LOCAL input/usage error).
+    Init {
+        /// Target directory; absent = the current working directory. The file
+        /// written is always `<DIR>/rezidnt.toml` (the §13 filename `open` reads).
+        dir: Option<PathBuf>,
+        /// Non-interactive: write a minimal valid single-agent spec, NO prompts.
+        #[arg(long)]
+        defaults: bool,
+        /// Overwrite an existing `rezidnt.toml`. Without it, an existing file is
+        /// left byte-unchanged and the command exits 2.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -217,6 +248,19 @@ fn main() {
         Cmd::Gate {
             cmd: GateCmd::Why { run, json },
         } => (1, gate_why(&run, json)),
+        // `spec init` is a pure local file generator (DR-036): it dials no
+        // daemon and emits no fact (I3). It OWNS its DR-004 exit codes and exits
+        // internally (0 written, 2 refused clobber) — like the gate/operator
+        // verbs — so a placeholder class here. An unexpected IO fault (e.g. the
+        // target dir is unwritable) folds into 1 via the table.
+        Cmd::Spec {
+            cmd:
+                SpecCmd::Init {
+                    dir,
+                    defaults,
+                    force,
+                },
+        } => (1, spec_init(dir.as_deref(), defaults, force)),
         Cmd::Operator {
             cmd: OperatorCmd::KillRun { run },
         } => {
@@ -281,6 +325,156 @@ fn main() {
         eprintln!("rezidnt: {e:#}");
         std::process::exit(failure_code);
     }
+}
+
+/// The §13 filename the golden path / `open` reads (DR-036: written into the
+/// target dir, always this name).
+const SPEC_FILENAME: &str = "rezidnt.toml";
+
+/// The generated `[[agent]]` defaults (DR-036 Design): the S1 native harness and
+/// the sole-allocator worktree model. No `bin_override` (the test/pin seam is not
+/// part of a minimal operator spec).
+const DEFAULT_HARNESS: &str = "claude-code";
+const DEFAULT_WORKTREE: &str = "auto";
+
+/// `rezidnt spec init [DIR]` — generate a §13 `rezidnt.toml` the golden path
+/// opens UNTOUCHED (DR-036 sub-slice `spec-init`). PURE local file writer: it
+/// dials no daemon and emits no fabric fact (I3). `--defaults` writes a minimal
+/// single-agent spec with no prompts; otherwise it prompts plain-CLI stdin/stdout
+/// lines (I1 — line prompts, NOT a TUI). Refuses to clobber an existing
+/// `rezidnt.toml` without `--force`, leaving the file byte-unchanged and exiting 2
+/// (DR-004 LOCAL input/usage). Owns its own exit codes (0/2) and exits internally.
+fn spec_init(dir: Option<&Path>, defaults: bool, force: bool) -> anyhow::Result<()> {
+    let target_dir = dir.unwrap_or_else(|| Path::new("."));
+    let path = target_dir.join(SPEC_FILENAME);
+
+    // Clobber guard (DR-004 exit 2): decide BEFORE writing a single byte so a
+    // refused clobber leaves the existing file exactly as it was.
+    if path.exists() && !force {
+        eprintln!(
+            "rezidnt: {} already exists; pass --force to overwrite (nothing written)",
+            path.display()
+        );
+        std::process::exit(2);
+    }
+
+    // Build the spec fields — non-interactive default, or plain-CLI prompts.
+    let spec = if defaults {
+        SpecFields::default()
+    } else {
+        prompt_spec_fields().context("read interactive spec answers")?
+    };
+
+    let toml = render_spec_toml(&spec);
+
+    // Sanity pin (anti-drift, DR-036 §Consequences): the bytes we are about to
+    // write MUST parse into the REAL daemon spec type. A generator that drifts
+    // from what `open` accepts fails HERE, loudly, rather than writing a spec the
+    // golden path would reject.
+    rezidnt_run::spec::ProjectSpec::from_toml_str(&toml)
+        .context("internal: generated spec does not parse into ProjectSpec (generator drift)")?;
+
+    std::fs::write(&path, &toml)
+        .with_context(|| format!("write generated spec {}", path.display()))?;
+    println!("wrote {}", path.display());
+    std::process::exit(0);
+}
+
+/// The §13 fields the generator emits: a `[project]` (name + repo) and one
+/// `[[agent]]` (name + harness + worktree). The minimal single-agent shape
+/// DR-036 Design pins; no `bin_override`.
+struct SpecFields {
+    project_name: String,
+    repo: String,
+    agent_name: String,
+    harness: String,
+    worktree: String,
+}
+
+impl Default for SpecFields {
+    fn default() -> Self {
+        Self {
+            project_name: "rezidnt-project".to_string(),
+            repo: ".".to_string(),
+            agent_name: "impl".to_string(),
+            harness: DEFAULT_HARNESS.to_string(),
+            worktree: DEFAULT_WORKTREE.to_string(),
+        }
+    }
+}
+
+/// Prompt the §13 fields on plain stdin/stdout (I1 — line prompts, NOT a TUI).
+/// One prompt per line, in a fixed deterministic order (project name, repo, agent
+/// name, harness); a blank answer (or EOF) accepts the default. `worktree` is not
+/// prompted — it is the sole-allocator `auto` model (DR-036 Design). The flow is
+/// simple and never blocks past the fields it reads.
+fn prompt_spec_fields() -> anyhow::Result<SpecFields> {
+    use std::io::{BufRead, Write};
+
+    let d = SpecFields::default();
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // Read one answer, falling back to `default` on a blank line or EOF.
+    let mut ask = |label: &str, default: &str| -> anyhow::Result<String> {
+        let mut out = std::io::stdout();
+        write!(out, "{label} [{default}]: ").context("write prompt")?;
+        out.flush().context("flush prompt")?;
+        match lines.next() {
+            Some(line) => {
+                let line = line.context("read answer line")?;
+                let trimmed = line.trim();
+                Ok(if trimmed.is_empty() {
+                    default.to_string()
+                } else {
+                    trimmed.to_string()
+                })
+            }
+            None => Ok(default.to_string()), // EOF: accept the default
+        }
+    };
+
+    let project_name = ask("project name", &d.project_name)?;
+    let repo = ask("repo path", &d.repo)?;
+    let agent_name = ask("agent name", &d.agent_name)?;
+    let harness = ask("agent harness", &d.harness)?;
+
+    Ok(SpecFields {
+        project_name,
+        repo,
+        agent_name,
+        harness,
+        worktree: d.worktree,
+    })
+}
+
+/// Render the §13 TOML from the collected fields. Hand-written (not
+/// `toml::to_string(&ProjectSpec)`) because the parser reads `[[agent]]` tables
+/// (`RawSpec.agent`) while `ProjectSpec` serializes an `agents` field — a direct
+/// serialize would drift from the parser. `spec_init` re-parses the output through
+/// the REAL `ProjectSpec::from_toml_str` before writing, so this shape is pinned
+/// to the consumer, not to a §13 snapshot.
+fn render_spec_toml(f: &SpecFields) -> String {
+    // Minimal TOML basic-string quoting (mirrors spec::agent_spec_toml): the
+    // values are short identifiers / paths — `\` → `\\` then `"` → `\"`.
+    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    format!(
+        "# rezidnt project spec (§13) — generated by `rezidnt spec init` (DR-036).\n\
+         # The golden path opens this file untouched.\n\
+         [project]\n\
+         name = {name}\n\
+         repo = {repo}\n\
+         \n\
+         [[agent]]\n\
+         name = {agent}\n\
+         harness = {harness}\n\
+         worktree = {worktree}\n",
+        name = q(&f.project_name),
+        repo = q(&f.repo),
+        agent = q(&f.agent_name),
+        harness = q(&f.harness),
+        worktree = q(&f.worktree),
+    )
 }
 
 /// Read and parse the spec file locally: the success line needs

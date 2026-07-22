@@ -2,6 +2,10 @@
 /target-wsl
 **/*.rs.bk
 *.stackdump
+# Daemon runtime state (worktrees, captures) materialized by `rezidnt open` —
+# never tracked, in this repo or an operator's. A spec with `repo = "."` opened
+# from a repo dir writes it here; the spec-init e2e can leave one behind too.
+.rezidnt/
 # Guard: agents running host cargo with the WSL CARGO_TARGET_DIR=$HOME/.cache
 # idiom create a colon-sanitized junk dir at the repo root (Git-Bash $HOME is
 # C:\Users\...). Never track it.

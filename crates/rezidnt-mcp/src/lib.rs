@@ -1019,41 +1019,14 @@ impl McpCore {
         //     verifier path runs. The applied outcome is a REAL logged decision
         //     fact (I3 — interrogable, `resolved_from` chains to WHO/WHY, I6), NOT
         //     a silent coercion of the escalation (a RECORDED human override).
-        //     An unrecognized human verb (neither `allow` nor `deny`) is NEVER
-        //     coerced to a grant (I6): it does not apply, so control falls through
-        //     to the verifier path (which escalates an empty set). Resolve the
-        //     applied `(subject, decision, resolved_from)` first so the borrow of
-        //     `folded` ends before the async emit/fallthrough.
-        let applied = folded
-            .resolution_for(&action, &tool)
-            .and_then(|resolution| {
-                let (subject, decision) = match resolution.decision.as_str() {
-                    "allow" => ("permit.granted", Decision::Allow),
-                    "deny" => ("permit.denied", Decision::Deny),
-                    _ => return None,
-                };
-                Some((subject, decision, resolution.request_id.clone()))
-            });
-        if let Some((subject, decision, resolved_from)) = applied {
-            // The applied fact carries `resolved_from` = the resolution's
-            // `request_id` so "granted via human resolution X" is a structured,
-            // log-derivable read (I6). No `policy_ref`: a human resolution is
-            // neither a policy nor a CAS blob (ontology permit.granted.resolved_from
-            // — deliberately NOT overloaded onto policy_ref).
-            let payload = json!({
-                "run": run,
-                "request_id": request_id,
-                "resolved_from": resolved_from,
-            });
-            self.publish_fact(subject, payload)
-                .await
-                .map_err(|(_, m)| PdpError::Internal(m))?;
-
-            return Ok(PermitOutcome {
-                request_id,
-                decision,
-                reason: None,
-            });
+        //     The emit is factored into `apply_folded_resolution` so DR-034's
+        //     live-unblock re-decide (`recheck_resolution`) applies the SAME
+        //     ledger-check without re-running the `permit.requested`/verifier path.
+        if let Some(outcome) = self
+            .apply_folded_resolution(&folded, &run, &action, &tool, &request_id)
+            .await?
+        {
+            return Ok(outcome);
         }
 
         // 3. The request axis + folded state as pinned params. Each verifier's
@@ -1222,6 +1195,87 @@ impl McpCore {
             decision,
             reason,
         })
+    }
+
+    /// DR-034 live-unblock — re-run the DR-033 ledger-check ALONE for a
+    /// currently-held escalated request, WITHOUT re-emitting the
+    /// `permit.requested`/`permit.escalated` pair the first `decide_permit`
+    /// already logged (I3: the wake produces ONLY the applied grant/deny, never a
+    /// duplicate requested/escalated pair — a replay reconstructs identically
+    /// whether or not the request was held).
+    ///
+    /// The daemon socket handler calls this each time a `permit.resolved` for the
+    /// held run lands within the unblock deadline. It folds the run fresh, and if
+    /// a human resolution now answers this exact action `(run, tool)`, emits the
+    /// applied `permit.granted`/`permit.denied` (carrying the ORIGINAL held
+    /// `request_id` and `resolved_from`) and returns `Some(outcome)` — the wake.
+    /// It returns `None` when no resolution yet matches (still escalated → the
+    /// caller keeps waiting until the deadline, then fails closed to `ask`).
+    /// A resolution for a DIFFERENT action never matches here, so a foreign
+    /// resolve never wakes this request (DR-034 §Decision 3 — the ledger-check's
+    /// action-identity match is the only gate; no side channel).
+    pub async fn recheck_resolution(
+        &self,
+        run: &str,
+        action: &str,
+        tool: &str,
+        request_id: &str,
+    ) -> Result<Option<PermitOutcome>, PdpError> {
+        let folded = self
+            .fold_run_state(run)
+            .await
+            .map_err(|(_, m)| PdpError::Internal(m))?;
+        self.apply_folded_resolution(&folded, run, action, tool, request_id)
+            .await
+    }
+
+    /// The DR-033 ledger-check emit, shared by `decide_permit` (first pass) and
+    /// `recheck_resolution` (DR-034 wake). If the folded run carries a human
+    /// `permit.resolved` matching `(action, tool)`, APPLY it: emit the applied
+    /// `permit.granted`/`permit.denied` fact carrying `request_id` (the caller's,
+    /// echoed) and `resolved_from` (the resolution's id, so "granted via human
+    /// resolution X" is a structured log-derivable read, I6), and return the
+    /// applied [`PermitOutcome`]. Return `None` when no resolution answers this
+    /// action — the caller then runs (or keeps escalating) the verifier path.
+    ///
+    /// An unrecognized human verb (neither `allow` nor `deny`) is NEVER coerced to
+    /// a grant (I6): it does not apply, so `None` falls through. No `policy_ref`: a
+    /// human resolution is neither a policy nor a CAS blob (the ontology's
+    /// `permit.granted.resolved_from` — deliberately NOT overloaded onto
+    /// `policy_ref`). The applied `(subject, decision, resolved_from)` is resolved
+    /// first so the borrow of `folded` ends before the async emit.
+    async fn apply_folded_resolution(
+        &self,
+        folded: &rezidnt_state::AgentRunState,
+        run: &str,
+        action: &str,
+        tool: &str,
+        request_id: &str,
+    ) -> Result<Option<PermitOutcome>, PdpError> {
+        let applied = folded.resolution_for(action, tool).and_then(|resolution| {
+            let (subject, decision) = match resolution.decision.as_str() {
+                "allow" => ("permit.granted", Decision::Allow),
+                "deny" => ("permit.denied", Decision::Deny),
+                _ => return None,
+            };
+            Some((subject, decision, resolution.request_id.clone()))
+        });
+        let Some((subject, decision, resolved_from)) = applied else {
+            return Ok(None);
+        };
+        let payload = json!({
+            "run": run,
+            "request_id": request_id,
+            "resolved_from": resolved_from,
+        });
+        self.publish_fact(subject, payload)
+            .await
+            .map_err(|(_, m)| PdpError::Internal(m))?;
+        Ok(Some(PermitOutcome {
+            request_id: request_id.to_string(),
+            decision,
+            reason: None,
+        }))
     }
 
     /// Fold this run's per-run state (intent allowlist + permit accumulators)

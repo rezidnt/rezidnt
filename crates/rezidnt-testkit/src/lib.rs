@@ -284,6 +284,50 @@ pub fn start_daemon_with_mcp(seed_fixture: Option<&str>) -> (DaemonGuard, PathBu
     )
 }
 
+/// Start rezidentd serving BOTH transports (bare UDS + loopback-HTTP MCP via
+/// `REZIDNT_MCP_LOCKFILE`) AND with a `REZIDNT_UNBLOCK_TIMEOUT_MS` set (DR-034
+/// §Decision 2: the SEPARATE, longer live-unblock deadline, distinct from the
+/// 250ms hot-path `REZIDNT_PERMIT_TIMEOUT_MS`).
+///
+/// This is the live-unblock harness: the bare socket is where the PEP holds a
+/// `request_permission` open (the held request), and the loopback-HTTP surface
+/// is where the operator drives `resolve_permit` (the real operator door) — one
+/// daemon, both doors, so the wake is proven END-TO-END, not by a synthetic log
+/// poke. Returns the guard + the announced lockfile path.
+///
+/// `unblock_ms` is the live-unblock budget: pass a LONG value (e.g. 8000) for
+/// the resume tests so the resolution has time to land while the request is
+/// held, and a SHORT value (e.g. 400) for the expiry test so the suite stays
+/// fast and non-flaky.
+pub fn start_daemon_with_mcp_and_unblock(unblock_ms: u64) -> (DaemonGuard, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("rezidnt.sock");
+    let db = dir.path().join("events.db");
+    let lockfile = dir.path().join("mcp.lock");
+
+    let child = Command::new(daemon_bin())
+        .env("REZIDNT_SOCKET", &socket)
+        .env("REZIDNT_DB", &db)
+        .env("REZIDNT_MCP_LOCKFILE", &lockfile)
+        .env("REZIDNT_UNBLOCK_TIMEOUT_MS", unblock_ms.to_string())
+        .spawn()
+        .expect("spawn rezidentd");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (
+        DaemonGuard {
+            child,
+            socket,
+            db,
+            _dir: dir,
+        },
+        lockfile,
+    )
+}
+
 /// Restart the daemon over the SAME db/socket/lockfile paths — a real
 /// restart: process memory is gone (SIGKILL, the S0 precedent), the log
 /// survives. The old socket and lockfile are removed BEFORE the respawn so a

@@ -78,6 +78,26 @@ mod unix_daemon {
     /// request line). S1 clients send their request immediately.
     const REQUEST_WAIT: Duration = Duration::from_millis(500);
 
+    /// DR-034 live-unblock default: with `REZIDNT_UNBLOCK_TIMEOUT_MS` UNSET (or
+    /// unparseable), the bounded server-assisted long-poll is DISABLED — a held
+    /// escalated `request_permission` returns `ask` immediately, exactly as it did
+    /// before DR-034 (the pure DR-033 "honored on next ask" fallback, unchanged).
+    /// This SEPARATE, opt-in knob is distinct from the 250ms hot-path
+    /// `REZIDNT_PERMIT_TIMEOUT_MS` (DR-034 §Decision 2): a stalled-agent wait is a
+    /// different budget than a hot decision, so it does NOT change today's
+    /// behaviour for callers who never set it. `0` also disables the hold.
+    const DEFAULT_UNBLOCK_TIMEOUT_MS: u64 = 0;
+
+    /// The DR-034 live-unblock deadline: `REZIDNT_UNBLOCK_TIMEOUT_MS` when set to a
+    /// parseable value, else [`DEFAULT_UNBLOCK_TIMEOUT_MS`] (0 = disabled). Parsed
+    /// like `REZIDNT_PERMIT_TIMEOUT_MS` in the PEP (env → `parse::<u64>` → default).
+    fn unblock_timeout_ms() -> u64 {
+        std::env::var("REZIDNT_UNBLOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_UNBLOCK_TIMEOUT_MS)
+    }
+
     /// The hello's `schema` field: identity hash of the compiled-in subject
     /// taxonomy (version string + subjects, newline-delimited). Derived from
     /// the same constants the drift-guard test pins against the canonical
@@ -460,6 +480,13 @@ mod unix_daemon {
                 // so the ask and the on-log decision fact share one id. The two
                 // facts (`permit.requested` + one decision fact) are emitted by
                 // `decide_permit` — the socket handler never re-emits (I3).
+                // DR-034 live-unblock: keep the request's action identity so a
+                // held escalation can be RE-DECIDED against a landing
+                // `permit.resolved` (the wake keys on `(run, tool)`, DR-034
+                // §Decision 3). Cloned BEFORE `req` moves into `decide_permit`.
+                let held_run = run.clone();
+                let held_action = action.clone();
+                let held_tool = tool.clone();
                 let req = rezidnt_mcp::PermitRequest {
                     run,
                     request_id: Some(request_id),
@@ -476,6 +503,22 @@ mod unix_daemon {
                 };
                 match pdp.decide_permit(req).await {
                     Ok(outcome) => {
+                        // DR-034: on a DECISIVE verdict (allow/deny) the hot path is
+                        // untouched — return at once, never hold. Only an
+                        // `ask`/escalate MAY enter the bounded long-poll below.
+                        let outcome = if outcome.decision == rezidnt_mcp::Decision::Ask {
+                            await_unblock(
+                                &daemon,
+                                &pdp,
+                                &held_run,
+                                &held_action,
+                                &held_tool,
+                                outcome,
+                            )
+                            .await?
+                        } else {
+                            outcome
+                        };
                         let reply = Reply::PermitDecision {
                             request_id: outcome.request_id,
                             decision: outcome.decision.as_word().to_string(),
@@ -507,6 +550,109 @@ mod unix_daemon {
         frame.push('\n');
         out.write_all(frame.as_bytes()).await?;
         Ok(())
+    }
+
+    /// DR-034 live-unblock — a bounded server-assisted long-poll for a HELD
+    /// escalated `request_permission`. The first `decide_permit` already escalated
+    /// (`permit.requested` + `permit.escalated` are on the log, so `escalated` is
+    /// the outcome passed in). While `REZIDNT_UNBLOCK_TIMEOUT_MS > 0` and until the
+    /// deadline: each time a `permit.resolved` for THIS run lands, RE-DECIDE the
+    /// same held request via `recheck_resolution` — which applies a matching
+    /// resolution as the on-log `permit.granted`/`permit.denied` WITHOUT re-logging
+    /// a second requested/escalated pair (I3). A wake carries the ORIGINAL held
+    /// `request_id` (it flows through the re-decide, never re-minted — DR-034
+    /// §Decision 3). On deadline expiry with no matching resolution, return the
+    /// ORIGINAL escalation unchanged — fail-closed to `ask` (DR-034 §Decision 2),
+    /// never `allow`, never a hang past the deadline. A FOREIGN resolution (a
+    /// different action/run) never flips the re-decide, so the loop simply waits
+    /// out the deadline and returns `ask` — the ledger-check's action-identity
+    /// match is the only gate (no separate id equality needed).
+    async fn await_unblock(
+        daemon: &Arc<Daemon>,
+        pdp: &Arc<rezidnt_mcp::McpCore>,
+        run: &str,
+        action: &str,
+        tool: &str,
+        escalated: rezidnt_mcp::PermitOutcome,
+    ) -> anyhow::Result<rezidnt_mcp::PermitOutcome> {
+        let budget_ms = unblock_timeout_ms();
+        if budget_ms == 0 {
+            // Hold disabled: pure DR-033 fallback (immediate `ask`), unchanged.
+            return Ok(escalated);
+        }
+
+        let span = tracing::info_span!(
+            "adapter",
+            kind = "permit-unblock",
+            run = run,
+            request_id = %escalated.request_id
+        );
+        let deadline = Duration::from_millis(budget_ms);
+        let held_id = escalated.request_id.clone();
+
+        let waited = tokio::time::timeout(deadline, async {
+            // Subscribe FIRST, then do an immediate re-decide: a resolution that
+            // landed between the escalate emit and this subscribe is caught by the
+            // fold (`recheck_resolution` re-folds the whole log), not missed.
+            let mut sub = daemon.fabric.subscribe();
+            if let Some(outcome) = pdp
+                .recheck_resolution(run, action, tool, &held_id)
+                .await
+                .context("permit live-unblock recheck")?
+            {
+                return Ok::<Option<rezidnt_mcp::PermitOutcome>, anyhow::Error>(Some(outcome));
+            }
+            loop {
+                match sub.recv().await {
+                    Ok(event) => {
+                        // Only a resolution for THIS run can flip the re-decide; a
+                        // `permit.resolved` for the run triggers a fresh
+                        // ledger-check. Any other fact (or a foreign run's resolve)
+                        // is ignored — cheap filter before the fold.
+                        if event.subject.as_str() != "permit.resolved"
+                            || event.payload()["run"] != json!(run)
+                        {
+                            continue;
+                        }
+                        if let Some(outcome) = pdp
+                            .recheck_resolution(run, action, tool, &held_id)
+                            .await
+                            .context("permit live-unblock recheck")?
+                        {
+                            return Ok(Some(outcome));
+                        }
+                    }
+                    // A lagged subscriber may have skipped the resolution: re-fold
+                    // the full log (the fold sees it regardless) and keep waiting if
+                    // it still does not match.
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(dropped = n, "permit-unblock subscriber lagged; re-folding");
+                        if let Some(outcome) = pdp
+                            .recheck_resolution(run, action, tool, &held_id)
+                            .await
+                            .context("permit live-unblock recheck")?
+                        {
+                            return Ok(Some(outcome));
+                        }
+                    }
+                    Err(RecvError::Closed) => return Ok(None),
+                }
+            }
+        })
+        .instrument(span)
+        .await;
+
+        match waited {
+            // A matching resolution woke the held request within the deadline.
+            Ok(Ok(Some(outcome))) => Ok(outcome),
+            // Fabric closed with no match — fail closed to the original `ask`.
+            Ok(Ok(None)) => Ok(escalated),
+            // A recheck fault: never coerce — surface it (the caller answers Error).
+            Ok(Err(e)) => Err(e),
+            // Deadline expiry, no matching resolution: fail closed to `ask`
+            // (DR-034 §Decision 2) — the ORIGINAL escalation, never `allow`.
+            Err(_elapsed) => Ok(escalated),
+        }
     }
 
     /// Tail stream: replay from seq 0, then live, optionally filtered by

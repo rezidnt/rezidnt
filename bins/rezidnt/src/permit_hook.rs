@@ -122,7 +122,9 @@ pub fn extract_paths(input: &Value) -> Option<Value> {
 
 /// The fail-closed timeout for the round-trip: `REZIDNT_PERMIT_TIMEOUT_MS` when
 /// set to a parseable value, else the 250 ms default (DR-014 §Decision 3).
-/// Unix-only: bounds the UDS round-trip in `ask_daemon`.
+/// Unix-only: bounds the CONNECT and WRITE ops in `ask_daemon` (a genuinely-down
+/// daemon still fails closed fast); the reply READ is bounded separately by
+/// [`read_timeout`] so DR-034 live-unblock can hold.
 #[cfg(unix)]
 fn timeout() -> Duration {
     let ms = std::env::var("REZIDNT_PERMIT_TIMEOUT_MS")
@@ -130,6 +132,51 @@ fn timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TIMEOUT_MS);
     Duration::from_millis(ms)
+}
+
+/// DR-034 live-unblock: the SEPARATE, longer budget the daemon may HOLD an
+/// escalated reply for (`REZIDNT_UNBLOCK_TIMEOUT_MS`, distinct from the 250ms
+/// hot-path). Parsed exactly like the daemon parses it (env → `parse::<u64>` →
+/// default 0). `0`/unset DISABLES the hold — the PEP then reads under the plain
+/// hot-path budget, unchanged. Unix-only: consumed by [`read_timeout`].
+#[cfg(unix)]
+fn unblock_timeout_ms() -> u64 {
+    std::env::var("REZIDNT_UNBLOCK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The margin added to the unblock budget for the PEP's reply-read deadline so
+/// the CLIENT read outlasts the daemon's own hold: the daemon releases AT the
+/// unblock deadline (resolve-applied or expiry-`ask`), and this margin covers the
+/// release + write + socket travel so the PEP observes the daemon's frame rather
+/// than cutting it off a hair early. Unix-only.
+#[cfg(unix)]
+const UNBLOCK_READ_MARGIN_MS: u64 = 2_000;
+
+/// The reply-READ deadline (DR-034 §Design — the PEP's `#[cfg(unix)]` half). When
+/// the unblock knob is engaged (`REZIDNT_UNBLOCK_TIMEOUT_MS > 0`), the daemon may
+/// HOLD an escalated reply up to that budget, so the PEP must wait for it plus a
+/// travel margin — NOT the 250ms hot-path budget (which would cut the hold off
+/// and fail closed to `ask` before the resolution can wake it). A decisive
+/// allow/deny still returns within the hot-path window regardless, so the larger
+/// read deadline only bites when the daemon is actually holding on an `ask` —
+/// exactly the intended coupling window. Past it, the read still times out and
+/// the caller funnels to a fail-closed `ask` (never allow, never a hang). When the
+/// knob is unset/0, this IS the hot-path `timeout()` — behaviour unchanged.
+#[cfg(unix)]
+fn read_timeout() -> Duration {
+    let hot = timeout();
+    let unblock = unblock_timeout_ms();
+    if unblock == 0 {
+        return hot;
+    }
+    // The daemon holds up to `unblock`; the client outlasts that by the margin.
+    // `max` guards a pathological config where the hot-path budget already
+    // exceeds the extended one.
+    let extended = Duration::from_millis(unblock.saturating_add(UNBLOCK_READ_MARGIN_MS));
+    extended.max(hot)
 }
 
 /// Ask the daemon PDP over the socket and return `(decision_word, reason)`. Any
@@ -144,17 +191,21 @@ fn ask_daemon(input: &Value) -> anyhow::Result<(String, Option<String>)> {
 
     let request = build_request(input, &crate::cas_dir())?;
 
-    let deadline = timeout();
     let sock = socket_path();
     let stream = UnixStream::connect(&sock)
         .with_context(|| format!("connect daemon at {}", sock.display()))?;
-    // Bound every blocking op by the fail-closed timeout — a hung daemon must
-    // resolve to `ask`, not block the tool call forever.
+    // DR-034 §Design (PEP half): bound the WRITE by the short hot-path budget — a
+    // genuinely-down daemon must still fail closed FAST — but bound the reply READ
+    // by the (possibly longer) unblock budget, so the daemon can HOLD an escalated
+    // reply up to `REZIDNT_UNBLOCK_TIMEOUT_MS` and the PEP waits to collect it
+    // rather than hitting a 250ms cutoff and self-escalating to `ask`. When the
+    // knob is unset/0 both are the hot-path budget (behaviour unchanged). Past the
+    // read deadline the read times out → `?` → fail-closed `ask` (never allow).
     stream
-        .set_read_timeout(Some(deadline))
+        .set_read_timeout(Some(read_timeout()))
         .context("set read timeout")?;
     stream
-        .set_write_timeout(Some(deadline))
+        .set_write_timeout(Some(timeout()))
         .context("set write timeout")?;
 
     let mut reader = BufReader::new(stream);

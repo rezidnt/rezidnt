@@ -117,6 +117,19 @@ pub struct ResolvePermitArgs {
     /// stays doc §9 no-drift: absent = OMITTED, never null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    /// DR-035 §Decision 2 — optional grant-all scope: a single-axis wildcard that
+    /// widens the match from the exact `(run, tool, action/target)` to a class.
+    /// The only value in v1 is `"run_tool"` = "any action on this `(run, tool)`".
+    /// ABSENT = today's DR-033 exact request-scoped match. A closed named-axis
+    /// enum, NOT a boolean and NOT an expression string (DR-035 §Decision 2
+    /// rejected an unrestricted predicate language): the value token IS the
+    /// predicate, so `gate why`/`debrief` render it verbatim (I6). COUPLING
+    /// (DR-035 §Decision 3): when `scope` is present, `ttl_ms` MUST also be
+    /// present (broad OR permanent, never both) — enforced at the `resolve_permit`
+    /// tool boundary before any fact is emitted, NOT in this schema. Additive-
+    /// optional so `schema_for!` stays doc §9 no-drift: absent = OMITTED, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// `request_permission` — the harness PEP asks the daemon PDP "may this action

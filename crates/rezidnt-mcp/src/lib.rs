@@ -70,6 +70,12 @@ pub mod codes {
     pub const AGENT_UNKNOWN: &str = "agent.unknown";
     /// The spawn itself failed after all checks passed.
     pub const SPAWN_FAILED: &str = "spawn.failed";
+    /// DR-035 §Decision 3 — `resolve_permit` was called with a broad scope
+    /// (`scope="run_tool"`) but no `ttl_ms`. Broad OR permanent, never both: a
+    /// broad grant MUST be time-boxed so the dangerous quadrant (broad AND
+    /// permanent) is structurally unreachable on the log. Additive code — older
+    /// peers tolerate an unknown refusal code (I5).
+    pub const SCOPE_REQUIRES_TTL: &str = "scope.requires_ttl";
 }
 
 /// MCP protocol version this server speaks (DEFAULT: the current spec rev).
@@ -832,6 +838,22 @@ impl McpCore {
                 }
             };
 
+        // DR-035 §Decision 3 — THE COUPLING GUARD (the security-critical structural
+        // guarantee). A broad (`scope="run_tool"`) resolution MUST carry a bounded
+        // `ttl_ms`: broad OR permanent, never both. Validated AFTER the badge door and
+        // BEFORE any derive/emit, so a broad-and-permanent `permit.resolved` can never
+        // reach the log (no partial state, I3) — the dangerous quadrant is structurally
+        // unreachable, not merely discouraged. Absent scope (DR-033 request-scoped) is
+        // permanent-by-default, unchanged: the coupling binds ONLY the broad case.
+        if parsed.scope.as_deref() == Some("run_tool") && parsed.ttl_ms.is_none() {
+            return Ok(tool_refused(
+                codes::SCOPE_REQUIRES_TTL,
+                "resolve_permit: a broad scope (scope=\"run_tool\") requires a ttl_ms — \
+                 broad OR permanent, never both (DR-035 §Decision 3); the broad-and-permanent \
+                 quadrant is structurally forbidden",
+            ));
+        }
+
         // DERIVE `(action, target)` from the log by `request_id` (DR-033 §Design).
         // Fold the run and look the escalation up in the permit ledger. If ABSENT
         // (no `permit.requested` folded for this request_id) the daemon cannot
@@ -871,6 +893,14 @@ impl McpCore {
         // pure fold with no created_at on the fact (I3, DR-035 §Decision 1).
         if let (Some(ttl_ms), Some(obj)) = (parsed.ttl_ms, payload.as_object_mut()) {
             obj.insert("ttl_ms".to_string(), json!(ttl_ms));
+        }
+        // DR-035 §Decision 2: the optional grant-all scope rides the fact VERBATIM so
+        // the reducer folds the broadening onto `PermitResolution.scope` and the PDP
+        // matches any action on this `(run, tool)`. Absent = OMITTED (never null) =
+        // DR-033 exact request-scoped match. Mirrors the `ttl_ms` insert above; the
+        // coupling guard already guaranteed a present scope carries a ttl_ms.
+        if let (Some(scope), Some(obj)) = (&parsed.scope, payload.as_object_mut()) {
+            obj.insert("scope".to_string(), json!(scope));
         }
         self.publish_fact("permit.resolved", payload).await?;
 
@@ -1304,16 +1334,31 @@ impl McpCore {
                     "deny" => ("permit.denied", Decision::Deny),
                     _ => return None,
                 };
-                Some((subject, decision, resolution.request_id.clone()))
+                // DR-035 §Decision 2 / §Invariants I6: carry the matched broad
+                // predicate onto the applied fact so a broad grant is a recorded,
+                // attributable, EXPLAINABLE outcome (never a silent widening). `None`
+                // for a request-scoped grant — the negative control keeps a narrow
+                // grant clean of a phantom predicate.
+                Some((
+                    subject,
+                    decision,
+                    resolution.request_id.clone(),
+                    resolution.scope.clone(),
+                ))
             });
-        let Some((subject, decision, resolved_from)) = applied else {
+        let Some((subject, decision, resolved_from, scope)) = applied else {
             return Ok(None);
         };
-        let payload = json!({
+        let mut payload = json!({
             "run": run,
             "request_id": request_id,
             "resolved_from": resolved_from,
         });
+        // Thread the matched broad predicate onto the applied fact only when present
+        // (I6 interrogability); absent for a request-scoped grant so it stays distinct.
+        if let (Some(scope), Some(obj)) = (&scope, payload.as_object_mut()) {
+            obj.insert("scope".to_string(), json!(scope));
+        }
         self.publish_fact(subject, payload)
             .await
             .map_err(|(_, m)| PdpError::Internal(m))?;
@@ -1523,6 +1568,16 @@ impl McpCore {
                 // resolved_from would misreport the deciding authority).
                 if let Some(resolved_from) = payload.get("resolved_from") {
                     obj.insert("resolved_from".to_string(), resolved_from.clone());
+                }
+                // DR-035 §Decision 2 / §Invariants I6 — surface the matched broad
+                // predicate when the applied fact carries it, so `gate why`/`debrief`
+                // render "granted by broad resolution X matching any action on
+                // (run, tool)". Present ONLY on a broad grant; ABSENT on a
+                // request-scoped grant (the negative control) — never synthesized, so a
+                // narrow grant is never misreported as broad (the inverse of a silent
+                // widening).
+                if let Some(scope) = payload.get("scope") {
+                    obj.insert("scope".to_string(), scope.clone());
                 }
                 // DR-035 §Invariants I6 — expiry is EXPLAINABLE, never a silent
                 // vanish. On a re-escalation (`permit.escalated`), if the log holds

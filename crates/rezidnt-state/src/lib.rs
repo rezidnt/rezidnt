@@ -273,6 +273,19 @@ pub struct PermitResolution {
     /// `ttl_ms`, so the deadline is never consulted (permanent).
     #[serde(default)]
     pub resolved_at_ms: u64,
+    /// DR-035 §Decision 2 — the optional grant-all scope: a single-axis wildcard
+    /// widening the match from the exact `(run, tool, action/target)` to a class.
+    /// The only value in v1 is `"run_tool"` = "any action on this `(run, tool)`";
+    /// `None` = exact request-scoped match (DR-033 behavior). Folded VERBATIM from
+    /// the fact; `#[serde(default)]` so a pre-DR-035-grant-all fixture (no `scope`)
+    /// parses unchanged and matches exactly as before (additive, rebuild-stable,
+    /// I3). The broadening of `resolution_for`'s match predicate that CONSUMES
+    /// this is implementer scope (NOT folded-into behavior yet): today the field is
+    /// carried inert. COUPLING (DR-035 §Decision 3): a `Some("run_tool")` obligates
+    /// a `Some(ttl_ms)` — but that is enforced at the `resolve_permit` tool
+    /// boundary, so a broad-and-permanent resolution can never reach this fold.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// A run's per-session permit accumulators: the running state the *contextual*
@@ -483,6 +496,21 @@ pub struct AgentRunState {
     pub resolutions: Vec<PermitResolution>,
 }
 
+/// DR-035 §Decision 2 — the action-axis match predicate shared by the applied
+/// (`resolution_for`) and interrogability (`expired_resolution_for`) scans. A
+/// resolution with `scope == Some("run_tool")` is BROAD: it matches ANY incoming
+/// action (the action/target axis is wildcarded; the tool axis stays exact,
+/// enforced by the caller's separate `target.tool` check). Absent (or any other)
+/// scope stays DR-033's EXACT `action` match — a sibling action never matches, so
+/// the request-scoped default is un-broadened. Pure, no clock (I3): the branch
+/// reads only the folded record and the incoming action string.
+fn action_matches(r: &PermitResolution, action: &str) -> bool {
+    match r.scope.as_deref() {
+        Some("run_tool") => true,
+        _ => r.action == action,
+    }
+}
+
 impl AgentRunState {
     /// Whether this run was mid-run-PEP-enforced — `true` iff the spawn folded
     /// `pep == "enforced"` (DR-014 §Decision 5). ABSENCE folds `false`: a run
@@ -520,7 +548,7 @@ impl AgentRunState {
         incoming_ms: u64,
     ) -> Option<&PermitResolution> {
         self.resolutions.iter().rev().find(|r| {
-            r.action == action
+            action_matches(r, action)
                 && r.target.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
                 && match r.ttl_ms {
                     // Permanent (DR-033 §Decision 2) — never filtered.
@@ -551,7 +579,7 @@ impl AgentRunState {
         incoming_ms: u64,
     ) -> Option<&PermitResolution> {
         self.resolutions.iter().rev().find(|r| {
-            r.action == action
+            action_matches(r, action)
                 && r.target.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
                 && matches!(r.ttl_ms, Some(n) if incoming_ms > r.resolved_at_ms.saturating_add(n))
         })
@@ -954,6 +982,13 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     // the envelope ULID already on the log so expiry is a pure fold).
                     ttl_ms: payload["ttl_ms"].as_u64(),
                     resolved_at_ms: event.id.timestamp_ms(),
+                    // DR-035 §Decision 2 (slice `escalation-grant-all`): the grant-all
+                    // scope folds VERBATIM from the fact (absent = exact request-scoped
+                    // match, DR-033 §Decision 3; `Some("run_tool")` = the single-axis
+                    // wildcard `resolution_for` consumes to grant any action on this
+                    // `(run, tool)`). Additive/rebuild-stable: a legacy resolution with
+                    // no `scope` folds to `None` and matches exactly as before (I3).
+                    scope: payload["scope"].as_str().map(String::from),
                 };
                 graph
                     .agent_runs

@@ -1,73 +1,75 @@
-# Handoff — 2026-07-22 (session 20: operator-live-unblock — DR-034 shipped, /vet + /debrief PASS)
+# Handoff — 2026-07-22 (session 20: DR-034 live-unblock + DR-035 escalation TTL & grant-all — ALL shipped)
 
 ## State of play
-Cold-started from session 19's handoff (operator-client arc DR-031/032/033 complete). Owner's steer this
-session: **pull forward live-unblock** — the demand-gated option DR-033 explicitly rejected for slice 2. Ran the
-full loop and shipped it. **All work on `origin/main` (synced, `042740b`).** High autonomy ON
-([[autonomy-high-trust]]). `current-slice` = `operator-live-unblock` (**done**).
+Cold-started from session 19's handoff (operator-client arc DR-031/032/033 complete). Owner steered three
+consecutive design commitments this session, each run through the full loop and shipped to `origin/main`
+(synced, `6a8a44b`). High autonomy ON ([[autonomy-high-trust]]). `current-slice` = `escalation-grant-all`
+(**done** — last sub-slice of the DR-035 arc).
 
-DR-034 drafted → owner ratified (Accept + open slice) → /oracle (5 red) → implement (both halves) → host /vet PASS
-→ /debrief INCONCLUSIVE (real finding) → remediate → host /vet PASS → /debrief PASS. Definition of done met.
+Three arcs closed, each DR → (/subject) → /oracle → implement → /vet → /debrief, all /vet + /debrief PASS:
+1. **DR-034 operator live-unblock** — resume the currently-stalled agent on resolve (pulled forward DR-033's
+   demand-gated deferral). One /debrief came back INCONCLUSIVE (a real scope gap), remediated in-session, re-PASSED.
+2. **DR-035 sub-slice 1 `escalation-ttl`** — log-derived resolution expiry. Clean PASS.
+3. **DR-035 sub-slice 2 `escalation-grant-all`** — broad-grant predicate + the structural coupling. Clean PASS.
 
-## Current slice & criteria — `operator-live-unblock` (DONE)
-DR-034. **Resume the currently-stalled agent** when a matching operator resolution lands, instead of forcing a
-re-ask (DR-033's honest limit). Mechanism = a **bounded server-assisted long-poll**, not a held-open push.
-- **Daemon half** (`bins/rezidentd/src/main.rs` `await_unblock`, `crates/rezidnt-mcp/src/lib.rs`
-  `recheck_resolution`/`apply_folded_resolution`): on `Decision::Ask`, subscribe to the fabric `broadcast`
-  (same primitive `serve_tail` uses), re-run ONLY DR-033's ledger-check on each new `permit.resolved` for the run,
-  emit exactly the applied `permit.granted`/`permit.denied` (+`resolved_from`, original request_id) — **no** second
-  `permit.requested`/`escalated` (I3 replay-identical). Bounded by `tokio::time::timeout`; Lagged re-folds, Closed
-  fails closed. `REZIDNT_UNBLOCK_TIMEOUT_MS` default **0 = disabled** (pure DR-033 fallback, pre-DR-034 behavior
-  byte-for-byte). Hot path (decisive allow/deny) untouched — returns immediately, no hold.
-- **Client half** (`bins/rezidnt/src/permit_hook.rs` `ask_daemon`): splits the deadlines — write/connect stay the
-  250ms hot-path budget (down daemon still fails fast); the reply **read** extends to `unblock + 2s margin` ONLY
-  when the knob is set. Past it, read errors → `decide()` → fail-closed `ask` (never allow, never unbounded).
-- **Wake key (as-built, erratum in DR-034 §Decision 3):** the wake gates on ACTION identity `(run, tool)` via the
-  ledger-check re-decide, NOT request_id equality; the reply still carries the original id un-re-minted. One
-  matcher, ledger is truth (cleaner than the DR's original request_id-keyed framing). Correctness unaffected.
+## What shipped (git log since `f9c2948`)
+- `cc7e46d` **DR-034 ACCEPTED** + `042740b` impl (both halves) + `bbad69e` handoff.
+- `686e19d` **DR-035 ACCEPTED** (one DR, both axes — TTL + grant-all — designed together because the risk is
+  DURATION × BLAST-RADIUS) + §20 row (next record now **DR-036**) + §16 pointer.
+- `7d2989c` **escalation-ttl** impl · `e21107d` slice advance · `6a8a44b` **escalation-grant-all** impl.
 
-## What changed this session (git log since `f9c2948`)
-- `cc7e46d` **DR-034 ACCEPTED** + open slice: new record, architecture §20 index row + next-record bump to DR-035,
-  §16 amended-by pointer, DR-033 PEP-path erratum (`bins/rezidnt/` not `crates/rezidnt-mcp/`),
-  `current-slice → operator-live-unblock`.
-- `042740b` **implementation, both halves + tests + DR-034 §Decision 3 erratum.** Tests:
-  `bins/rezidentd/tests/permit_live_unblock.rs` (5 — daemon hold/wake-allow/wake-deny/expiry/foreign/fallback) and
-  `bins/rezidentd/tests/permit_hook_unblock.rs` (2 — drives the shipped `rezidnt permit-hook` binary end-to-end
-  through the real `resolve_permit` door; the real-PEP judge that caught the 250ms client cutoff). Testkit helper
-  `start_daemon_with_mcp_and_unblock`. No new subject, no new `Reply` variant (DR-034 lean held).
+## The two features now live on `permit.resolved` v1 (both additive, v1 unchanged, drift green)
+- **`ttl_ms?: u64`** — optional duration; a resolution applies only while `incoming_request_ULID_ms <=
+  resolution_ULID_ms + ttl_ms`, else re-escalates. Expiry is a PURE FOLD of two event-ULID timestamps already on
+  the log (no decision-time wall-clock → I3-clean, replay-deterministic). Absent = permanent (DR-033 behavior).
+- **`scope?: "run_tool"`** — optional single-axis wildcard; a broad resolution matches ANY action on its
+  `(run, tool)` (tool stays EXACT). Absent = DR-033 exact request-scoped match. Unknown scope values fail closed to
+  exact. **Coupling (structural, DR-035 §Decision 3):** `resolve_permit` REFUSES `scope="run_tool"` with no
+  `ttl_ms` (code `codes::SCOPE_REQUIRES_TTL`, badge→validate→emit, no fact on refusal) — broad-and-permanent is
+  UNMINTABLE, not merely discouraged.
 
-## Next action (owner's steer — slice done, nothing gated)
-No forced next. Natural options:
-1. **Escalation TTL/expiry** — DR-033 + DR-034 both deferred; a `permit.resolved` (and now a live hold) has no
-   clock/expiry. Pull only on demand; own DR.
-2. **Grant-all-matching predicate** — DR-033 deferred; broaden a resolution beyond one `(run, tool, action/target)`.
-   Own DR.
-3. **Onboarding** ([[onboarding-future-focus]]) — flagged by owner; still needs audience + DR before it's a slice.
-4. Other roadmap phase: benchmark harness (DR-022), macOS/Windows sandbox+egress backends.
-5. A live-op end-to-end proof wiring kill-run + resolve + live-unblock into one operator demo.
+## The shared seam (where both features live)
+`AgentRunState::resolution_for(action, tool, incoming_ms)` (`crates/rezidnt-state/src/lib.rs` ~482/507/550) — the
+one function the DR-033 PDP path (`apply_folded_resolution`) AND DR-034 live-unblock (`recheck_resolution`) both
+route through, so TTL + grant-all flow to both automatically. `action_matches` (free fn) does the action-axis
+wildcard; the TTL deadline branch composes with it; `expired_resolution_for` mirrors both for I6 expiry
+interrogation. Operator surface: `resolve_permit` gained optional `ttl_ms`/`scope`; `rezidnt operator resolve-permit`
+gained `--ttl-ms` (a `--scope` flag was NOT added — flag if the CLI needs it; the MCP arg exists).
+
+## Next action (owner's steer — DR-035 arc complete, nothing gated)
+No forced next. `current-slice` sits at `escalation-grant-all` (done). Natural options:
+1. **`--scope` CLI flag** — small gap: the MCP `resolve_permit` takes `scope`, but the `rezidnt operator
+   resolve-permit` subcommand only wired `--ttl-ms`. A broad grant is currently only reachable via raw MCP, not the
+   CLI. Trivial follow-up (no DR) if operator ergonomics want it.
+2. **Onboarding** ([[onboarding-future-focus]]) — flagged by owner; still needs audience + DR before it's a slice.
+3. Other roadmap phase: benchmark harness (DR-022), macOS/Windows sandbox+egress backends.
+4. A live-op end-to-end demo of all the operator actions (kill-run + resolve + live-unblock + TTL/broad grants).
 
 ## Open /debrief findings (NON-BLOCKING, none blocks done)
-- Closed in-session: the one INCONCLUSIVE (PEP client half — `ask_daemon`'s 250ms read timeout unlifted, so the
-  real client couldn't collect the daemon's held reply) was remediated (deadline split) and re-/debrief PASSED.
-- Honest as-built note (recorded as DR-034 §Decision 3 erratum, no action): wake keys on action-identity, not
-  request_id, diverging from the DR's stated preference; correctness preserved, ledger is source of truth.
+- DR-034: the INCONCLUSIVE (PEP client 250ms read-timeout unlifted, so the real client couldn't collect the held
+  reply) was remediated (deadline split) and re-PASSED. Recorded as DR-034 §Decision 3 erratum (wake keys on
+  action-identity via the ledger re-decide, not request_id equality — cleaner, ledger is truth).
+- grant-all non-blocking notes (auditor): `saturating_add` silently clamps a pathological `u64::MAX` ttl to
+  "always applies" (no criterion requires refusing it); `scope` is a closed single-value enum — a future second
+  axis needs an `action_matches` arm, not just a schema value.
 
 ## Decisions still needing a /dr
-- Escalation **TTL/expiry** and **grant-all-matching predicate** — DR-033/034 deferred both; DR only if demand shows.
+- None outstanding from this arc. DR-035 closed DR-033's two "MAY add if demand shows" deferrals (TTL, grant-all).
 - Prior carried (unrelated): macOS/Windows sandbox+egress backends; MCP-based 1Password backend.
 
 ## Environment (essentials)
-Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done). This slice added **`#[cfg(unix)]` bodies on BOTH
-halves** (daemon `await_unblock` + PEP `ask_daemon`/`read_timeout`) — host clippy can't lint-reach them
-([[vet-is-host-side-wsl-insufficient]]); the implementer ran WSL clippy clean AND WSL tests green, host /vet PASS.
-For any future work here: lint on WSL (`wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, quote the PATH export
-[[wsl-dev-environment]]), run host+WSL **sequentially** ([[vet-concurrency-flake]]). Watch
-[[clippy-doc-lazy-continuation-trap]] in doc headers. Untracked `.playwright-mcp/` + `docs/site/` are stray, not
-part of the project — leave them.
+Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done). DR-035's core (fold + `resolution_for` + coupling
+guard) is in the **platform-neutral state + mcp crates** — host-lintable, and all DR-035 tests are host-side (no
+`#[cfg(unix)]`). DR-034 live-unblock DID add `#[cfg(unix)]` bodies (daemon `await_unblock` + PEP `ask_daemon`) —
+host clippy can't reach them ([[vet-is-host-side-wsl-insufficient]]); for any future work there, lint on WSL
+(`wsl.exe -d Ubuntu-24.04`, cargo `~/.cargo/bin`, quote the PATH export [[wsl-dev-environment]]), host+WSL
+SEQUENTIAL ([[vet-concurrency-flake]]). Watch [[clippy-doc-lazy-continuation-trap]] in doc headers. Untracked
+`.playwright-mcp/` + `docs/site/` are stray, not part of the project — leave them.
 
 ---
-**NEXT ACTION → `operator-live-unblock` (DR-034: bounded long-poll resuming the stalled agent on resolve) is DONE,
-/vet + /debrief PASS, pushed to origin/main (`042740b`). `current-slice` = operator-live-unblock (done). NO forced
-next slice — owner's steer. Strongest candidates: (1) escalation TTL/expiry DR, (2) grant-all-matching predicate DR,
-(3) onboarding (needs audience + DR), (4) a live-op end-to-end demo of the three operator actions. High autonomy ON.
-For any #[cfg(unix)] work, lint on WSL; run host+WSL vet sequentially.**
+**NEXT ACTION → DR-034 (live-unblock) + DR-035 (escalation TTL + grant-all) all shipped, every slice /vet +
+/debrief PASS, pushed to origin/main (`6a8a44b`). `current-slice` = escalation-grant-all (done); DR-035 arc
+complete. NO forced next — owner's steer. Strongest candidates: (1) wire `--scope` on the resolve-permit CLI
+(trivial, no DR — the MCP arg exists but the CLI only got --ttl-ms), (2) onboarding (needs audience + DR), (3) a
+live-op end-to-end demo of the operator actions, (4) a different roadmap phase (benchmark DR-022; macOS/Windows
+backends). High autonomy ON. DR-035 work is host-lintable; DR-034's #[cfg(unix)] bodies need WSL clippy.**

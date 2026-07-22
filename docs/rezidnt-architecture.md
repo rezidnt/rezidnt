@@ -239,7 +239,7 @@ Verifier packs are separate crates/repos. The generic packs are open; domain jud
 
 **Socket protocol.** UDS at `$XDG_RUNTIME_DIR/rezidnt.sock` (fallback `~/.local/state/rezidnt/`); Windows named pipe `\\.\pipe\rezidnt`. JSONL frames; first frame is a versioned hello `{proto: 1, schema: <ontology hash>, daemon: <semver>}`; mismatched proto majors disconnect with a machine-readable upgrade hint. The CLI, TUI, and future Tauri client are all just consumers of this protocol — no privileged in-process clients (I1).
 
-**CLI.** `rezidnt open <repo|spec>` (materialize), `status`, `tail [--subject …]`, `vet <agent-spec>`, `debrief <session|run>`, `gate why <run>`, `rebuild`, `doctor`, `spec init`. Global `--json` on every verb; stable exit codes (BINDING, ratified by DR-004): **0** ok · **1** unexpected internal error · **2** local input/usage error (clap convention; daemon never reached) · **3** substrate fault, including daemon-side refusals · **4** daemon unreachable · **5** gate-fail (`vet`/`debrief`/`pre_merge` verdict `fail`; `inconclusive` is NOT 5 — it is 3, never coerced toward pass or fail, per I6). Lore vocabulary stops at `vet`, `debrief`, and `dossier` (BINDING) — everything else stays boring on purpose.
+**CLI.** `rezidnt open <repo|spec>` (materialize), `status`, `tail [--subject …]`, `vet <agent-spec>`, `debrief <session|run>`, `gate why <run>`, `rebuild`, `doctor`, `spec init`, `init` (the onboarding entry: `doctor` → `spec init` → `open`; `doctor`/`spec init`/`init` all implemented by [DR-036](decisions/DR-036-operator-onboarding.md)). Global `--json` on every verb; stable exit codes (BINDING, ratified by DR-004): **0** ok · **1** unexpected internal error · **2** local input/usage error (clap convention; daemon never reached) · **3** substrate fault, including daemon-side refusals · **4** daemon unreachable · **5** gate-fail (`vet`/`debrief`/`pre_merge` verdict `fail`; `inconclusive` is NOT 5 — it is 3, never coerced toward pass or fail, per I6). Lore vocabulary stops at `vet`, `debrief`, and `dossier` (BINDING) — everything else stays boring on purpose.
 
 ## 10. Data plane
 
@@ -287,7 +287,7 @@ verifiers = [
 ]
 ```
 
-`rezidnt spec init` generates this interactively; the golden path must work with the generated file untouched.
+`rezidnt spec init` generates this interactively; the golden path must work with the generated file untouched. Implemented by [DR-036](decisions/DR-036-operator-onboarding.md), which also adds `rezidnt init` (the `doctor` → `spec init` → `open` wrapper) and `docs/quickstart.md` (the narrated one-take demo).
 
 ## 14. Observability
 

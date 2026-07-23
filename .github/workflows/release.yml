@@ -1,0 +1,89 @@
+name: release
+
+# DR-037 sub-slice `release-ci` — the artifact source of truth for the golden-path
+# `curl | sh` install step. Cut a release by pushing a semver tag (e.g. `v0.1.0`):
+# this job cross-compiles the two static `x86_64-unknown-linux-musl` binaries
+# (DR-037 §Decision 2/3, Linux/WSL-first), PROVES they are genuinely static (I7 —
+# the build fails if they are not), strips + checksums them, and publishes them as
+# GitHub Release assets that `install.sh` (sub-slice `install-script`) fetches and
+# verifies against the published sha256. No telemetry, no phone-home (I7). Minimal
+# external-action surface: only first-party `actions/checkout`; `rustup` and `gh` are
+# preinstalled on the runner. A manual `workflow_dispatch` runs the same build+verify
+# WITHOUT publishing, so the pipeline can be smoke-tested before a real tag is cut.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # publish the GitHub Release + upload assets
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    name: build static musl artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "$TARGET"
+
+      - name: Build rezidnt + rezidentd (release, static musl)
+        env:
+          # bundled SQLite (rusqlite) + ring compile their C/asm with musl-gcc.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target "$TARGET" -p rezidnt -p rezidentd
+
+      - name: Stage, strip, and PROVE static (I7 gate)
+        run: |
+          set -eu
+          out="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$out"
+          bindir="target/$TARGET/release"
+          for bin in rezidnt rezidentd; do
+            asset="$bin-$TARGET"
+            cp "$bindir/$bin" "$out/$asset"
+            strip "$out/$asset"
+            finfo=$(file "$out/$asset")
+            echo "$finfo"
+            case "$finfo" in
+              *"statically linked"*|*"static-pie linked"*) : ;;
+              *) echo "::error::$asset is not statically linked (I7 violated)"; exit 1 ;;
+            esac
+            # ldd on a static binary exits non-zero on some hosts; capture, don't pipe.
+            lddout=$(ldd "$out/$asset" 2>&1 || true)
+            case "$lddout" in
+              *"not a dynamic executable"*|*"statically linked"*) : ;;
+              *) echo "::error::ldd reports $asset dynamic (I7 violated): $lddout"; exit 1 ;;
+            esac
+            # The artifact must EXECUTE on this glibc runner (a foreign-libc host —
+            # exactly the install.sh scenario): a static binary needs no host libc.
+            # Only `rezidnt` has a CLI (clap `--version`); `rezidentd` is a bare
+            # daemon with no arg parsing — running it would bind a socket and hang,
+            # so its static-linkage is proven by `file`/`ldd` above, not by execution.
+            if [ "$bin" = "rezidnt" ]; then
+              "$out/$asset" --version || { echo "::error::$asset did not run"; exit 1; }
+            fi
+          done
+
+      - name: Checksums (per-artifact sha256)
+        working-directory: dist
+        run: sha256sum "rezidnt-$TARGET" "rezidentd-$TARGET" | tee SHA256SUMS
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "dist/rezidnt-$TARGET" "dist/rezidentd-$TARGET" dist/SHA256SUMS

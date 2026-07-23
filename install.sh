@@ -58,12 +58,14 @@ VERSION="${REZIDNT_VERSION:-}"
 BASE_URL="${REZIDNT_BASE_URL:-}"
 if [ -z "$BASE_URL" ]; then
   if [ -z "$VERSION" ]; then
-    # Latest-release resolution (the only branch not exercised by the fixture tests;
-    # real use only). Parse tag_name out of the GitHub API without a jq dependency.
+    # Newest-release resolution (real use only; not exercised by the file:// fixture
+    # tests). Use /releases (newest first) NOT /releases/latest — the latter EXCLUDES
+    # pre-releases, and pre-1.0 rezidnt ships only pre-releases. Parse the first
+    # tag_name without a jq dependency.
     command -v curl >/dev/null 2>&1 || { err "curl not found — needed to resolve the latest release."; exit 3; }
-    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1" \
       | grep '"tag_name"' | head -1 | sed -e 's/.*"tag_name":[ ]*"//' -e 's/".*//')
-    [ -n "$VERSION" ] || { err "could not resolve the latest release tag for $REPO."; exit 3; }
+    [ -n "$VERSION" ] || { err "could not resolve the newest release tag for $REPO (no releases yet?)."; exit 3; }
   fi
   BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 fi

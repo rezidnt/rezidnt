@@ -85,7 +85,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Pre-1.0 is a pre-release (honest posture: the golden path is not yet
+          # shippable end-to-end until the Phase-1 exit). Drop this once v1.0.0 ships.
+          prerelease=
+          case "$GITHUB_REF_NAME" in
+            v0.*) prerelease=--prerelease ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
+            $prerelease \
             "dist/rezidnt-$TARGET" "dist/rezidentd-$TARGET" dist/SHA256SUMS

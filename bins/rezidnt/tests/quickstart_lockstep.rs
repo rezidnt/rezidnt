@@ -45,15 +45,23 @@
 //! verified/gated run — one take, zero config edits, single-digit minutes.
 //!
 //! ## How commands are extracted from the doc
-//! `extract_rezidnt_commands` scans the doc line by line, tracking fenced-block
-//! state (a line whose trimmed start is ```` ``` ```` toggles in/out of a fence,
-//! regardless of the info string — ```bash / ```text / ```console all count). INSIDE
-//! a fence, each line is stripped of a leading shell prompt marker (`$ ` or `# `),
-//! then split on whitespace; if the first token is `rezidnt`, the SECOND token is
-//! taken as the subcommand verb (skipping tokens that look like `--flags` so an
-//! invocation like `rezidnt --json init` still yields `init`). Verbs are collected
-//! deduplicated. Prose OUTSIDE fences is never mined for commands (only fenced,
-//! copy-pasteable blocks are the contract).
+//! `rezidnt_invocations` scans the doc line by line, tracking fenced-block state (a
+//! line whose trimmed start is ```` ``` ```` toggles in/out of a fence, regardless of
+//! the info string — ```bash / ```text / ```console all count). INSIDE a fence, each
+//! line is stripped of a leading shell prompt marker (`$ ` or `# `), then split on
+//! whitespace; if the first token is `rezidnt`, the remaining tokens (each trimmed of
+//! trailing shell punctuation) are returned as one invocation. Prose OUTSIDE fences is
+//! never mined (only fenced, copy-pasteable blocks are the contract). Two views are
+//! derived off that:
+//!   - `extract_rezidnt_commands` → the SECOND word, i.e. the top-level verb (the
+//!     first non-`--flag` token after `rezidnt`, so `rezidnt --json init` yields
+//!     `init`).
+//!   - `extract_rezidnt_nested_commands` → the `v1 v2` pair for invocations whose
+//!     THIRD word (`v2`) LOOKS like a sub-verb (lowercase `[a-z][a-z0-9-]*`), so
+//!     `rezidnt gate why <run>` yields `gate why` but `rezidnt debrief <run-ulid>`
+//!     (a `<placeholder>` value, not a sub-verb) yields nothing. This is the two-token
+//!     nested check the single-verb view cannot see: a renamed sub-verb (`gate why` →
+//!     `gate explain`) the doc still shows is drift only this view catches.
 //!
 //! ## How this test locates docs/quickstart.md
 //! `quickstart_path()` walks UP from `CARGO_MANIFEST_DIR` (this crate lives at
@@ -107,12 +115,13 @@ fn read_quickstart() -> String {
     }
 }
 
-/// Extract the set of `rezidnt <verb>` subcommand verbs referenced inside the doc's
-/// FENCED code blocks (```… fences of any info string). Prose outside fences is not
-/// mined. A leading shell prompt (`$ ` / `# `) is stripped; leading `--flags` before
-/// the verb are skipped so `rezidnt --json init` still yields `init`.
-fn extract_rezidnt_commands(doc: &str) -> BTreeSet<String> {
-    let mut verbs = BTreeSet::new();
+/// For each `rezidnt …` invocation inside the doc's FENCED code blocks (```… fences
+/// of any info string), return the token list AFTER the `rezidnt` program word.
+/// Prose outside fences is not mined. A leading shell prompt (`$ ` / `# `) is
+/// stripped; each returned token is trimmed of trailing shell punctuation (`,` `;`
+/// `\`) a narrated command might carry.
+fn rezidnt_invocations(doc: &str) -> Vec<Vec<String>> {
+    let mut invocations = Vec::new();
     let mut in_fence = false;
     for raw in doc.lines() {
         let trimmed = raw.trim_start();
@@ -133,17 +142,51 @@ fn extract_rezidnt_commands(doc: &str) -> BTreeSet<String> {
         if tokens.next() != Some("rezidnt") {
             continue;
         }
-        // The verb is the first non-flag token after `rezidnt`.
-        if let Some(verb) = tokens.find(|t| !t.starts_with('-')) {
-            // Trim trailing shell punctuation (`,` `;` `\`) a narrated command
-            // might carry, so the verb matches the CLI's spelling.
-            let verb = verb.trim_end_matches([',', ';', '\\']);
-            if !verb.is_empty() {
-                verbs.insert(verb.to_string());
-            }
+        let rest: Vec<String> = tokens
+            .map(|t| t.trim_end_matches([',', ';', '\\']).to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        invocations.push(rest);
+    }
+    invocations
+}
+
+/// The set of top-level `rezidnt <verb>` subcommand verbs referenced in the doc's
+/// fenced blocks — the first non-`--flag` token after `rezidnt`, so
+/// `rezidnt --json init` still yields `init`.
+fn extract_rezidnt_commands(doc: &str) -> BTreeSet<String> {
+    rezidnt_invocations(doc)
+        .into_iter()
+        .filter_map(|toks| toks.into_iter().find(|t| !t.starts_with('-')))
+        .collect()
+}
+
+/// A token that LOOKS like a subcommand verb: starts with an ascii lowercase letter
+/// and is otherwise only lowercase letters / digits / `-`. Excludes `--flags`, a
+/// `<placeholder>` value, an uppercase `METAVAR`, a `foo.toml` path, and a ULID — so
+/// the second word of `rezidnt debrief <run-ulid>` is NOT mistaken for a sub-verb.
+fn looks_like_verb(tok: &str) -> bool {
+    tok.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The set of NESTED `rezidnt <v1> <v2>` command pairs in the doc's fenced blocks —
+/// the first two non-`--flag` tokens where `v2` `looks_like_verb` (so `gate why` is
+/// captured but `debrief <run-ulid>` and `init --defaults` are not). Returned as
+/// `"v1 v2"` strings.
+fn extract_rezidnt_nested_commands(doc: &str) -> BTreeSet<String> {
+    let mut nested = BTreeSet::new();
+    for toks in rezidnt_invocations(doc) {
+        let mut nonflag = toks.iter().filter(|t| !t.starts_with('-'));
+        if let (Some(v1), Some(v2)) = (nonflag.next(), nonflag.next())
+            && looks_like_verb(v2)
+        {
+            nested.insert(format!("{v1} {v2}"));
         }
     }
-    verbs
+    nested
 }
 
 /// Drive the REAL binary with `<verb> --help` and report whether clap RECOGNIZES
@@ -161,6 +204,23 @@ fn cli_recognizes_verb(verb: &str) -> bool {
     !(stderr.contains("unrecognized subcommand")
         || stderr.contains("invalid subcommand")
         || stderr.contains("unexpected argument"))
+}
+
+/// Drive the REAL binary with `<v1> <v2> --help` and report whether clap RECOGNIZES
+/// the NESTED subcommand. Unlike the top-verb probe this is LENIENT about
+/// "unexpected argument": that phrasing means `v1` takes no subcommand and `v2` was
+/// merely a positional arg (not nested drift), so it does NOT fail here. It fails
+/// ONLY on clap's unknown-subcommand phrasing — the real signal that `v1` HAS
+/// subcommands and `v2` is not one (a renamed/dropped sub-verb the doc still shows).
+fn cli_recognizes_nested(v1: &str, v2: &str) -> bool {
+    let out = Command::new(env!("CARGO_BIN_EXE_rezidnt"))
+        .arg(v1)
+        .arg(v2)
+        .arg("--help")
+        .output()
+        .expect("spawn the rezidnt binary for a nested --help probe");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    !(stderr.contains("unrecognized subcommand") || stderr.contains("invalid subcommand"))
 }
 
 /// Lowercased doc, for case-insensitive anchor matching.
@@ -204,6 +264,33 @@ fn every_documented_rezidnt_command_is_a_real_cli_verb() {
             "quickstart command `rezidnt {verb}` is not a real CLI subcommand — the doc has \
              DRIFTED from the shipped CLI (§1/§18 lockstep): every `rezidnt <verb>` in \
              {QUICKSTART_REL} must be a verb the binary recognizes"
+        );
+    }
+}
+
+/// Every NESTED `rezidnt <verb> <subverb>` in the doc's fenced blocks (e.g.
+/// `gate why`) MUST be a real nested subcommand the shipped CLI recognizes — the
+/// two-token form `every_documented_rezidnt_command_is_a_real_cli_verb` cannot see
+/// (it checks only the top verb `gate`). A renamed sub-verb the doc still shows
+/// (`gate why` → `gate explain`) is DRIFT this catches. Pins `gate why` present so
+/// the guard has teeth (§9 interrogability — the "first gated run" step).
+#[test]
+fn every_documented_nested_rezidnt_command_is_real() {
+    let doc = read_quickstart();
+    let nested = extract_rezidnt_nested_commands(&doc);
+    assert!(
+        nested.contains("gate why"),
+        "quickstart must show the nested `rezidnt gate why <run>` interrogation (§9 \
+         interrogability — the 'first gated run' step): no `rezidnt gate why` invocation \
+         found in {QUICKSTART_REL}, so the nested-drift guard would be vacuous"
+    );
+    for pair in &nested {
+        let (v1, v2) = pair.split_once(' ').expect("nested pair is `v1 v2`");
+        assert!(
+            cli_recognizes_nested(v1, v2),
+            "quickstart command `rezidnt {pair}` is not a real nested subcommand — the doc \
+             has DRIFTED from the shipped CLI (§1/§18 lockstep): every `rezidnt <verb> \
+             <subverb>` in {QUICKSTART_REL} must be a nested verb the binary recognizes"
         );
     }
 }

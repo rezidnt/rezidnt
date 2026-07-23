@@ -186,3 +186,56 @@ fn unwritable_socket_path_is_not_pass() {
          never coerced to pass) — it must be `fail` or `inconclusive`. check status was: {s}"
     );
 }
+
+/// PRECEDENCE leg — the two seams DIVERGE: `REZIDNT_LOCKFILE`'s parent is WRITABLE
+/// while `REZIDNT_SOCKET`'s parent is NOT (0o555). The check prefers the LOCKFILE
+/// (the path this CLI's `lockfile_path()` is authoritative about; a dead socket is
+/// `open`'s exit-4 concern, not a doctor gate), so it must probe the writable
+/// lockfile parent and report `pass` — a SOCKET-first probe would fail on the
+/// unwritable socket parent. Asserting `pass` pins the `REZIDNT_LOCKFILE`-first
+/// precedence the retired socket-first probe left untested.
+///
+/// (The `pass` verdict is the correct answer for a lockfile-first probe regardless
+/// of the runner's uid; under root the 0o555 socket parent stays writable, so this
+/// leg no longer DISCRIMINATES against a hypothetical socket-first regression there —
+/// but it never false-greens, matching this file's root-tolerance philosophy.)
+#[test]
+fn divergent_parents_probe_lockfile_not_socket() {
+    // Socket parent: stripped of its write bit — a socket-first probe would fail here.
+    let sock_parent = tempfile::tempdir().expect("socket-parent tempdir");
+    let mut perms = std::fs::metadata(sock_parent.path())
+        .expect("stat socket parent")
+        .permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(sock_parent.path(), perms).expect("chmod socket parent read-only");
+
+    // Lockfile parent: a distinct, writable dir — the path a lockfile-first probe uses.
+    let lock_parent = tempfile::tempdir().expect("lockfile-parent tempdir");
+
+    let sock = sock_parent.path().join("rezidnt.sock");
+    let lock = lock_parent.path().join("mcp.lock");
+    let (code, stdout, stderr) = run_doctor_json(&[
+        ("REZIDNT_SOCKET", sock.to_str().unwrap()),
+        ("REZIDNT_LOCKFILE", lock.to_str().unwrap()),
+    ]);
+    assert_not_clap_usage_error(&stderr);
+
+    let checks = parse_checks(&stdout, &stderr, code);
+    let check = writable_check(&checks);
+    let s = status_of(&check);
+
+    // Restore perms BEFORE asserting so a panic never leaks an undeletable tempdir.
+    if let Ok(md) = std::fs::metadata(sock_parent.path()) {
+        let mut p = md.permissions();
+        p.set_mode(0o755);
+        let _ = std::fs::set_permissions(sock_parent.path(), p);
+    }
+
+    assert_eq!(
+        s, "pass",
+        "with REZIDNT_LOCKFILE under a WRITABLE parent and REZIDNT_SOCKET under a NON-writable \
+         one (0o555), the check must PROBE THE LOCKFILE parent (REZIDNT_LOCKFILE-first \
+         precedence) and report `pass` — a socket-first probe would have failed on the \
+         unwritable socket parent. check: {check:#}"
+    );
+}

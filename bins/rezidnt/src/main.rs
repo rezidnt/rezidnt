@@ -157,6 +157,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OperatorCmd,
     },
+    /// MCP over stdio for a local client (Claude Code) to spawn (§9 stdio
+    /// transport; §16 S3 connection path). A thin stdio↔loopback-HTTP JSON-RPC
+    /// PROXY to the resident daemon: it reads the 0600 lockfile (loopback port +
+    /// operator badge), forwards each stdin JSON-RPC request to
+    /// `127.0.0.1:<port>/mcp`, and relays the response to stdout. I3 forces this to
+    /// be a PROXY — a Claude-spawned subprocess cannot own the daemon's single
+    /// writer, so the surface itself stays resident in `rezidentd`. It injects the
+    /// operator badge into MUTATING tool calls so the client never handles the
+    /// token (§12; 0600 lockfile ⇒ possession = the local user). I7: reuses the
+    /// hand-rolled `loopback_post` (no HTTP crate). Exits 4 (daemon-unreachable) if
+    /// the lockfile is absent at startup; 0 on stdin EOF. Not a separate binary (I7).
+    Mcp,
     /// The permit Policy Enforcement Point (DR-014 §Decision 1). claude-code's
     /// `PreToolUse` hook config invokes this: it reads the tool descriptor on
     /// stdin, asks the daemon PDP over `REZIDNT_SOCKET`, and writes the
@@ -376,6 +388,11 @@ fn main() {
         // internally; a hard error here (unreadable stdin / stdout write) is an
         // unexpected internal fault → 1.
         Cmd::PermitHook => (1, permit_hook::run()),
+        // `mcp` proxies stdio JSON-RPC to the daemon's loopback-HTTP MCP. It OWNS
+        // its DR-004 exit codes and exits internally (4 daemon-unreachable at
+        // startup, 0 on stdin EOF); an unexpected IO fault (stdin read / stdout
+        // write) folds into 1 via the table.
+        Cmd::Mcp => (1, mcp_serve()),
     };
     if let Err(e) = result {
         eprintln!("rezidnt: {e:#}");
@@ -1843,6 +1860,107 @@ fn operator_resolve_permit(
         std::process::exit(5);
     }
     println!("resolved permit for run {run} ({decision})");
+    std::process::exit(0);
+}
+
+/// The MUTATING MCP tools — a `tools/call` for one of these needs a badge (§12).
+/// The proxy injects the operator badge for these (unless the caller supplied one);
+/// read-class tools (`gate_explain`, `tail_events`) and non-`tools/call` methods pass
+/// through untouched (their arg structs would reject an unknown `badge` field).
+const MUTATING_MCP_TOOLS: &[&str] = &[
+    "open_project",
+    "spawn_agent",
+    "kill_run",
+    "resolve_permit",
+    "request_permission",
+];
+
+/// Inject the operator `badge` into a `tools/call` for a MUTATING tool that did not
+/// already carry one, so a local client (Claude Code) never handles the token (§12).
+/// Everything else is returned unchanged. An unparseable line is the caller's to
+/// forward verbatim (the daemon judges it), signalled by an `Err`.
+fn inject_operator_badge(line: &str, badge: &str) -> anyhow::Result<String> {
+    let mut v: serde_json::Value = serde_json::from_str(line)?;
+    if v.get("method").and_then(|m| m.as_str()) == Some("tools/call") {
+        let name = v["params"]["name"].as_str().unwrap_or_default();
+        if MUTATING_MCP_TOOLS.contains(&name) {
+            let args = &mut v["params"]["arguments"];
+            if args.is_null() {
+                *args = serde_json::json!({});
+            }
+            if let Some(obj) = args.as_object_mut() {
+                obj.entry("badge")
+                    .or_insert_with(|| serde_json::Value::String(badge.to_string()));
+            }
+        }
+    }
+    Ok(serde_json::to_string(&v)?)
+}
+
+/// `rezidnt mcp` (§16 S3 / §9 stdio transport) — the stdio↔loopback-HTTP JSON-RPC
+/// PROXY. Reads the 0600 lockfile for the daemon's loopback port + operator badge,
+/// then serves line-delimited JSON-RPC on stdio: each request is forwarded to the
+/// daemon's `/mcp` (operator badge injected for mutating tools, §12), the response
+/// relayed to stdout. Fails closed to exit 4 (daemon-unreachable) if the lockfile is
+/// unreadable at startup. A mid-session loopback failure becomes a JSON-RPC error for
+/// that request id (fail-closed, but keeps serving — the daemon may return). Reuses
+/// `loopback_post` (I7 — no HTTP crate); cross-platform (loopback TCP + stdio).
+fn mcp_serve() -> anyhow::Result<()> {
+    use std::io::{BufRead as _, Write as _};
+
+    let path = lockfile_path();
+    let lock = match rezidnt_mcp::lockfile::read(&path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!(
+                "rezidnt: daemon unreachable: cannot read MCP lockfile {}: {e}",
+                path.display()
+            );
+            std::process::exit(4);
+        }
+    };
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line.context("read stdin JSON-RPC line")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Inject the operator badge into mutating calls; an unparseable line is
+        // forwarded verbatim (the daemon returns the JSON-RPC parse error).
+        let forward = inject_operator_badge(&line, &lock.badge).unwrap_or_else(|_| line.clone());
+        match loopback_post(lock.port, &forward) {
+            Ok(body) => {
+                let body = body.trim();
+                // A notification (no id) draws no response body; relay only non-empty.
+                if !body.is_empty() {
+                    writeln!(stdout, "{body}").context("write JSON-RPC response")?;
+                    stdout.flush().context("flush JSON-RPC response")?;
+                }
+            }
+            Err(e) => {
+                // Mid-session daemon loss: answer this request with a JSON-RPC error
+                // (fail-closed) but keep serving. A notification (no id) gets nothing.
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                if !id.is_null() {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": format!("rezidnt daemon unreachable: {e:#}"),
+                        },
+                    });
+                    writeln!(stdout, "{err}").context("write JSON-RPC error")?;
+                    stdout.flush().ok();
+                }
+            }
+        }
+    }
     std::process::exit(0);
 }
 

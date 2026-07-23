@@ -14,13 +14,17 @@ The bar we hold ourselves to: one take, zero config edits, single-digit minutes.
 
 ## 1. Install
 
-The golden path is a one-line install of a single static binary — no runtime dependencies, no telemetry. Once released this will be:
+The golden path is a one-line install of two static binaries — no runtime dependencies, no telemetry. On Linux or Windows+WSL2:
 
 ```bash
-curl -fsSL https://rezidnt.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rezidnt/rezidnt/main/install.sh | sh
 ```
 
-That endpoint is the intended distribution channel and is not yet live from this repository. Until it is, build the same binary from source:
+This fetches the newest release's static `x86_64-unknown-linux-musl` binaries, verifies them against their published `SHA256SUMS` **before** installing (it fails closed and installs nothing on a mismatch), and drops `rezidnt` and `rezidentd` in `~/.local/bin` (override with `REZIDNT_INSTALL_DIR`). It installs on Linux/WSL only — macOS and native Windows are not yet supported, and the installer refuses any other platform rather than half-installing. (A friendlier `rezidnt.dev/install.sh` vanity URL is planned; the raw GitHub URL above is the one that works today.)
+
+rezidnt is pre-1.0: releases are marked **pre-release** (early access), and the installer resolves the newest one. The install step itself is real; the full one-take demo lands at the Phase-1 exit as the rest of the golden path is completed.
+
+Prefer to build from source, or on a platform the installer doesn't cover? With a Rust toolchain:
 
 ```bash
 cargo install --path bins/rezidnt

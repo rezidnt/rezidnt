@@ -1866,7 +1866,10 @@ fn operator_resolve_permit(
 /// The MUTATING MCP tools — a `tools/call` for one of these needs a badge (§12).
 /// The proxy injects the operator badge for these (unless the caller supplied one);
 /// read-class tools (`gate_explain`, `tail_events`) and non-`tools/call` methods pass
-/// through untouched (their arg structs would reject an unknown `badge` field).
+/// through untouched. The safety comes from scoping injection to THIS set — not from
+/// any daemon-side rejection of a stray field (the daemon reads args off a JSON value
+/// and would silently ignore an unknown `badge`), so the proxy must never add one to a
+/// read-class call in the first place.
 const MUTATING_MCP_TOOLS: &[&str] = &[
     "open_project",
     "spawn_agent",

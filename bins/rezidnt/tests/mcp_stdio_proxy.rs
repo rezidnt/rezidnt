@@ -16,8 +16,10 @@
 //!      §12 — mutating calls need a badge), so the client never handles the token.
 //!   2. **Read-class pass-through.** A `tools/call` for a read-class tool
 //!      (`gate_explain`/`tail_events`, DR-005 unbadged) and non-tools/call methods
-//!      (`initialize`) are forwarded UNCHANGED — no badge injected (their arg structs
-//!      would reject an unknown field).
+//!      (`initialize`) are forwarded UNCHANGED — no badge injected. The proxy's safety
+//!      is that it scopes injection to the mutating set; the daemon would silently
+//!      IGNORE a stray `badge` (it reads args off a JSON value, no `deny_unknown_fields`),
+//!      so the proxy must simply never add one to a read-class call.
 //!
 //! And the framing: each stdin JSON-RPC line yields exactly one stdout JSON-RPC line,
 //! ids preserved, in order.
@@ -77,24 +79,89 @@ fn fake_mcp_server(expect: usize) -> (u16, mpsc::Receiver<String>) {
             let mut body = vec![0u8; content_len];
             reader.read_exact(&mut body).expect("read body");
             let body = String::from_utf8(body).expect("utf8 body");
-            // Echo the JSON-RPC id back in a minimal result.
-            let id = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-                .unwrap_or(serde_json::Value::Null);
-            let resp =
-                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}).to_string();
-            let http = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                resp.len(),
-                resp
-            );
+            // Model the daemon faithfully: a REQUEST (has `id`) draws a JSON-RPC
+            // result; a NOTIFICATION (no `id`) draws an empty 202 (the real daemon
+            // frames Content-Length: 0), so the proxy's no-response-line suppression
+            // path is exercised, not merely reasoned about.
+            let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+            let has_id = parsed.as_ref().is_some_and(|v| v.get("id").is_some());
+            let http = if has_id {
+                let id = parsed.and_then(|v| v.get("id").cloned()).unwrap();
+                let resp =
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}).to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp.len(),
+                    resp
+                )
+            } else {
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
             stream.write_all(http.as_bytes()).expect("write resp");
             stream.flush().ok();
             tx.send(body).expect("record request");
         }
     });
     (port, rx)
+}
+
+/// A fake `/mcp` server that serves `serve_ok` requests normally, then simulates a
+/// daemon that DIES mid-session: on the next connection it reads the request (so the
+/// proxy's write completes) and closes without a valid response, so the proxy's
+/// `loopback_post` fails and it must answer that request with a JSON-RPC error
+/// (fail-closed) and keep serving. Returns the bound port.
+fn fake_mcp_server_dropping(serve_ok: usize) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake /mcp");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        let mut served = 0usize;
+        for conn in listener.incoming() {
+            let mut stream = match conn {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            // Drain the request head + body so the client's write completes cleanly.
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let l = line.trim_end();
+                if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_len = v.trim().parse().unwrap_or(0);
+                }
+                if l.is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_len];
+            let _ = reader.read_exact(&mut body);
+            if served < serve_ok {
+                let id = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&body))
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                let resp =
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}).to_string();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp.len(),
+                    resp
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.flush();
+                served += 1;
+            } else {
+                // The daemon "dies": drop the connection with no response.
+                drop(stream);
+                break;
+            }
+        }
+    });
+    port
 }
 
 /// Write a lockfile (via the real `write_atomic`) pointing the proxy at `port` with a
@@ -201,11 +268,12 @@ fn proxy_forwards_and_injects_badge_only_for_mutating_tools() {
         "open_project (mutating) must have the operator badge injected from the lockfile: {}",
         parsed[1]
     );
-    // 3) gate_explain (READ-CLASS) left untouched — no badge injected.
+    // 3) gate_explain (READ-CLASS) left untouched — no badge injected. (The daemon
+    // would ignore a stray badge, so the guarantee is that the proxy never adds one.)
     assert!(
         parsed[2]["params"]["arguments"].get("badge").is_none(),
-        "gate_explain (read-class) must be forwarded WITHOUT a badge (its arg struct \
-         would reject an unknown field): {}",
+        "gate_explain (read-class) must be forwarded WITHOUT a badge — the proxy scopes \
+         injection to the mutating set: {}",
         parsed[2]
     );
 }
@@ -251,5 +319,91 @@ fn proxy_exits_4_when_daemon_lockfile_is_absent() {
         code,
         Some(4),
         "proxy must exit 4 (daemon-unreachable) when the lockfile is absent/unreadable"
+    );
+}
+
+/// A JSON-RPC NOTIFICATION (no `id`) draws no response from the daemon, so the proxy
+/// must write NOTHING to stdout for it — while still forwarding it. Proves the
+/// suppression path against a faithful daemon (empty 202), not merely reasoning.
+#[test]
+fn proxy_suppresses_output_for_a_notification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (port, rx) = fake_mcp_server(2);
+    let lock = write_lockfile(dir.path(), port, BADGE);
+
+    let reqs = [
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, // notification: no id
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"gate_explain","arguments":{"run":"01JQ"}}}"#,
+    ];
+    let (code, stdout) = run_proxy(&lock, &reqs);
+    assert_eq!(code, Some(0));
+
+    // Both were forwarded to the daemon...
+    let f1 = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("fwd 1");
+    let f2 = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("fwd 2");
+    assert!(
+        f1.contains("notifications/initialized") || f2.contains("notifications/initialized"),
+        "the notification must still be forwarded to the daemon"
+    );
+    // ...but only the id-bearing request drew a stdout line.
+    assert_eq!(
+        stdout.len(),
+        1,
+        "a notification draws no daemon response, so the proxy writes no line for it; got: {stdout:?}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout[0]).unwrap();
+    assert_eq!(
+        v["id"],
+        serde_json::json!(9),
+        "the only stdout line is the id-bearing request's response"
+    );
+}
+
+/// Mid-session daemon loss is FAIL-CLOSED: when the daemon dies, the proxy answers the
+/// in-flight request with a JSON-RPC error (never a silent hang, I6) carrying that
+/// request's id, and KEEPS SERVING — it reaches stdin EOF and exits 0.
+#[test]
+fn proxy_errors_and_keeps_serving_on_midsession_daemon_loss() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = fake_mcp_server_dropping(1); // serves req 1, drops req 2's connection
+    let lock = write_lockfile(dir.path(), port, BADGE);
+
+    let reqs = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gate_explain","arguments":{"run":"a"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"gate_explain","arguments":{"run":"b"}}}"#,
+    ];
+    let (code, stdout) = run_proxy(&lock, &reqs);
+
+    assert_eq!(
+        code,
+        Some(0),
+        "the proxy must reach stdin EOF and exit 0 even after a mid-session daemon loss"
+    );
+    assert_eq!(
+        stdout.len(),
+        2,
+        "both requests draw a stdout line (a result, then an error): {stdout:?}"
+    );
+    let r1: serde_json::Value = serde_json::from_str(&stdout[0]).unwrap();
+    assert_eq!(r1["id"], serde_json::json!(1));
+    assert!(
+        r1.get("result").is_some(),
+        "req 1 got a normal result: {}",
+        stdout[0]
+    );
+    let r2: serde_json::Value = serde_json::from_str(&stdout[1]).unwrap();
+    assert_eq!(
+        r2["id"],
+        serde_json::json!(2),
+        "the error must carry the failed request's id (not null)"
+    );
+    assert!(
+        r2.get("error").is_some(),
+        "req 2 (daemon dead) must get a JSON-RPC error, not a hang: {}",
+        stdout[1]
     );
 }

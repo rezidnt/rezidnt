@@ -1,92 +1,95 @@
-# Handoff — 2026-07-22 (session 21: --scope CLI + live-op demo + DR-036 onboarding arc ALL shipped)
+# Handoff — 2026-07-23 (session 22: two DR-036 follow-ups + the WHOLE DR-037 installer arc — golden-path `curl` install is now REAL)
 
 ## State of play
-Cold-started from session 20's handoff (DR-034 live-unblock + DR-035 TTL/grant-all complete). Owner steered
-"live op, then we will focus on onboarding." Delivered both and the whole onboarding arc. Everything /vet + /debrief
-PASS, pushed to `origin/main` (synced, `5b36157`). High autonomy ON ([[autonomy-high-trust]]). `current-slice` =
-`quickstart` (**done** — the last slice of the DR-036 arc; the arc is COMPLETE).
+Cold-started from session 21's handoff (DR-036 onboarding arc complete). Owner steered toward the installer.
+Delivered: two non-blocking DR-036 follow-ups, then the full **DR-037 installer arc drafted → ratified → 3 slices
+shipped**, culminating in a published **`v0.0.1` pre-release** and a `curl | sh` install PROVEN end-to-end. Everything
+/vet + /debrief PASS, pushed to `origin/main` (synced, `a50e576`). High autonomy ON ([[autonomy-high-trust]]).
+`current-slice` = `quickstart-real` (**done** — last slice of the DR-037 arc; the arc is COMPLETE).
 
-Five units shipped this session, each through the full loop:
-1. **`--scope` CLI flag** (`e295887`) — DR-035 §Decision 2 parity: `rezidnt operator resolve-permit --scope run_tool`
-   (the MCP arg existed; the CLI only had `--ttl-ms`). Thin verbatim pass-through; daemon owns the semantics.
-2. **Live-op e2e demo** (`5ff5941`) — `bins/rezidentd/tests/operator_liveops_e2e.rs`: every operator action driven
-   against a REAL daemon through the REAL `rezidnt` CLI (resolve allow/deny, live-unblock, TTL-boxed, `--scope`
-   broad grant, kill-run, coupling-guard refusal). First live-daemon exercise of the `--scope`/`--ttl-ms` flags.
-3. **DR-036 ACCEPTED** (`6596395`) — operator onboarding arc (audience + scope owner-settled: operator adopting
-   rezidnt; command AND docs; fullest command scope = doctor + init wrapper; docs under `docs/`).
-4. **The 4-slice arc** — `spec-init` (`e48a01a`), `onboarding-doctor` (`b848e4d`), `init-wrapper` (`6735ffa`),
-   `quickstart` (`a18e353`).
-5. **DR-036 §9/§13 amendments** (`5b36157`) — CLI verb list + spec-init sentence updated now the verbs are real.
+The §1/§18 BINDING golden path's FIRST step — `curl` install — is now real (it was aspirational after DR-036 shipped
+every OTHER step). DR-036 closed "zero config edits"; DR-037 closes the install step.
 
-## What the onboarding arc built (the golden path's "zero config edits" clause is now MET)
-Before this, an operator on a cold machine could not reach `rezidnt open` with zero config — the §9/§13-specified
-`rezidnt spec init` generator did not exist. Now, all in the ONE `rezidnt` binary (I7), plain-CLI (I1, no TUI),
-fact-free/daemon-free except the `open` step (I3), no telemetry (I7):
-- **`rezidnt spec init [DIR] [--defaults] [--force]`** — interactive generator writing a §13 `rezidnt.toml` the
-  golden path opens UNTOUCHED. Anti-drift: re-parses its own output through the real `rezidnt_run::spec::ProjectSpec`
-  before writing. Bare-verb clobber guard = exit 2 without `--force`.
-- **`rezidnt doctor [--json]`** — read-only §11 preflight (`git`/`harness`/`socket-lockfile-writable`/`wsl`).
-  I6 never-coerce: undeterminable → `inconclusive`, NEVER `pass`. Exit 0 all-pass / 3 any non-pass / never 5.
-- **`rezidnt init [DIR] [--defaults] [--force]`** — the entry: chains `doctor → spec init → open` in-process. Gate on
-  fail (abort 3), warn on inconclusive+proceed (owner-settled). Wrapper clobber nuance: existing spec w/o `--force`
-  → SKIP + open (byte-unchanged), NOT bare-verb's exit 2.
-- **`docs/quickstart.md`** — the narrated one-take demo, kept honest by a lockstep test
-  (`bins/rezidnt/tests/quickstart_lockstep.rs`) that mines every `rezidnt <verb>` and drives the shipped binary so
-  the doc can't drift from the CLI.
+## What shipped this session (each through the full loop)
+1. **Two DR-036 follow-ups** (`724068b`) — nested-verb lockstep coverage (`quickstart_lockstep.rs` now catches drift
+   in `gate why`, not just `gate`) + the `check_socket_writable` REZIDNT_LOCKFILE-first divergent-parent pin
+   (`doctor_socket_unix.rs`). /vet + /debrief PASS.
+2. **DR-037 ACCEPTED** (`0aefd51`) — distribution/release posture; plan wired (§1/§16/§18 amended-by pointers +
+   §18 risk row + §20 index, next-record → DR-038). Owner-settled: Linux/WSL-first; `x86_64-unknown-linux-musl` only
+   (aarch64 deferred); TWO static binaries this arc (the pre-existing reality — the combined multi-call binary is a
+   NAMED follow-up, NOT an I7 per-artifact re-read); raw GitHub-asset endpoint; DR-007 is a naming collision (its
+   `release_worktree` is a runtime trait, unrelated).
+3. **`release-ci`** (`0137bcf` + `21afaef` SHA-pin) — `.github/workflows/release.yml` (repo's FIRST CI): on a semver
+   tag, cross-compiles both static musl binaries, self-gates on I7 (fails if `file`/`ldd` show non-static), strips,
+   emits `SHA256SUMS`, publishes as Release assets (`v0.*` → `--prerelease`). Observed GREEN on GitHub.
+4. **`install-script`** (`90d11f9`) — clean-room POSIX-sh `install.sh` (repo root) + `bins/rezidnt/tests/curl_sh_unix.rs`
+   (`#[cfg(unix)]`, fixture-driven via `file://`). Verifies sha256 BEFORE install (fail-closed, no partial install),
+   Linux/WSL+x86_64 gate with plain refusal, no telemetry.
+5. **Pre-release prep** (`4380c77`) — `v0.*`→prerelease in the workflow; `install.sh` resolves newest via `/releases`
+   (NOT `/releases/latest`, which excludes pre-releases).
+6. **`v0.0.1` cut** (tag pushed) — workflow ran green INCLUDING publish; **`v0.0.1` is a live pre-release** (assets:
+   `rezidnt-x86_64-unknown-linux-musl`, `rezidentd-x86_64-unknown-linux-musl`, `SHA256SUMS`). Real `curl | sh` PROVEN
+   end-to-end (resolves v0.0.1 via /releases, https fetch, sha256 verify, both bins install, `rezidnt --version`→0.0.1).
+7. **`quickstart-real`** (`a50e576`) — flipped `docs/quickstart.md`'s install block from "not yet live" to the live
+   `curl -fsSL https://raw.githubusercontent.com/rezidnt/rezidnt/main/install.sh | sh`, with honest pre-release/Phase-1
+   framing. /debrief PASS (prose honesty is a hand-held obligation — the lockstep judge doesn't cover install prose).
 
-## Reusable seams worth knowing (for the next slice/test author)
-- `rezidnt_testkit::cli_bin()` locates the real `rezidnt` binary (sibling of `daemon_bin()`), so a cross-crate test
-  can drive the actual operator/onboarding CLI, not just the socket/MCP doors. Used by the live-op + init e2e.
-- The daemon resolves `spec.repo` against ITS OWN cwd (`bins/rezidentd/src/runs.rs:~565`). A default spec's
-  `repo="."` therefore materializes the DAEMON's cwd, not the spec dir — so `spec_init_open_e2e.rs`/`init_wrapper_e2e.rs`
-  either splice the tempdir's ABSOLUTE path into the generated `repo` (spec-init e2e) or start the daemon with
-  `current_dir` = the scaffolded repo + a `claude` stub on its PATH (init e2e). New e2e tests: reuse one of these.
-- `run_doctor_checks()` and `generate_spec()` are factored out of `doctor()`/`spec_init()` for reuse — `init` calls
-  them directly. `check_socket_writable` now prefers `REZIDNT_LOCKFILE` over `REZIDNT_SOCKET` (the path this CLI is
-  authoritative about; a dead socket is `open`'s exit-4 concern, not a doctor gate).
-
-## Next action (owner's steer — DR-036 arc COMPLETE, nothing gated)
-No forced next. `current-slice` sits at `quickstart` (done); the onboarding arc is finished. Natural options:
-1. **Non-blocking follow-ups from this arc's debriefs** (both auditor-noted, low priority, no DR):
-   - `quickstart_lockstep.rs` extractor checks only the FIRST verb token, so a nested sub-verb (`gate why`) is
-     verified only as `gate`. Extend to the two-token form to catch nested drift. (`bins/rezidnt/tests/quickstart_lockstep.rs:~136`)
-   - The `check_socket_writable` REZIDNT_LOCKFILE-first precedence has no test pinning the divergent-parent case
-     (socket parent ≠ lockfile parent). Add one small pin.
-2. **A real `curl | sh` installer** — `docs/quickstart.md` frames it as "intended, not yet live"; building the actual
-   install script + release would make the golden path's install step real (currently `cargo install --path` is the
-   works-today path). Likely needs a DR (release/distribution posture).
-3. Other roadmap phase: benchmark harness (DR-022), macOS/Windows sandbox+egress backends, the operator `--scope`
-   ergonomics elsewhere.
+## Reusable knowledge (for the next author)
+- **musl toolchain is now installed on WSL** (Ubuntu-24.04): `musl-tools` + the `x86_64-unknown-linux-musl` target.
+  Build recipe (proven): from repo root, `export CC_x86_64_unknown_linux_musl=musl-gcc` then
+  `cargo build --release --target x86_64-unknown-linux-musl -p rezidnt -p rezidentd`. Static works because no OpenSSL
+  anywhere (rustls/rcgen use `ring`), `portable-pty` is unlinked, `rusqlite` bundles SQLite (compiles under musl-gcc).
+  Full recipe + release-workflow details in [[installer-arc-progress]].
+- **Windows UAC install-name trap**: a host test file `install_script_unix.rs` failed with os error 740 (Windows flags
+  `*install*`/`*setup*`/`*update*`/`*patch*` exes for elevation). Renamed → `curl_sh_unix.rs`. Heed PROACTIVELY when
+  naming any installer/updater test ([[windows-test-binary-update-uac]], description broadened this session).
+- `rezidentd` is a bare daemon with NO clap/`--version` (bare `unix_daemon::run()` shim) — never execute it as a smoke
+  test (it binds a UDS and hangs); prove its staticness via `file`/`ldd` only. The release workflow's run-smoke is
+  guarded to `rezidnt` only.
+- `gh` is authed (account `smithdak`); `gh workflow run release.yml --ref main` runs a build+verify dispatch WITHOUT
+  publishing (publish gates on `refs/tags/`).
 
 ## Open /debrief findings (NON-BLOCKING, none blocks done)
-- spec-init: the e2e took 4 debrief rounds purely on test-doc honesty (stale RED-first framing leaking into a live
-  assertion message + an e2e opening the daemon's cwd repo instead of the scaffolded tempdir). All remediated. The
-  host `spec_init_cli.rs` still carries oracle "RED today" DOCSTRING framing (auditor ruled non-blocking, matches the
-  committed `operator_resolve_permit_cli.rs` idiom); reword to past tense if that file is next touched.
-- init-wrapper: `check_socket_writable` REZIDNT_SOCKET→REZIDNT_LOCKFILE swap adjudicated SOUND (not a mask); the
-  divergent-parent path of the retired socket-first probe is now untested (see follow-up 1 above).
+- **quickstart internal-consistency** (auditor-flagged, deferred): `docs/quickstart.md`'s "What you just saw" section
+  (~lines 104-108) + the "one take … single-digit minutes" bar still narrate steps 2-5 as fully working today; only the
+  new line-25 hedge admits the full path isn't live until the Phase-1 exit. NOT a violation (the install block itself is
+  honest; steps 2-5 are real DR-036 verbs) — but worth a scribe pass to soften the demo narration when S1/S3 close.
+- **install.sh coverage**: the real https/curl path + `/releases` resolution are now PROVEN live (no longer the
+  auditor's gap 1/2), but are still not UNIT-tested (only the `file://` fixture is). Same-origin checksum trust (gap 3)
+  is by-design (DR-037-accepted `curl|sh` model). A unit test of the API-parse branch is a nice-to-have.
+- **checkout Node-20 deprecation**: the SHA-pinned `actions/checkout@v4.2.2` targets Node 20 (force-run on Node 24); a
+  future bump to a checkout v5 SHA clears the annotation. Cosmetic.
 
 ## Decisions still needing a /dr
-- None outstanding from this arc. A real installer (follow-up 2) would want a distribution/release DR (DR-037).
+- **Combined multi-call single binary** (literal-I7 form) — a daemon-crate extraction (pull `bins/rezidentd/src`'s
+  ~714-line `unix_daemon` into a lib so `rezidnt daemon` can dispatch). DR-037 NAMED this as the I7-honoring follow-up;
+  it wants its own slice/DR. Not urgent.
 - Prior carried (unrelated): macOS/Windows sandbox+egress backends; MCP-based 1Password egress backend.
 
+## Next action (owner's steer — DR-037 arc COMPLETE, nothing gated)
+No forced next. `current-slice` = `quickstart-real` (done); the installer arc is finished; `v0.0.1` pre-release is live.
+Natural candidates:
+1. **Phase-1 core to make the FULL golden path real** — §16 S1 (herdr adapter + `rezidnt open` materialization) and S3
+   (MCP surface). This is the highest-leverage next: it's what makes the demo the doc narrates ACTUALLY complete
+   end-to-end (and lets the "What you just saw" prose become fully honest). The install step is now real; the *rest* of
+   the one-take is the remaining gap to the Phase-1 exit demo (the only definition of done).
+2. **A different roadmap phase** — benchmark harness (DR-022); macOS/Windows sandbox+egress backends (would un-gate a
+   cross-platform installer later).
+3. **The combined multi-call binary DR** (literal-I7 installer form) or the small non-blocking follow-ups above.
+
 ## Environment (essentials)
-Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done). The onboarding generator/doctor/init CORE is in the
-platform-neutral `rezidnt` bin and is host-lintable; the e2e tests (`spec_init_open_e2e.rs`, `init_wrapper_e2e.rs`,
-`operator_liveops_e2e.rs`) are `#[cfg(unix)]` and need WSL clippy+test ([[vet-is-host-side-wsl-insufficient]]).
-WSL: `wsl.exe -d Ubuntu-24.04 -e bash -lc 'cd /mnt/d/github/rezidnt && export CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target
-PATH=$HOME/.cargo/bin:$PATH && cargo …'` ([[wsl-dev-environment]]). Build BOTH bins on WSL before an e2e run (the
-e2e's `cli_bin()` locates the sibling `rezidnt`). Host+WSL SEQUENTIAL ([[vet-concurrency-flake]]). Watch
-[[clippy-doc-lazy-continuation-trap]] — it bit THREE times this session (oracle test headers + a wrapped list item);
-a `//!`/`///` continuation line must not start with `+`/`-` or lazily continue a list without a blank line/indent.
-Added `.rezidnt/` to `.gitignore` (daemon runtime worktree state, never tracked). Untracked `.playwright-mcp/` +
-`docs/site/` are stray, not part of the project — leave them.
+Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done). The install.sh CORE is platform-neutral prose/shell; its
+test (`curl_sh_unix.rs`) is `#[cfg(unix)]` → needs WSL clippy+test ([[vet-is-host-side-wsl-insufficient]]). WSL:
+`wsl.exe -d Ubuntu-24.04 -e bash -lc 'cd /mnt/d/github/rezidnt && export CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target
+PATH=$HOME/.cargo/bin:$PATH && cargo …'` ([[wsl-dev-environment]]). Host+WSL SEQUENTIAL ([[vet-concurrency-flake]]).
+The `clippy doc_lazy_continuation` trap bit once more this session (a doc paragraph after a `//!` bullet list needs a
+blank `//!` separator) ([[clippy-doc-lazy-continuation-trap]]). Untracked `.playwright-mcp/` + `docs/site/` are stray,
+not part of the project — leave them.
 
 ---
-**NEXT ACTION → --scope CLI + live-op demo + the entire DR-036 onboarding arc (spec-init → doctor → init-wrapper →
-quickstart) all shipped, every slice /vet + /debrief PASS, pushed to origin/main (`5b36157`). `current-slice` =
-quickstart (done); onboarding arc COMPLETE, DR-036 amendments applied (§9/§13/§16/§20). NO forced next — owner's
-steer. Strongest candidates: (1) two small non-blocking follow-ups (nested-verb lockstep coverage; divergent-parent
-socket-check pin), (2) a real `curl | sh` installer to make the quickstart's install step real (likely DR-037,
-distribution posture), (3) a different roadmap phase (benchmark DR-022; macOS/Windows backends). High autonomy ON.
-Onboarding CORE is host-lintable; the three e2e suites are #[cfg(unix)] → WSL.**
+**NEXT ACTION → DR-037 installer arc COMPLETE: two DR-036 follow-ups + release-ci → install-script → quickstart-real all
+shipped, every slice /vet + /debrief PASS, pushed to origin/main (`a50e576`). `v0.0.1` published as a GitHub pre-release;
+the golden path's `curl | sh` install step is REAL and proven end-to-end. `current-slice` = quickstart-real (done). NO
+forced next — owner's steer. Strongest candidate: Phase-1 core (§16 S1 herdr adapter / S3 MCP) to make the FULL one-take
+golden path actually complete (the install step is done; the rest of the demo is the remaining Phase-1-exit gap).
+Alternatives: benchmark DR-022; macOS/Windows backends; the combined-binary literal-I7 DR. High autonomy ON.**

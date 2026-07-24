@@ -1016,3 +1016,135 @@ fn an_unallocatable_task_is_a_refused_sub_and_never_a_tallied_one() {
         );
     }
 }
+// --- CRITERION (DR-046 §Consequences (b)): fan_out is same-process-only ------
+
+/// Count the two subjects a fan-out emits if it takes ANY effect, as the log
+/// serves them right now.
+fn effect_counts(url: &str) -> (usize, usize) {
+    let result = mcp_tool_call(url, 90, "tail_events", json!({}));
+    let events = tool_payload(&result)["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let count = |subject: &str| {
+        events
+            .iter()
+            .filter(|e| e["subject"] == json!(subject))
+            .count()
+    };
+    (count("worktree.allocated"), count("agent.spawned"))
+}
+
+/// CRITERION (DR-046 §Decision 2/3, §Consequences (b) — the OWED compensating
+/// leg) — `fan_out` is STRUCTURALLY SAME-PROCESS-ONLY, and that limitation is
+/// machine-checked rather than merely recorded.
+///
+/// DR-017 §Decision 6 mints the macaroon root key per process and never persists
+/// it. After `restart_daemon_with_mcp` the daemon holds a DIFFERENT root key, so
+/// a lead badge minted before the restart can no longer verify: the §12 door
+/// refuses it `BADGE_INVALID`, and the refusal precedes any effect — no new
+/// `worktree.allocated`, no new `agent.spawned` (DR-045 §Decision 3's ordering).
+///
+/// A lead run that outlives a daemon restart therefore cannot fan out again.
+/// That is the documented cost of keeping the root key ephemeral (DR-046
+/// §Decision 1 — persisting it would convert a process-lifetime secret into a
+/// long-lived stealable one), and shipping it with no machine check is the
+/// failure class this whole arc has been closing.
+///
+/// ## Failing for the right reason
+///
+/// `BADGE_INVALID` is also what a MALFORMED or mistyped badge returns, so a
+/// refusal alone proves nothing — a typo in the test would produce the same
+/// code. The pre-restart leg is therefore load-bearing: the EXACT SAME badge
+/// string is presented twice, admitted before the restart and refused after it.
+/// The only variable between the two calls is the daemon process, which is
+/// precisely the claim.
+#[test]
+fn a_pre_restart_lead_badge_cannot_fan_out_after_a_restart() {
+    let (mut daemon, lock_path) = start_daemon_with_mcp(None);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url").to_string();
+    let operator = lock["badge"].as_str().expect("badge").to_string();
+    initialize(&url);
+
+    let (project_dir, base_spec) = make_project(20);
+    let harness = badge_dumping_harness(project_dir.path());
+    let spec = with_badge_dump_and_role(&base_spec, &harness);
+
+    let (workspace, _lead_run, lead_badge) = open_and_capture_lead(&url, &operator, &spec);
+
+    // --- pre-restart: THIS EXACT badge string is admitted --------------------
+    // Without this leg the post-restart assertion would be satisfied by a
+    // typo'd badge, which returns the same BADGE_INVALID code.
+    let admitted = fan_out(&url, 19, &lead_badge, &workspace, &["dr046-prerestart"]);
+    assert_ne!(
+        admitted["isError"],
+        json!(true),
+        "PRECONDITION — this exact badge string fans out successfully BEFORE the restart, so the \
+         post-restart refusal below is attributable to the restart and to nothing else: \
+         {admitted:#}"
+    );
+    let pre_run = outcome_runs(&admitted)
+        .first()
+        .expect("one task, one run")
+        .clone();
+    tail_until(&url, FACT_DEADLINE, |e| {
+        e["subject"] == "agent.spawned" && e["payload"]["run"] == json!(pre_run)
+    });
+
+    // --- restart: the root key is re-minted and the old one is gone ----------
+    restart_daemon_with_mcp(&mut daemon, &lock_path);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url after restart").to_string();
+    initialize(&url);
+
+    let (allocated_before, spawned_before) = effect_counts(&url);
+    // Non-vacuity for the comparison below: the pre-restart lead and sub really
+    // did allocate and spawn, so this is not a 0-vs-0 tautology.
+    assert!(
+        allocated_before > 0 && spawned_before > 0,
+        "the pre-restart process left real effects on the log to compare against; got          {allocated_before} allocated / {spawned_before} spawned"
+    );
+
+    // --- post-restart: the SAME badge string is now unverifiable -------------
+    let refused = fan_out(&url, 20, &lead_badge, &workspace, &["dr046-postrestart"]);
+    assert_eq!(
+        refused["isError"],
+        json!(true),
+        "a pre-restart lead badge must be REFUSED after a restart — the root key was re-minted \
+         (DR-017 §Decision 6), so the macaroon cannot verify. fan_out is structurally \
+         same-process-only (DR-046 §Decision 2): {refused:#}"
+    );
+    let payload = tool_payload(&refused);
+    assert_eq!(
+        payload["code"],
+        json!("badge.invalid"),
+        "the refusal is BADGE_INVALID — the badge genuinely no longer verifies. NOT \
+         FAN_OUT_LEAD_ONLY (it is still the right KIND of badge, DR-045 §Decision 2) and not \
+         RUN_UNKNOWN (the door refuses before any lead lookup): {payload:#}"
+    );
+
+    // --- and the refusal preceded any effect ---------------------------------
+    let (allocated_after, spawned_after) = effect_counts(&url);
+    assert_eq!(
+        (allocated_after, spawned_after),
+        (allocated_before, spawned_before),
+        "a refused post-restart fan_out emits NO new `worktree.allocated` and NO new \
+         `agent.spawned` — the door refuses before any allocation or spawn (DR-045 §Decision 3, \
+         DR-046 §Consequences (b)). Before: {allocated_before}/{spawned_before}, after: \
+         {allocated_after}/{spawned_after}"
+    );
+
+    // The pre-restart sub is untouched by the failed retry: still exactly one
+    // spawn for it, so nothing was double-minted under the refused call.
+    let log = cold_read(&mut daemon);
+    let spawns = log
+        .iter()
+        .filter(|e| e.subject.as_str() == "agent.spawned" && e.payload()["run"] == json!(pre_run))
+        .count();
+    assert_eq!(
+        spawns, 1,
+        "the pre-restart sub {pre_run} keeps exactly one agent.spawned — a refused fan_out \
+         neither respawns nor disturbs what the previous process minted (I3)"
+    );
+}

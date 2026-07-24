@@ -70,7 +70,9 @@
 use std::path::PathBuf;
 
 use rezidnt_state::{fold, orchestration_graph};
-use rezidnt_types::Event;
+use rezidnt_types::{Event, SourceId, Subject};
+use serde_json::json;
+use ulid::Ulid;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/fixtures")
@@ -246,6 +248,65 @@ fn a_fanned_out_lead_folds_zero_attenuations_while_its_subs_still_project() {
         lead_row.delegated, 0,
         "BoardRow.delegated is delegation-chain DEPTH and stays delegations.len() — a fanned-out \
          lead shows 0, which is it telling the TRUTH (DR-046 §Consequences (c)): {lead_row:#?}"
+    );
+
+    // Side 1, POSITIVE CONTROL — without this, side 1 is a tautology. The
+    // fixture carries no `permit.delegated` at all, so "zero" above would hold
+    // even if the reducer had stopped folding delegations entirely, and it
+    // cannot fail unless the reducer starts INVENTING records.
+    //
+    // So: replay the same log with ONE lead-keyed `permit.delegated` appended —
+    // the exact fact DR-046 §Decision 4 withdrew — and demand that both
+    // observables MOVE. That proves the zero above is a fact about the LOG (the
+    // emitter is silent) rather than about a dead code path, and it pins the
+    // detector that would catch the withdrawn emit if it came back on a log.
+    //
+    // The EMITTER side of the withdrawal cannot be checked by folding any static
+    // fixture — see `bins/rezidentd/tests/permit_delegated_is_attenuation_only.rs`
+    // for the host-runnable source guard, and `fan_out_live_e2e.rs` (WSL) for the
+    // runtime one.
+    let mut with_restored_emit = events.clone();
+    with_restored_emit.push(
+        Event::new(
+            SourceId::new("rezidnt-run"),
+            None,
+            Subject::new("permit.delegated"),
+            Ulid::new(),
+            None,
+            1,
+            json!({
+                "run": LEAD_RUN,
+                "parent_badge_id": "1eadbadge0000001",
+                "child_badge_id": "5uba0000000000a1",
+                "added_caveats": [],
+            }),
+        )
+        .expect("test event under 32KiB"),
+    );
+    let contaminated = fold(with_restored_emit.iter());
+    let contaminated_lead = contaminated
+        .agent_runs
+        .get(LEAD_RUN)
+        .expect("the lead folds on the contaminated log too");
+    assert_eq!(
+        contaminated_lead.delegations.len(),
+        1,
+        "POSITIVE CONTROL: a lead-keyed permit.delegated on the log DOES fold onto the lead's \
+         attenuation chain. If this is 0, the assertion above is vacuous and proves nothing \
+         about the withdrawal: {:#?}",
+        contaminated_lead.delegations
+    );
+    let contaminated_row = rezidnt_state::project(&contaminated)
+        .runs
+        .iter()
+        .find(|r| r.run == LEAD_RUN)
+        .cloned()
+        .expect("the lead has a board row on the contaminated log");
+    assert_eq!(
+        contaminated_row.delegated, 1,
+        "POSITIVE CONTROL: BoardRow.delegated tracks that same chain, so the 0 asserted above is \
+         a live observable — this is the number that read 2 before the withdrawal, on the \
+         dossier `debrief` reads (DR-046 §Risk register): {contaminated_row:#?}"
     );
 
     // Side 2 — and the graph still folds the fan-out. Zero delegations must NOT

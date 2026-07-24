@@ -1646,9 +1646,11 @@ pub struct OrchestrationView {
 /// leads) is what keeps a real lead reporting its genuine cross-run subs and a
 /// correct derived `fan_out`. That distinction bites whenever the lead's OWN
 /// spec declares a role, since the self-edge is emitted ONLY then
-/// (`bins/rezidentd/src/runs.rs:766` — a roleless run emits no
-/// `permit.delegated` at all, so for a roleless lead the two placements
-/// coincide). The role-declaring case is where the whole argument lives.
+/// (`bins/rezidentd/src/runs.rs:766` — a roleless run emits no SELF-edge, so
+/// for a roleless lead the two placements coincide). The role-declaring case is
+/// where the whole argument lives. Note the premise is about the self-edge
+/// specifically, NOT about `permit.delegated` as a whole: a roleless LEAD does
+/// emit that fact for each sub it fans out to (DR-044 §Decision 2b).
 /// No discriminator field is minted on the fact:
 /// with this guard, "lead-keyed edge whose child badge belongs to a DIFFERENT
 /// run" IS the discriminator, derivable from existing fields (DR-044
@@ -1676,8 +1678,8 @@ pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
                 // guard. A same-run delegation is the DR-017 capability-chain
                 // hop, not an orchestration edge, so it contributes no sub and
                 // no `fan_out`. Guarding HERE (not on the lead) leaves a real
-                // lead's cross-run subs intact even though it also carries its
-                // own role self-edge.
+                // lead's cross-run subs intact even when it also carries its
+                // own self-edge — which it does whenever it declares a role.
                 .filter(|(sub_run, _)| *sub_run != lead_run)
                 .filter(|(_, sub)| match &sub.badge_id {
                     Some(badge) => lead.delegations.iter().any(|d| &d.child_badge_id == badge),

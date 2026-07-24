@@ -39,6 +39,12 @@
 //! a substitute for the runtime leg. It is a tripwire on the one location the
 //! withdrawal actually removed code from, which is where a revert or a bad merge
 //! would put it back.
+//!
+//! It also matches the subject as a STRING LITERAL only: a `Subject::new(CONST)`
+//! or a `format!`-built subject evades both legs silently. That is inside the
+//! threat model rather than a hole in it — the realistic regression is a revert
+//! or a bad merge restoring the deleted block verbatim, which uses the literal —
+//! but it is stated so nobody reads a green run as proof of more than it checks.
 
 use std::path::PathBuf;
 
@@ -116,7 +122,29 @@ fn the_surviving_emit_is_the_role_attenuation_edge_and_names_no_lead() {
     // and it is exactly the failure mode a source guard must not have: the
     // withdrawn emit is identified by what ITS OWN payload names, not by what
     // happens to sit near it.
-    let payload_window = lines[site..(site + 16).min(lines.len())].join("\n");
+    // Bounded by the emit's OWN `json!` close, not by a fixed line count, and
+    // with comment lines stripped. A fixed span ran one line into the WITHDRAWN
+    // tombstone comment below the emit, and the forbidden list includes the
+    // 5-char `lead.` — so scanning comment prose was one edit away from
+    // re-creating the very false-positive class the scoping note above records.
+    // Structural bounds cannot drift that way: the window is exactly the payload.
+    let payload_end = lines[site..]
+        .iter()
+        .position(|line| line.trim() == "}),")
+        .map(|offset| site + offset + 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "the `permit.delegated` emit at line {} has no closing `}}),` — the guard could \
+                 not bound its payload, so it must fail rather than scan an open-ended window",
+                site + 1
+            )
+        });
+    let payload_window = lines[site..payload_end]
+        .iter()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
     for forbidden in ["lead.lead_run", "lead_badge_id", "lead."] {
         assert!(
             !payload_window.contains(forbidden),

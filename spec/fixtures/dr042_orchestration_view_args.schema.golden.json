@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OrchestrationViewArgs",
+  "type": "object",
+  "properties": {
+    "run": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

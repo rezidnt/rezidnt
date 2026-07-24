@@ -1,70 +1,72 @@
-# Handoff — 2026-07-24 (session 24: 3-lane parallel fan-out — DR-041 verify-lints + dependency-audit shipped, DR-042 read-side deepened, DR-043 drafted)
+# Handoff — 2026-07-24 (session 24: 3-lane fan-out + secret-scan-native → DR-041 v1 verifier pack COMPLETE)
 
 ## State of play
-Owner asked to "make progress quicker" by fanning out a team to build vertical slices. Ran a **3-lane parallel
-fan-out** (implementer subagents in isolated git worktrees, orchestrator holding the single-lane debrief/vet/merge gate
-— pattern captured in [[fan-out-parallel-build-pattern]]). Everything merged to `origin/main` (synced, `92a4c55`), host
-`/vet` GREEN (`{"verdict":"pass"}`), each lane through an independent auditor /debrief. High autonomy ON
-([[autonomy-high-trust]]). `current-slice` = `secret-scan-native` (gated on DR-043 ratification).
+Owner asked to "make progress quicker" via a fanned-out team building vertical slices. Ran a **3-lane parallel
+fan-out** (implementer subagents in isolated git worktrees; orchestrator held the single-lane debrief/vet/merge gate —
+[[fan-out-parallel-build-pattern]]), THEN drove the `secret-scan-native` slice through the full loop
+(oracle→implementer→debrief→fix→re-debrief→vet). Everything merged to `origin/main` (synced, `54d3992`); every merge
+is host `/vet` GREEN (`{"verdict":"pass"}`) + independent auditor `/debrief`. High autonomy ON ([[autonomy-high-trust]]).
+`current-slice` = `secret-scan-native` (**done**).
+
+**Headline: the DR-041 v1 production verifier pack is COMPLETE** — verify-subcommand → verify-lints →
+dependency-audit → secret-scan-native all shipped ([[verifier-pack-dr041]]).
 
 ## What shipped this session (each merged, vet-green, independently debriefed)
-1. **DR-042 orchestrator read-side deepening** (Lane B, merge `dfac65c`) — advances the two owed tests the DR named:
-   an I3 rebuild-from-persisted-log equivalence test (real `rezidnt rebuild` path: `EventLog::open`→`read_from(1)`→fold),
-   a §9 schema no-drift golden pin for the orchestration MCP tool args, plus a design-legal richer read-side fold
-   (`SubRow.cost_usd`/`killed_by` from existing agent.completed/agent.signaled facts; `LeadRow.verdict_rollup` — I6-honest
-   tally, inconclusive never coerced, buckets partition fan_out). Phase-3 live fan-out stayed GATED OFF; no subject minted
-   (sub-worktree linkage correctly deferred to a warden /subject). See [[orchestrator-dr042]].
-2. **DR-041 `verify-lints`** (Lane A, merge `ef75cfb`) — real `rezidnt verify clippy` + `rezidnt verify fmt-check` §8 exec
-   verifiers through `resolve_one` into the daemon pre_merge gate. clippy names the lint; fmt-check discriminates
-   mis-format `fail` / genuine-syntax-error `inconclusive` / type-error-in-formatted-crate `pass` (rustfmt is syntax-layer).
-   17 CLI + 4 unix e2e green.
-3. **DR-041 `dependency-audit`** (Lane A, same merge) — `rezidnt verify dependency-audit` EXEC verifier (`cargo audit
-   --json`); tool-absent/DB-unreachable/unparseable → inconclusive, never a silent pass; 6 CLI tests (pass/fail legs
-   honestly capability-SKIP since cargo-audit is absent host+WSL). Progress tracked in [[verifier-pack-dr041]].
-4. **DR-022 benchmark harness** (Lane C) — scope scout found it ALREADY BUILT + green; no rework. Recorded
-   [[dr022-benchmark-harness-built]].
+1. **DR-042 orchestrator read-side deepening** (Lane B, `dfac65c`) — the two owed tests (I3 rebuild-from-log
+   equivalence via the real `rezidnt rebuild` path; §9 schema no-drift golden) + a design-legal richer read-side fold
+   (`SubRow.cost_usd`/`killed_by`, `LeadRow.verdict_rollup`, I6-honest, inconclusive never coerced). Phase-3 live
+   fan-out stayed GATED OFF; no subject minted. [[orchestrator-dr042]].
+2. **DR-041 verify-lints** (Lane A, `ef75cfb`) — real `rezidnt verify clippy` + `fmt-check` §8 exec verifiers, full
+   Decision-4 trap mapping.
+3. **DR-041 dependency-audit** (Lane A, `ef75cfb`) — `cargo audit --json` EXEC verifier, honest inconclusive posture.
+4. **DR-043** (ACCEPTED, `1d3a757`) — ratified + §20-indexed (next DR-044): the CAS-content-ref fix that made
+   secret-scan-native buildable (owner chose Option A).
+5. **DR-041 secret-scan-native** (`54d3992`) — native `secret-scan` scans a new `refs["content"]` CasRef the daemon
+   now emits (per-file RAW added bytes, I2 bytes→CAS); no subject minted (rode existing gate-refs). CLOSES the v1 pack.
+6. **DR-022 benchmark harness** (Lane C) — scope scout found it ALREADY BUILT + green; no rework
+   ([[dr022-benchmark-harness-built]]).
+
+## The one that proves the loop works (carry this)
+secret-scan-native's FIRST /debrief **FAILED** on a real I6 silent-pass the makers missed: the daemon pinned content via
+`String::from_utf8_lossy` before `cas.put()`, so a non-UTF-8 NUL-free file reached the native as clean text and could be
+silently passed — the pure-logic test bypassed it by feeding raw bytes straight to the native. Fix: pin exact raw bytes
+so the native's binary guard fires on the PRODUCTION path; added `e2e_binary_no_nul_content_maps_to_inconclusive`
+(oracle proved it non-vacuous against the pre-fix daemon). Re-debrief PASS, then vet. Maker/checker separation is why
+this didn't ship broken.
 
 ## Owner-settled this session
-- Fan-out width: all 3 lanes at once; self-drive per lane (high autonomy).
-- **secret-scan blocker → Option A.** Owner chose to keep secret-scan NATIVE and fix the input shape (below), over
-  reclassifying it exec.
-
-## The one real blocker → DR-043 (PROPOSED, needs your ratification)
-`secret-scan-native` can't be built as DR-041 Decision 2 wrote it: at pre_merge the daemon hands natives only a
-content-free path-status summary (`git_diff_summary` → `refs["diff"]`, `bins/rezidentd/src/runs.rs:1576`) — no file
-bytes, so a native scanner can't detect an in-file key (I6-dishonest). **DR-043**
-(`docs/decisions/DR-043-secret-scan-content-ref.md`, PROPOSED, pushed) resolves it Option-A: the daemon git adapter
-`cas.put()`s per-file added content and exposes a new `refs["content"]` CasRef, keeping secret-scan native +
-CAS-replayable (the I3/I6 property exec-reads-live-worktree would forfeit). **NEXT ACTION on it: owner flips DR-043
-PROPOSED→ACCEPTED**, then a slice builds it (owed: input-contract pin test, CAS-replay-equivalence test,
-inconclusive-on-unscannable-content). It's a daemon-side change (`gates.rs`/`runs.rs`) — a new lane/worktree, crosses the
-old Lane A file boundary.
+- Fan-out: all 3 lanes at once, self-drive per lane (high autonomy). secret-scan blocker → **Option A** (keep native,
+  pin content to CAS) → DR-043 ratified and built.
 
 ## Open follow-ups (NON-BLOCKING)
-- **`git stash@{0}`** holds the subsumed prior-session verify-lints WIP ("prior-session verify-lints WIP (subsumed by
-  Lane A, DR-041) — recoverable"). Lane A superseded it and is pushed+vet-green, so the stash is now redundant — safe to
-  `git stash drop` whenever; kept for now since it was prior work not created this session.
-- **`bench/harness/src/lib.rs` stale doc** (lines ~27–34) still narrates the fns as `todo!()` stubs though implemented —
+- **`git stash@{0}`** still holds the subsumed prior-session verify-lints WIP ("… subsumed by Lane A … recoverable").
+  Lane A superseded it and shipped+vet-green — safe to `git stash drop` anytime; kept only because it was prior work.
+- **`bench/harness/src/lib.rs` stale doc** (~lines 27–34) still narrates the fns as `todo!()` stubs though implemented —
   doc-only cleanup owed ([[dr022-benchmark-harness-built]]).
-- Two DR-041 auditor forward-notes still standing for any content-emitting verifier: I2 bytes→CAS on uncapped failure
-  evidence; gate `input.timeout_ms` not propagated to the in-binary verifier budget (both fine today) — see
-  [[verifier-pack-dr041]].
+- Two standing DR-041 auditor notes for any content-emitting verifier: I2 bytes→CAS on uncapped failure evidence; gate
+  `input.timeout_ms` not propagated to the in-binary verifier budget (both fine today) — [[verifier-pack-dr041]].
+- Stray untracked `.playwright-mcp/`, `docs/site/` — leave them.
 
 ## Decisions still needing a /dr
-- **DR-043 ratification** (PROPOSED → ACCEPTED) — owner's word. On acceptance, also add the §20 index row +
-  "next record is DR-044" bump in `docs/rezidnt-architecture.md`.
+- None outstanding. DR-041 pack complete; DR-042 orchestrator LIVE fan-out is the next big decision-bearing arc but is
+  Phase-3-gated by its own record (owner's steer on when).
+
+## What's next (owner's steer — nothing forced)
+The v1 verifier pack (the §8 differentiation layer) is done. Strongest candidates: (a) **DR-042 Phase-3 orchestrator
+live fan-out** — the biggest capability, but Phase-3-sequenced (needs the owner to open it; the read-side rails + owed
+tests are now in place); (b) the small named follow-ups above; (c) macOS/Windows backends or the combined single binary
+(named in prior handoffs). No slice is mid-flight.
 
 ## Environment (essentials)
-Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done; it ended `{"verdict":"pass","evidence":[]}` this session).
-verify-lints/dependency-audit CLI oracles are cross-platform (host-lintable); the pre_merge e2e (`verify_lints_e2e.rs`) is
-`#[cfg(unix)]` → WSL ([[wsl-dev-environment]], [[vet-is-host-side-wsl-insufficient]]). Fan-out ops recipe +
-gotchas in [[fan-out-parallel-build-pattern]] (KEY: worktrees fork committed HEAD, not dirty WIP — commit/stash before
-fanning out). Host+WSL SEQUENTIAL for vet ([[vet-concurrency-flake]]). `gh` authed. Stray untracked `.playwright-mcp/`,
-`docs/site/` — leave them.
+Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done; ended `{"verdict":"pass"}` twice this session). The native
+verifier boards + testkit are cross-platform (host-lintable); the pre_merge e2e (`*_e2e.rs`, incl.
+`secret_scan_content_ref_e2e.rs`) is `#[cfg(unix)]` → WSL ([[wsl-dev-environment]],
+[[vet-is-host-side-wsl-insufficient]]). Host+WSL SEQUENTIAL for vet ([[vet-concurrency-flake]]). Fan-out ops recipe +
+the worktrees-fork-committed-HEAD gotcha in [[fan-out-parallel-build-pattern]]. `gh` authed.
 
 ---
-**NEXT ACTION → session's 3-lane fan-out COMPLETE: DR-042 read-side deepening + DR-041 verify-lints + dependency-audit
-all merged to origin/main (`92a4c55`), host /vet GREEN, each independently debriefed. `current-slice` =
-secret-scan-native, BLOCKED pending owner ratification of DR-043 (PROPOSED) — the CAS-content-ref fix that makes the
-native scanner buildable. On ACCEPT: bump §20 index, then build secret-scan-native in a fresh lane (daemon-side
-`gates.rs`/`runs.rs` change, owed the 3 tests named in DR-043). High autonomy ON.**
+**NEXT ACTION → DR-041 v1 verifier pack COMPLETE this session (verify-subcommand → verify-lints → dependency-audit →
+secret-scan-native, all on origin/main `54d3992`, host /vet GREEN, each independently debriefed; the secret-scan I6
+silent-pass was caught by /debrief and fixed before merge). DR-043 ACCEPTED + §20-indexed. `current-slice` =
+secret-scan-native (done). NO forced next — owner's steer; strongest candidate is DR-042 Phase-3 orchestrator live
+fan-out (Phase-3-gated, read-side rails now in place). High autonomy ON.**

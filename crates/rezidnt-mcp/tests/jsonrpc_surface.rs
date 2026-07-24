@@ -61,6 +61,18 @@ async fn tools_list_serves_board_view() {
     util::find_tool(&tools, "board_view");
 }
 
+/// DR-040: the READ-ONLY `get_escalations` tool is served in `tools/list`. It
+/// is in the `tail_events`/`board_view` read class (unbadged, doc §12 as
+/// amended by DR-005) and returns the outstanding permit escalations as
+/// `Vec<EscalationRow>`. RED until the implementer advertises the tool
+/// (`rezidnt-mcp/src/lib.rs` tools_list()).
+#[tokio::test]
+async fn tools_list_serves_get_escalations() {
+    let (_dir, core) = util::core();
+    let tools = util::list_tools(&core).await;
+    util::find_tool(&tools, "get_escalations");
+}
+
 /// Doc §9 BINDING no-drift rule: every served inputSchema EQUALS the schema
 /// generated from `rezidnt-types` via schemars — the surface and the
 /// published types can never drift.
@@ -97,6 +109,19 @@ async fn tool_schemas_are_generated_from_rezidnt_types() {
         (
             "board_view",
             serde_json::to_value(schemars::schema_for!(rezidnt_types::mcp::BoardViewArgs)).unwrap(),
+        ),
+        // DR-040: the READ-ONLY get_escalations tool. Its
+        // `GetEscalationsArgs { run: Option<String> }` snapshot arg mirrors the
+        // arg-struct pattern of `TailEventsArgs`/`BoardViewArgs`; the served
+        // inputSchema MUST equal the schemars-generated one (no drift, §9
+        // BINDING). RED until the implementer adds
+        // `rezidnt_types::mcp::GetEscalationsArgs` and advertises the tool.
+        (
+            "get_escalations",
+            serde_json::to_value(schemars::schema_for!(
+                rezidnt_types::mcp::GetEscalationsArgs
+            ))
+            .unwrap(),
         ),
     ];
     for (name, schema) in expected {

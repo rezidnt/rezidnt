@@ -1441,3 +1441,58 @@ pub fn project(graph: &Graph) -> BoardView {
         worktrees,
     }
 }
+
+/// DR-040: one outstanding permit escalation — the drill-down detail behind
+/// `board_view`'s `permit_escalated` COUNT. A pure read of already-folded state
+/// (I3): every field is carried VERBATIM from the folded [`PermitLedgerEntry`]
+/// (`crates/rezidnt-state/src/lib.rs`) plus the run key and the `request_id`
+/// map key — the projection re-interprets nothing. `reason`/`policy_ref` surface
+/// verbatim so the escalation stays interrogable and is never coerced to
+/// granted/denied (I6). Derives `Serialize + Deserialize` so `get_escalations`
+/// serves it and the oracle deserializes the served payload back for equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EscalationRow {
+    /// The run's ULID key (graph `agent_runs` key).
+    pub run: String,
+    /// The escalated ask's `request_id` (the `permit_ledger` map key).
+    pub request_id: String,
+    /// The requested action kind, verbatim from the ledger entry.
+    pub action: String,
+    /// The requested action target descriptor, verbatim. `None` while the
+    /// request has not folded (a decision may fold before its request, I3).
+    pub target: Option<serde_json::Value>,
+    /// The escalation reason, verbatim (I6 — interrogable, never coerced).
+    pub reason: Option<String>,
+    /// The deciding policy's CAS hash, verbatim, so the escalation is
+    /// interrogable (I6). `None` if the fact omitted it.
+    pub policy_ref: Option<String>,
+}
+
+/// PURE projection: the outstanding permit escalations across the fleet. No IO,
+/// no clocks, no randomness — a read of already-folded state (I3): each row is
+/// carried VERBATIM from a [`PermitLedgerEntry`] whose `decision ==
+/// Some("escalated")`, re-interpreting nothing. `filter` scopes to one run's key
+/// when `Some` (absent/other run → no rows), all runs when `None`. Deterministic
+/// in `BTreeMap` key order (`agent_runs`, then `permit_ledger`) — same
+/// content-hashed log yields the same rows (I6).
+pub fn escalations(graph: &Graph, filter: Option<&str>) -> Vec<EscalationRow> {
+    graph
+        .agent_runs
+        .iter()
+        .filter(|(run, _)| filter.is_none_or(|want| want == run.as_str()))
+        .flat_map(|(run, state)| {
+            state
+                .permit_ledger
+                .iter()
+                .filter(|(_, entry)| entry.decision.as_deref() == Some("escalated"))
+                .map(move |(request_id, entry)| EscalationRow {
+                    run: run.clone(),
+                    request_id: request_id.clone(),
+                    action: entry.action.clone(),
+                    target: entry.target.clone(),
+                    reason: entry.reason.clone(),
+                    policy_ref: entry.policy_ref.clone(),
+                })
+        })
+        .collect()
+}

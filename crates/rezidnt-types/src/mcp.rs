@@ -182,6 +182,22 @@ pub struct RequestPermissionArgs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BoardViewArgs {}
 
+/// `get_escalations` — DR-040: read the outstanding permit escalations as
+/// `Vec<EscalationRow>` (the drill-down detail behind `board_view`'s
+/// `permit_escalated` count). Read-only, idempotent, no badge — in the
+/// `tail_events`/`board_view` read class (doc §12 as amended by DR-005). The
+/// optional `run` filters to one run (all runs when absent), mirroring the
+/// optional-arg pattern of `TailEventsArgs`; the served `inputSchema` MUST
+/// equal `schema_for!` of this shape (doc §9 no-drift).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GetEscalationsArgs {
+    /// Filter to one run's escalations (canonical 26-char ULID text form).
+    /// Absent = all outstanding escalations across the fleet. Additive-optional
+    /// so `schema_for!` stays doc §9 no-drift: absent = OMITTED, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

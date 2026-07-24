@@ -15,7 +15,8 @@
 //!
 //! Surface pinned by the board:
 //! - tools: `open_project`, `spawn_agent`, `gate_explain`, `tail_events`,
-//!   `board_view` (DR-039 read-only fleet projection);
+//!   `board_view` (DR-039 read-only fleet projection),
+//!   `get_escalations` (DR-040 read-only outstanding-escalations projection);
 //!   every `inputSchema` served by `tools/list` MUST equal
 //!   `schemars::schema_for!` of the matching `rezidnt_types::mcp` type
 //!   (doc §9 no-drift rule).
@@ -538,6 +539,7 @@ impl McpCore {
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
             "board_view" => self.call_board_view(args).await,
+            "get_escalations" => self.call_get_escalations(args).await,
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
@@ -1683,6 +1685,27 @@ impl McpCore {
         Ok(tool_ok(payload))
     }
 
+    /// `get_escalations` — DR-040: the READ-ONLY outstanding-escalations
+    /// projection (the drill-down detail behind `board_view`'s
+    /// `permit_escalated` count). In the `tail_events`/`board_view` read class
+    /// (unbadged, doc §12 as amended by DR-005). The data path is pure and
+    /// re-interprets nothing (I3): `replay(None)` (the whole log) →
+    /// `rezidnt_state::fold` → `rezidnt_state::escalations` — the ONE pure
+    /// projection over the already-folded `permit_ledger` (this crate does not
+    /// re-implement it). The optional `run` (via `GetEscalationsArgs`) scopes to
+    /// one run, all runs when absent. One whole-log fold per call (snapshot
+    /// cost, same as `board_view`).
+    async fn call_get_escalations(&self, args: Value) -> RpcOutcome {
+        let parsed: rezidnt_types::mcp::GetEscalationsArgs = serde_json::from_value(args)
+            .map_err(|e| (-32602, format!("get_escalations args: {e}")))?;
+        let events = self.replay(None).await?;
+        let graph = rezidnt_state::fold(events.iter());
+        let rows = rezidnt_state::escalations(&graph, parsed.run.as_deref());
+        let payload = serde_json::to_value(&rows)
+            .map_err(|e| (-32603, format!("encode escalations: {e}")))?;
+        Ok(tool_ok(payload))
+    }
+
     /// `resources/read` — `rezidnt://run/<ulid>/dossier`, the rezidnt-state
     /// fold of the log (I3: derived state, never a side store). Misses answer
     /// with machine-readable contents, never an error and never a hang.
@@ -1802,6 +1825,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "board_view",
                 "description": "Read the derived fleet BoardView (whole-log fold, projected): events folded, workspace open/closed counts, subject histogram, run rows, worktree rows. Read-class, no badge (DR-039).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::BoardViewArgs))?,
+            },
+            {
+                "name": "get_escalations",
+                "description": "Read the outstanding permit escalations (the drill-down detail behind board_view's permit_escalated count): one row per outstanding escalation with run, request_id, action, target, reason, policy_ref. Optional `run` filters to one run. Read-class, no badge (DR-040).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::GetEscalationsArgs))?,
             },
         ]
     }))

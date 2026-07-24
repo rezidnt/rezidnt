@@ -50,6 +50,17 @@ async fn tools_list_serves_the_s3_surface() {
     }
 }
 
+/// DR-039: the READ-ONLY `board_view` tool is served in `tools/list`. It is in
+/// the `tail_events` read class (unbadged, doc §12 as amended by DR-005) and
+/// returns the fleet `BoardView` projection. RED until the implementer
+/// advertises the tool (`rezidnt-mcp/src/lib.rs` tools_list()).
+#[tokio::test]
+async fn tools_list_serves_board_view() {
+    let (_dir, core) = util::core();
+    let tools = util::list_tools(&core).await;
+    util::find_tool(&tools, "board_view");
+}
+
 /// Doc §9 BINDING no-drift rule: every served inputSchema EQUALS the schema
 /// generated from `rezidnt-types` via schemars — the surface and the
 /// published types can never drift.
@@ -77,6 +88,15 @@ async fn tool_schemas_are_generated_from_rezidnt_types() {
             "tail_events",
             serde_json::to_value(schemars::schema_for!(rezidnt_types::mcp::TailEventsArgs))
                 .unwrap(),
+        ),
+        // DR-039: the READ-ONLY board_view tool. Its empty `BoardViewArgs {}`
+        // snapshot arg mirrors `TailEventsArgs`' arg-struct pattern; the served
+        // inputSchema MUST equal the schemars-generated one (no drift, §9
+        // BINDING). RED until the implementer adds
+        // `rezidnt_types::mcp::BoardViewArgs` and advertises the tool.
+        (
+            "board_view",
+            serde_json::to_value(schemars::schema_for!(rezidnt_types::mcp::BoardViewArgs)).unwrap(),
         ),
     ];
     for (name, schema) in expected {

@@ -174,6 +174,14 @@ pub struct RequestPermissionArgs {
     pub context_ref: Option<String>,
 }
 
+/// `board_view` — DR-039: read the derived fleet `BoardView` projection (the
+/// whole-log fold, projected). Read-only, idempotent, no badge — in the
+/// `tail_events` read class (doc §12 as amended by DR-005). The empty snapshot
+/// arg (full fold) mirrors `TailEventsArgs`' arg-struct pattern; the served
+/// `inputSchema` MUST equal `schema_for!` of this shape (doc §9 no-drift).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BoardViewArgs {}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

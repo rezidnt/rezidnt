@@ -14,7 +14,8 @@
 //! thin byte shims over that seam (I4).
 //!
 //! Surface pinned by the board:
-//! - tools: `open_project`, `spawn_agent`, `gate_explain`, `tail_events`;
+//! - tools: `open_project`, `spawn_agent`, `gate_explain`, `tail_events`,
+//!   `board_view` (DR-039 read-only fleet projection);
 //!   every `inputSchema` served by `tools/list` MUST equal
 //!   `schemars::schema_for!` of the matching `rezidnt_types::mcp` type
 //!   (doc §9 no-drift rule).
@@ -536,6 +537,7 @@ impl McpCore {
             "request_permission" => self.call_request_permission(args).await,
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
+            "board_view" => self.call_board_view(args).await,
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
@@ -1665,6 +1667,22 @@ impl McpCore {
         Ok(tool_ok(json!({"events": envelopes})))
     }
 
+    /// `board_view` — DR-039: the READ-ONLY fleet projection. In the
+    /// `tail_events` read class (unbadged, doc §12 as amended by DR-005). The
+    /// data path is pure and re-interprets nothing (I3): `replay(None)` (the
+    /// whole log) → `rezidnt_state::fold` → `rezidnt_state::project` — the ONE
+    /// projection the read-only board also uses (hoisted into `rezidnt-state`,
+    /// DR-039 Decision 3; this crate does not re-implement it). One whole-log
+    /// fold per call (snapshot cost, same as the `rezidnt board` read).
+    async fn call_board_view(&self, _args: Value) -> RpcOutcome {
+        let events = self.replay(None).await?;
+        let graph = rezidnt_state::fold(events.iter());
+        let board_view = rezidnt_state::project(&graph);
+        let payload = serde_json::to_value(&board_view)
+            .map_err(|e| (-32603, format!("encode board view: {e}")))?;
+        Ok(tool_ok(payload))
+    }
+
     /// `resources/read` — `rezidnt://run/<ulid>/dossier`, the rezidnt-state
     /// fold of the log (I3: derived state, never a side store). Misses answer
     /// with machine-readable contents, never an error and never a hang.
@@ -1779,6 +1797,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "tail_events",
                 "description": "Read event envelopes from the log, in log order; `since` is exclusive.",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::TailEventsArgs))?,
+            },
+            {
+                "name": "board_view",
+                "description": "Read the derived fleet BoardView (whole-log fold, projected): events folded, workspace open/closed counts, subject histogram, run rows, worktree rows. Read-class, no badge (DR-039).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::BoardViewArgs))?,
             },
         ]
     }))

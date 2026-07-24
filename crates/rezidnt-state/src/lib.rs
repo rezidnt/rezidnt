@@ -1289,3 +1289,155 @@ impl Default for Materializer {
         Self::new()
     }
 }
+
+// --- Fleet BoardView projection (DR-039) -----------------------------------
+//
+// Hoisted DOWN from `rezidnt-tui` into this crate (DR-039 Decision 3): the
+// fleet view is materialized state, so it belongs with the reducers. ONE pure
+// projection, `&Graph -> BoardView`, reused by both consumers — the read-only
+// board (`rezidnt-tui`, which keeps only its ratatui `draw()` layer and
+// re-exports these) and the `board_view` MCP tool (`rezidnt-mcp`). Neither
+// re-implements the projection (I3: one derivation), and `rezidnt-mcp` never
+// depends on `rezidnt-tui`, so the board's writer-free read-only proof
+// (DR-031) is untouched.
+//
+// `BoardView`/`RunRow`/`WorktreeRow` derive `Serialize + Deserialize` so the
+// tool result serializes through `tool_ok()` and the oracle can deserialize the
+// served payload back into a `BoardView` for byte-for-byte projection equality.
+
+/// The read-only fleet projection: everything the board renders, computed as a
+/// PURE function of a [`Graph`] snapshot. Carries derived state verbatim (I3):
+/// the projection re-interprets nothing.
+///
+/// Projection semantics (pinned by `rezidnt-tui/tests/board_projection.rs`):
+/// - `events_folded` = `graph.events_folded` (fleet heartbeat);
+/// - `workspaces_open` / `workspaces_closed` = counts over `graph.workspaces`
+///   by [`WorkspaceStatus`];
+/// - `counts_by_subject` = `graph.counts_by_subject` (subject histogram),
+///   carried verbatim in deterministic key order;
+/// - `runs` = one [`RunRow`] per `graph.agent_runs` entry, in the map's
+///   deterministic (ULID-string) key order;
+/// - `worktrees` = one [`WorktreeRow`] per `graph.worktrees` entry, in
+///   deterministic (path) key order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoardView {
+    pub events_folded: u64,
+    pub workspaces_open: usize,
+    pub workspaces_closed: usize,
+    /// Subject histogram, verbatim from the graph (deterministic order).
+    pub counts_by_subject: Vec<(String, u64)>,
+    pub runs: Vec<RunRow>,
+    pub worktrees: Vec<WorktreeRow>,
+}
+
+/// One agent run's row in the fleet board — the read-only accounting shadow.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunRow {
+    /// The run's ULID key (graph `agent_runs` key).
+    pub run: String,
+    /// Recorded status string, verbatim (`spawning` | `running` | `completed`
+    /// | …) — never re-interpreted (I3: reducers fold every live payload).
+    pub status: String,
+    pub total_usd: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// How many replay-divergence alarms are on this run (DR-006). Zero for a
+    /// healthy run; the board surfaces a nonzero count.
+    pub integrity_alarms: usize,
+    /// Permit decisions folded onto this run, carried verbatim from
+    /// [`AgentRunState::permit_accumulators`] (I3: no re-interpretation). Grant
+    /// count.
+    pub permit_granted: u64,
+    /// Permit denial count, from `permit_accumulators.denied`.
+    pub permit_denied: u64,
+    /// Permit escalation count, from `permit_accumulators.escalated`.
+    /// `escalated` is never coerced to `granted` (I6) — it surfaces on its own.
+    pub permit_escalated: u64,
+    /// Requested-but-undecided permits: ledger entries whose `decision` is
+    /// `None`. Honest zero when the ledger is empty.
+    pub permit_pending: usize,
+    /// Delegation-chain depth for this run, from
+    /// [`AgentRunState::delegations`] length.
+    pub delegated: usize,
+}
+
+/// One worktree's row in the fleet board.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorktreeRow {
+    /// The worktree's path key (graph `worktrees` key).
+    pub path: String,
+    pub status: String,
+    pub branch: Option<String>,
+    /// Most recent `diff.ready`/`diff.merged` summary hash, if any.
+    pub last_diff: Option<String>,
+}
+
+/// PURE projection: `&Graph` -> [`BoardView`]. No IO, no clocks, no
+/// randomness. Every field is carried verbatim from derived state (I3): the
+/// projection re-interprets nothing. Deterministic key orders are pinned by
+/// the `BTreeMap` iteration order (I6).
+pub fn project(graph: &Graph) -> BoardView {
+    // Fleet summary: heartbeat + workspace open/closed split. BTreeMap<Subject,_>
+    // iterates in deterministic key order, so the histogram is stable.
+    let mut workspaces_open = 0usize;
+    let mut workspaces_closed = 0usize;
+    for status in graph.workspaces.values() {
+        match status {
+            WorkspaceStatus::Open => workspaces_open += 1,
+            WorkspaceStatus::Closed => workspaces_closed += 1,
+        }
+    }
+    let counts_by_subject = graph
+        .counts_by_subject
+        .iter()
+        .map(|(subject, count)| (subject.as_str().to_string(), *count))
+        .collect();
+
+    // Per-run rows, in the agent_runs map's deterministic (ULID-string) key
+    // order. Every field is carried verbatim from derived state (I3).
+    let runs = graph
+        .agent_runs
+        .iter()
+        .map(|(run, state)| RunRow {
+            run: run.clone(),
+            status: state.status.clone(),
+            total_usd: state.total_usd,
+            input_tokens: state.input_tokens,
+            output_tokens: state.output_tokens,
+            integrity_alarms: state.integrity_alarms.len(),
+            // Permit state, carried verbatim from the ALREADY-FOLDED run
+            // (I3 — the board re-derives nothing). `permit_pending` counts
+            // ledger entries still awaiting a decision.
+            permit_granted: state.permit_accumulators.granted,
+            permit_denied: state.permit_accumulators.denied,
+            permit_escalated: state.permit_accumulators.escalated,
+            permit_pending: state
+                .permit_ledger
+                .values()
+                .filter(|entry| entry.decision.is_none())
+                .count(),
+            delegated: state.delegations.len(),
+        })
+        .collect();
+
+    // Per-worktree rows, in deterministic (path) key order.
+    let worktrees = graph
+        .worktrees
+        .iter()
+        .map(|(path, state)| WorktreeRow {
+            path: path.clone(),
+            status: state.status.clone(),
+            branch: state.branch.clone(),
+            last_diff: state.last_diff.clone(),
+        })
+        .collect();
+
+    BoardView {
+        events_folded: graph.events_folded,
+        workspaces_open,
+        workspaces_closed,
+        counts_by_subject,
+        runs,
+        worktrees,
+    }
+}

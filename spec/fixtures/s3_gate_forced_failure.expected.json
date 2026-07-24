@@ -10,6 +10,7 @@
   "agent_runs": {
     "01S3GATEFA1DED000000000R01": {
       "status": "spawning",
+      "badge_id": "beefbeef00000001",
       "gates": {
         "pre_merge": {
           "verdict": "fail",

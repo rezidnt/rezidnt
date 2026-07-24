@@ -26,6 +26,7 @@
       "intent": null,
       "pep": null,
       "role": null,
+      "badge_id": "root0000",
       "delegations": [
         {
           "parent_badge_id": "root0000",

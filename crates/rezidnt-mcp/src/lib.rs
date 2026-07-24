@@ -540,6 +540,7 @@ impl McpCore {
             "tail_events" => self.call_tail_events(args).await,
             "board_view" => self.call_board_view(args).await,
             "get_escalations" => self.call_get_escalations(args).await,
+            "orchestration_graph" => self.call_orchestration_graph(args).await,
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
@@ -1706,6 +1707,31 @@ impl McpCore {
         Ok(tool_ok(payload))
     }
 
+    /// `orchestration_graph` — DR-042: the READ-ONLY lead → parallel sub-runs
+    /// orchestration projection (each lead's DERIVED fan-out over its delegated
+    /// subs). In the `board_view`/`get_escalations` read class (doc §12 as
+    /// amended by DR-005): unbadged, idempotent, same replay→fold→project path.
+    /// The pure projection lives in rezidnt-state ([`rezidnt_state::orchestration_graph`]),
+    /// so the surface re-derives NOTHING (I3). The optional `run` (via
+    /// `OrchestrationViewArgs`) scopes to the lead whose `lead_run` matches — an
+    /// absent lead yields an empty `leads` vec, never an error.
+    async fn call_orchestration_graph(&self, args: Value) -> RpcOutcome {
+        let parsed: rezidnt_types::mcp::OrchestrationViewArgs = serde_json::from_value(args)
+            .map_err(|e| (-32602, format!("orchestration_graph args: {e}")))?;
+        let events = self.replay(None).await?;
+        let graph = rezidnt_state::fold(events.iter());
+        let mut view = rezidnt_state::orchestration_graph(&graph);
+        // The `run` filter scopes to one lead (the projection's own key), the
+        // whole fleet when absent. Filtering the pure projection's output
+        // re-interprets nothing (I3): an absent lead simply drops to zero rows.
+        if let Some(want) = parsed.run.as_deref() {
+            view.leads.retain(|lead| lead.lead_run == want);
+        }
+        let payload = serde_json::to_value(&view)
+            .map_err(|e| (-32603, format!("encode orchestration_graph: {e}")))?;
+        Ok(tool_ok(payload))
+    }
+
     /// `resources/read` — `rezidnt://run/<ulid>/dossier`, the rezidnt-state
     /// fold of the log (I3: derived state, never a side store). Misses answer
     /// with machine-readable contents, never an error and never a hang.
@@ -1830,6 +1856,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "get_escalations",
                 "description": "Read the outstanding permit escalations (the drill-down detail behind board_view's permit_escalated count): one row per outstanding escalation with run, request_id, action, target, reason, policy_ref. Optional `run` filters to one run. Read-class, no badge (DR-040).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::GetEscalationsArgs))?,
+            },
+            {
+                "name": "orchestration_graph",
+                "description": "Read the derived lead -> parallel sub-runs orchestration graph (whole-log fold, projected): one row per lead with its DERIVED fan-out and one SubRow per delegated sub (sub_run, status, gate verdicts verbatim, integrity_alarms). The lead->sub edge is derived (delegation child_badge_id == sub spawn badge_id); inconclusive verdicts surface verbatim. Optional `run` filters to one lead. Read-class, no badge (DR-042).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::OrchestrationViewArgs))?,
             },
         ]
     }))

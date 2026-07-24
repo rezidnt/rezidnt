@@ -18,6 +18,7 @@
       "input_tokens": 1,
       "output_tokens": 1,
       "session_id": "fixture-session",
+      "badge_id": "beefbeef00000002",
       "gates": {
         "pre_merge": {
           "verdict": "pass",

@@ -198,6 +198,22 @@ pub struct GetEscalationsArgs {
     pub run: Option<String>,
 }
 
+/// `orchestration_graph` — DR-042: read the fleet's lead → parallel sub-runs
+/// orchestration graph as an `OrchestrationView` (each lead's DERIVED fan-out
+/// over its delegated subs). Read-only, idempotent, no badge — in the
+/// `board_view`/`get_escalations` read class (doc §12 as amended by DR-005).
+/// The optional `run` filters to one lead (whole fleet when absent), mirroring
+/// `GetEscalationsArgs`' optional-run-filter shape; the served `inputSchema`
+/// MUST equal `schema_for!` of this shape (doc §9 no-drift).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestrationViewArgs {
+    /// Filter to one lead's fan-out (canonical 26-char ULID text form).
+    /// Absent = the whole fleet's orchestration graph. Additive-optional so
+    /// `schema_for!` stays doc §9 no-drift: absent = OMITTED, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

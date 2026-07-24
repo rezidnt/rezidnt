@@ -24,14 +24,14 @@
 //!   `cost_ms` on `gate.passed`, `action.metered.spend_delta_usd`) — this slice
 //!   mints NO new event field/subject.
 //!
-//! # RED status (oracle deliverable — implementer fills these)
+//! # Status (implemented; signatures are the pinned contract)
 //!
-//! Every public function below is an UNIMPLEMENTED STUB (`todo!()`) carrying
-//! ZERO real logic, so the oracle tests LINK and FAIL AT RUNTIME (the honest
-//! greenfield RED). A stub that accidentally satisfied a criterion would be a
-//! false oracle; there is intentionally no logic to satisfy one. The
-//! implementer replaces each `todo!()` body — the signatures and the report
-//! shape are the pinned contract and MUST NOT change to make a test pass.
+//! The public functions below are IMPLEMENTED and green — the collator, the
+//! `run_cases` orchestration seam, and the `#[cfg(unix)]` `DaemonDriver`. The
+//! signatures and the report shape are the pinned contract and MUST NOT change
+//! to make a test pass: the tests fold recorded logs and assert real numbers,
+//! not stub returns, so a body that accidentally satisfied a criterion would be
+//! a false oracle rather than a passing implementation.
 
 use serde::{Deserialize, Serialize};
 
@@ -164,9 +164,9 @@ pub trait Driver {
 /// from `Case::expect_merge` (the driver's result, not the case's intent, decides
 /// `reached_verified_merge`). `run_cases_default` wires the real daemon driver.
 ///
-/// IMPLEMENTER-OWNED STUB: `todo!()`, zero logic. RED at runtime; the fake-driver
-/// orchestration test asserts the loop against the DRIVER's controlled results,
-/// so a stub that echoed `expect_merge` could not satisfy it.
+/// The fake-driver orchestration test asserts the loop against the DRIVER's
+/// controlled results (not `Case::expect_merge`), so an implementation that
+/// echoed the case's intent could not satisfy it.
 pub fn run_cases(cases: &[Case], driver: &dyn Driver) -> Vec<CaseOutcome> {
     cases
         .iter()
@@ -537,8 +537,6 @@ mod unix_drive {
 /// `expected_cases` names the scenario intents so the deliberately-failing case
 /// scores as a MISS in the denominator (CRITERION 3) rather than being invisible
 /// to the rate.
-///
-/// IMPLEMENTER-OWNED STUB: `todo!()`, zero logic.
 pub fn collate(log: &[Event], expected_cases: &[Case]) -> MetricsReport {
     // Fold the three in-repo metrics off the log (I3), then attach the honest
     // `Inconclusive` precision/recall seam: `collate` is passed no labeled set,
@@ -558,8 +556,6 @@ pub fn collate(log: &[Event], expected_cases: &[Case]) -> MetricsReport {
 /// (§17) and is NOT asserted in-repo — its presence proves the seam EXISTS. The
 /// `_labeled` bytes are the opaque labeled-defect set the external artifact
 /// supplies.
-///
-/// IMPLEMENTER-OWNED STUB: `todo!()`, zero logic.
 pub fn collate_with_labeled_set(
     log: &[Event],
     expected_cases: &[Case],

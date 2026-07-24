@@ -629,7 +629,23 @@ impl AgentRunState {
 pub struct WorktreeState {
     pub status: String,
     pub branch: Option<String>,
-    /// `"rezidnt"` (sole allocator) or `"human"` (out-of-band observation).
+    /// The ALLOCATING PRINCIPAL, copied VERBATIM from the payload (`spec/ontology.md`
+    /// `worktree.allocated` v1, value vocabulary widened 2026-07-24 by DR-044
+    /// §Decision 6): `"rezidnt"` — the daemon on its own initiative, with no
+    /// delegating lead run (every ordinary non-fan-out allocation, unchanged);
+    /// `"run:<ULID>"` — the daemon allocating ON BEHALF OF the named lead run
+    /// (scheme-tagged, never a bare ULID, so a value is always either a
+    /// `<kind>:`-prefixed id or a sentinel from the closed literal set);
+    /// `"human"` — RESERVED for out-of-band observation (`worktree.observed`),
+    /// never emitted by rezidnt on `worktree.allocated`.
+    ///
+    /// The sole-allocator model is UNCHANGED (DR-001): a lead is not a second
+    /// allocator, it requests through the same registry — what widened is the
+    /// recorded principal, not the set of writers. The field stays an OPAQUE
+    /// `Option<String>`: the reducer copies it verbatim and parses nothing, so
+    /// the widening needs no reducer arm and every pre-existing log folds
+    /// bit-identically (I3). Any `run:` scheme interpretation belongs to a
+    /// consumer, never here.
     pub allocator: Option<String>,
     #[serde(default)]
     pub conflicts: u64,
@@ -1616,6 +1632,24 @@ pub struct OrchestrationView {
 /// content-hashed log yields the same view (I3 rebuild-stability). A lead with
 /// no delegation that matches a folded sub produces NO row; `fan_out` is the
 /// derived count of matched subs.
+///
+/// DR-044 §Decision 2(a) — the `sub_run != lead_run` guard. A SAME-RUN
+/// delegation is a legitimate fact this projection deliberately does NOT read:
+/// it is the DR-017 capability-chain record (a parent→child caveat hop WITHIN
+/// one run — a run attenuating its own badge when it declares a role,
+/// `bins/rezidentd/src/runs.rs:985-1005`), minted for replayable authority, not
+/// for orchestration. It shares the `permit.delegated` subject with the genuine
+/// lead→sub edge but lives on a different axis, and the spawning run's own
+/// `agent.spawned.badge_id` is that same attenuated badge (`:929`) — so a
+/// badge-only match reads every role-declaring run as a lead of ITSELF with
+/// `fan_out: 1`. Guarding on the SUB side (not by skipping self-delegating
+/// leads) is what keeps a real lead — which is itself role-declaring, so it
+/// ALWAYS carries a self-edge too — reporting its genuine cross-run subs and a
+/// correct derived `fan_out`. No discriminator field is minted on the fact:
+/// with this guard, "lead-keyed edge whose child badge belongs to a DIFFERENT
+/// run" IS the discriminator, derivable from existing fields (DR-044
+/// §Decision 2b). The guard is depth-agnostic; nested fan-out is out of slice
+/// (DR-044 §Consequences, deferred (b)).
 pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
     let leads = graph
         .agent_runs
@@ -1634,6 +1668,13 @@ pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
             let subs: Vec<SubRow> = graph
                 .agent_runs
                 .iter()
+                // DR-044 §Decision 2(a): the sub-side `sub_run != lead_run`
+                // guard. A same-run delegation is the DR-017 capability-chain
+                // hop, not an orchestration edge, so it contributes no sub and
+                // no `fan_out`. Guarding HERE (not on the lead) leaves a real
+                // lead's cross-run subs intact even though it also carries its
+                // own role self-edge.
+                .filter(|(sub_run, _)| *sub_run != lead_run)
                 .filter(|(_, sub)| match &sub.badge_id {
                     Some(badge) => lead.delegations.iter().any(|d| &d.child_badge_id == badge),
                     None => false,

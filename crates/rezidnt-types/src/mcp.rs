@@ -214,6 +214,69 @@ pub struct OrchestrationViewArgs {
     pub run: Option<String>,
 }
 
+/// `fan_out` — DR-044 §Decision 1: ONE call, N tasks. The first MUTATING tool of
+/// the orchestrator arc: a lead delegates N sub-runs in a single unit, so it
+/// requires a badge (doc §12), checked before any allocation or spawn. N separate
+/// `delegate` calls are REJECTED by the record — a per-call shape can neither
+/// enforce the width cap atomically nor report a fan-out as one unit.
+///
+/// The caller does NOT name the lead: there is no `lead_run` field, because the
+/// lead is the identity the §12 door verified from `badge` (DR-044 §Decision
+/// 1/2b) — a caller-declared parentage would let a run claim authority it does
+/// not hold. Authorization reuses the EXISTING `"spawn"` verb; no new verb and no
+/// new badge kind.
+///
+/// Idempotency (doc §9) composes PER TASK, not per call: each [`FanOutTask`]
+/// carries a required key resolving through the existing per-workspace
+/// `spawn_keys` map. Partial failure is normal and honest — the response is a
+/// per-task outcome vector and a retry with the same keys re-returns the same
+/// runs, spawning nothing new. There is no all-or-nothing rollback; spawns are
+/// not transactional.
+///
+/// I2: this shape carries run/task identifiers only. No sub diff, dossier, or
+/// transcript ever rides a fan-out call or its response — sub work folds back
+/// through the existing per-run CAS-ref paths (DR-044 §Decision 5).
+///
+/// Field order is load-bearing for the doc §9 BINDING no-drift pin: it fixes the
+/// generated `required` array against `spec/fixtures/dr044_fan_out_args.schema.golden.json`
+/// (`crates/rezidnt-types/tests/fanout_schema_no_drift.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FanOutArgs {
+    /// Capability badge token (hex), doc §12. The LEAD's own badge — it both
+    /// authorizes the call (existing `"spawn"` verb) and IDENTIFIES the lead the
+    /// emitted edges are keyed on. Checked before any worktree is allocated or
+    /// any agent spawned; never logged (the verified id is, not the token, I2).
+    pub badge: String,
+    /// Workspace ULID (canonical 26-char text form). One workspace per call —
+    /// cross-workspace fan-out is deferred by name (DR-044 §Consequences (d)).
+    pub workspace: String,
+    /// The tasks to fan out, one sub-run each. Required and never empty in
+    /// practice; a call wider than the `[orchestrator] max_fan_out` DEFAULT is
+    /// refused WHOLE with `FAN_OUT_TOO_WIDE` at the tool boundary, after the
+    /// badge door and before any effect (DR-044 §Decision 4 — the cap is this
+    /// slice's only backpressure, `rezidnt-supervise` does not exist).
+    pub tasks: Vec<FanOutTask>,
+}
+
+/// `fan_out` — DR-044 §Decision 1: one delegated sub-run's task. Carries exactly
+/// the two spawn axes and nothing else: NO per-task badge (the call's `badge` is
+/// the sole authority) and NO worktree or allocator hint — isolation rides the
+/// existing §7 sole-allocator registry, which the daemon drives (DR-044
+/// §Decision 3). A worktree-conflicted task mints NO run and is reported REFUSED,
+/// never as a passed, failed, or inconclusive sub (I6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FanOutTask {
+    /// Spec agent name (the `[[agent]]` entry to spawn as this sub).
+    pub agent: String,
+    /// REQUIRED idempotency key, per task (doc §9, DR-044 §Decision 1). Spawning
+    /// is non-idempotent by nature, so this is not optional — the same discipline
+    /// [`SpawnAgentArgs`] already carries. Resolves through the EXISTING
+    /// per-workspace `spawn_keys` map (log-derived from
+    /// `agent.spawned.idempotency_key`, I3): a retried task with the same key
+    /// returns the SAME run and spawns nothing new. No new dedup mechanism.
+    pub idempotency_key: String,
+}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

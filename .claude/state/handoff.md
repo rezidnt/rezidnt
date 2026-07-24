@@ -1,72 +1,72 @@
-# Handoff — 2026-07-24 (session 24: 3-lane fan-out + secret-scan-native → DR-041 v1 verifier pack COMPLETE)
+# Handoff — 2026-07-24 (session 25: PHASE 3 OPENED · DR-044 live lead→sub fan-out COMPLETE)
 
 ## State of play
-Owner asked to "make progress quicker" via a fanned-out team building vertical slices. Ran a **3-lane parallel
-fan-out** (implementer subagents in isolated git worktrees; orchestrator held the single-lane debrief/vet/merge gate —
-[[fan-out-parallel-build-pattern]]), THEN drove the `secret-scan-native` slice through the full loop
-(oracle→implementer→debrief→fix→re-debrief→vet). Everything merged to `origin/main` (synced, `54d3992`); every merge
-is host `/vet` GREEN (`{"verdict":"pass"}`) + independent auditor `/debrief`. High autonomy ON ([[autonomy-high-trust]]).
-`current-slice` = `secret-scan-native` (**done**).
+Owner opened **Phase 3** for the orchestrator arc (Phase 2's exit criterion is met — `bench/harness/tests/real_driver.rs`
+drives a real `DaemonDriver` end-to-end). The **DR-044 live lead→sub fan-out slice is DONE**: final `/debrief` **PASS**,
+host `/vet` **green at `459ef6d`**, WSL `fan_out_live_e2e` **7/7**. 18 commits, all on `main`, tree clean except the
+pre-existing untracked `.playwright-mcp/` and `docs/site/` (leave them). High autonomy ON ([[autonomy-high-trust]]).
+`current-slice` = `live-lead-sub-fanout` (**done**).
 
-**Headline: the DR-041 v1 production verifier pack is COMPLETE** — verify-subcommand → verify-lints →
-dependency-audit → secret-scan-native all shipped ([[verifier-pack-dr041]]).
+**Shipped:** the governed `fan_out` MCP tool (badge-doored + lead-only, per-task idempotency through the EXISTING
+`spawn_keys` map, honest partial failure with no fake rollback, width cap 8 refused whole-call before any effect), the
+daemon lead→sub path, and the `orchestration_graph` read side now folding a real edge.
 
-## What shipped this session (each merged, vet-green, independently debriefed)
-1. **DR-042 orchestrator read-side deepening** (Lane B, `dfac65c`) — the two owed tests (I3 rebuild-from-log
-   equivalence via the real `rezidnt rebuild` path; §9 schema no-drift golden) + a design-legal richer read-side fold
-   (`SubRow.cost_usd`/`killed_by`, `LeadRow.verdict_rollup`, I6-honest, inconclusive never coerced). Phase-3 live
-   fan-out stayed GATED OFF; no subject minted. [[orchestrator-dr042]].
-2. **DR-041 verify-lints** (Lane A, `ef75cfb`) — real `rezidnt verify clippy` + `fmt-check` §8 exec verifiers, full
-   Decision-4 trap mapping.
-3. **DR-041 dependency-audit** (Lane A, `ef75cfb`) — `cargo audit --json` EXEC verifier, honest inconclusive posture.
-4. **DR-043** (ACCEPTED, `1d3a757`) — ratified + §20-indexed (next DR-044): the CAS-content-ref fix that made
-   secret-scan-native buildable (owner chose Option A).
-5. **DR-041 secret-scan-native** (`54d3992`) — native `secret-scan` scans a new `refs["content"]` CasRef the daemon
-   now emits (per-file RAW added bytes, I2 bytes→CAS); no subject minted (rode existing gate-refs). CLOSES the v1 pack.
-6. **DR-022 benchmark harness** (Lane C) — scope scout found it ALREADY BUILT + green; no rework
-   ([[dr022-benchmark-harness-built]]).
+## Records (3 accepted, 2 errata)
+- **DR-044** — the slice; opens DR-042's Phase-3 gate. Decisions 2b/6 later amended, Decision 3 posture amended.
+- **DR-045** — `fan_out` is **lead-only**; an operator badge is refused on POLICY (`fan_out.lead_only`), kept distinct
+  from `badge.invalid` because an operator badge is *valid*, just the wrong kind (I6). Mirror of DR-032's `kill_run`.
+- **DR-046** — three things the build surfaced: (1) `fan_out` is **structurally same-process-only** (DR-045 × DR-017 §6:
+  the root key is per-process, so a lead's badge dies with the daemon); (2) the lead→sub edge was **mis-modelled** —
+  emitting `permit.delegated` for a fan-out asserted an attenuation that never happened, contaminating
+  `BoardRow.delegated` (chain DEPTH); (3) registry wiring **deferred**. Two errata: the "subject" it asked for was
+  correctly minted as a **field**, and its owed-guard ledger was stale on (f).
 
-## The one that proves the loop works (carry this)
-secret-scan-native's FIRST /debrief **FAILED** on a real I6 silent-pass the makers missed: the daemon pinned content via
-`String::from_utf8_lossy` before `cas.put()`, so a non-UTF-8 NUL-free file reached the native as clean text and could be
-silently passed — the pure-logic test bypassed it by feeding raw bytes straight to the native. Fix: pin exact raw bytes
-so the native's binary guard fires on the PRODUCTION path; added `e2e_binary_no_nul_content_maps_to_inconclusive`
-(oracle proved it non-vacuous against the pre-fix daemon). Re-debrief PASS, then vet. Maker/checker separation is why
-this didn't ship broken.
+## Ontology (warden, 2 sessions)
+1. `worktree.allocated.allocator` widened to admit the scheme-tagged delegating principal `run:<ULID>`; ordinary
+   allocations still emit `"rezidnt"` verbatim. Lockstep fix to `worktree.conflict.holder?`.
+2. **REFUSED** an orchestration subject and minted the **field `agent.spawned.lead_run?`** (bare ULID, `lead_run != run`)
+   on the house discriminator: a property fixed at spawn, 1:1 with the spawn fact, keyed on the sub's own RunId, earns a
+   field. Keying run-to-run discharged **two hazards by construction** — DR-044's silent `fan_out: 0` and the cross-run
+   badge-collision residual. Also corrected `ontology:216`, which asserted a `RepoSubstrate::allocate` path the daemon
+   does not take.
 
-## Owner-settled this session
-- Fan-out: all 3 lanes at once, self-drive per lane (high autonomy). secret-scan blocker → **Option A** (keep native,
-  pin content to CAS) → DR-043 ratified and built.
-
-## Open follow-ups (NON-BLOCKING)
-- **`git stash@{0}`** still holds the subsumed prior-session verify-lints WIP ("… subsumed by Lane A … recoverable").
-  Lane A superseded it and shipped+vet-green — safe to `git stash drop` anytime; kept only because it was prior work.
-- **`bench/harness/src/lib.rs` stale doc** (~lines 27–34) still narrates the fns as `todo!()` stubs though implemented —
-  doc-only cleanup owed ([[dr022-benchmark-harness-built]]).
-- Two standing DR-041 auditor notes for any content-emitting verifier: I2 bytes→CAS on uncapped failure evidence; gate
-  `input.timeout_ms` not propagated to the in-binary verifier budget (both fine today) — [[verifier-pack-dr041]].
-- Stray untracked `.playwright-mcp/`, `docs/site/` — leave them.
+## Open findings (all non-blocking; `/debrief` PASSED with these named)
+- **Source guard is a tripwire, not proof.** `bins/rezidentd/tests/permit_delegated_is_attenuation_only.rs` is the only
+  `rezidentd` test that runs on Windows. It **narrows** the host gap to the known emit site — it does NOT close it (an
+  emit in another file, or a non-literal `Subject::new(CONST)`, evades it). Say "narrowed", never "closed".
+- **Orphan-lead silence:** a sub naming a lead the log never spawned surfaces **no row and no alarm**
+  (`crates/rezidnt-state/src/lib.rs:1755-1763`). Ruled the right call (the alternative invents an entity the log never
+  minted) but the property lives only in a code comment. DR-046 §Decision 8's slice is where someone meets it next.
+- **Line-cite fragility, 3rd occurrence this arc.** `runs.rs:1075-1095` is hard-coded in two files; a 9-line comment
+  insertion invalidated the previous cite. See [[fanout-silent-wrong-pattern]].
+- **Fixture envelope drift:** `spec/fixtures/dr042_orchestration_fanout.jsonl` `source`/causation still differ from the
+  shipped path. No reducer reads either; the edge is faithful, the envelope approximate.
+- **`crates/rezidnt-tui/examples/board_rich.rs:323`** fails WSL clippy (`unnecessary_sort_by`), pre-existing, invisible
+  to host clippy (newer WSL toolchain). Same class as [[golden-txt-crlf-host-vet]].
 
 ## Decisions still needing a /dr
-- None outstanding. DR-041 pack complete; DR-042 orchestrator LIVE fan-out is the next big decision-bearing arc but is
-  Phase-3-gated by its own record (owner's steer on when).
+None outstanding. DR-046 §Decision 8 already **fixes the brief** for the next slice, so it needs a slice, not a record.
 
 ## What's next (owner's steer — nothing forced)
-The v1 verifier pack (the §8 differentiation layer) is done. Strongest candidates: (a) **DR-042 Phase-3 orchestrator
-live fan-out** — the biggest capability, but Phase-3-sequenced (needs the owner to open it; the read-side rails + owed
-tests are now in place); (b) the small named follow-ups above; (c) macOS/Windows backends or the combined single binary
-(named in prior handoffs). No slice is mid-flight.
+**DR-046 §Decision 8 — the registry-convergence slice**, whose brief is fully specified in that record: converge BOTH
+allocation paths (fan-out AND ordinary), because a registry seeing only fan-out cannot guard a fan-out racing an ordinary
+spawn. Known landmines, all verified: `rezidentd` has **no dependency on `rezidnt-adapter-git` at all**; `WorktreeReq`
+has **no principal field** and `alloc_worktree` hardcodes `"rezidnt"`; the adapter's `emit` **broadcasts on a channel
+with a `None` workspace envelope instead of appending to the fabric** (naive repoint ⇒ the allocation fact drops off the
+log, I3) and emits its own `worktree.allocated` (⇒ double-emit); the two path layouts differ (on-disk change). It also
+owes the **injectable allocation seam** — DR-044 §Consequences (e)'s I6 conflict test cannot be written black-box without
+one (paths are ULID-derived, so no test can pre-claim a path) — and a **distinct conflict refusal code** (everything
+collapses to `spawn.failed`). Canaries: `golden_path.rs`, `open_flow.rs:63`, `s2_worktrees.rs`, the adapter's 5 suites.
+Alternative arc: the **owned terminal substrate**, the other Phase-3 line and the actual herdr-removal endgame.
 
 ## Environment (essentials)
-Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done; ended `{"verdict":"pass"}` twice this session). The native
-verifier boards + testkit are cross-platform (host-lintable); the pre_merge e2e (`*_e2e.rs`, incl.
-`secret_scan_content_ref_e2e.rs`) is `#[cfg(unix)]` → WSL ([[wsl-dev-environment]],
-[[vet-is-host-side-wsl-insufficient]]). Host+WSL SEQUENTIAL for vet ([[vet-concurrency-flake]]). Fan-out ops recipe +
-the worktrees-fork-committed-HEAD gotcha in [[fan-out-parallel-build-pattern]]. `gh` authed.
+Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done; green at `459ef6d`). Pure-logic/projection/schema tests are
+host-lintable; `*_e2e.rs` is `#[cfg(unix)]` → WSL ([[wsl-dev-environment]], [[vet-is-host-side-wsl-insufficient]]).
+Host+WSL **sequential** ([[vet-concurrency-flake]]). **Read a record's premises against the tree before building to it**
+— this arc produced four defects of one class, none test-catchable ([[fanout-silent-wrong-pattern]]).
 
 ---
-**NEXT ACTION → DR-041 v1 verifier pack COMPLETE this session (verify-subcommand → verify-lints → dependency-audit →
-secret-scan-native, all on origin/main `54d3992`, host /vet GREEN, each independently debriefed; the secret-scan I6
-silent-pass was caught by /debrief and fixed before merge). DR-043 ACCEPTED + §20-indexed. `current-slice` =
-secret-scan-native (done). NO forced next — owner's steer; strongest candidate is DR-042 Phase-3 orchestrator live
-fan-out (Phase-3-gated, read-side rails now in place). High autonomy ON.**
+**NEXT ACTION → DR-044 slice COMPLETE and closed (Phase 3 opened; DR-044/045/046 accepted; `fan_out` shipped; the
+lead→sub edge is the field `agent.spawned.lead_run?`, NOT the badge-matching derivation DR-042 assumed). Final /debrief
+PASS + host /vet green at `459ef6d`. NO forced next — owner's steer; strongest candidate is the DR-046 §Decision 8
+registry-convergence slice, whose brief is already fixed in that record. High autonomy ON.**

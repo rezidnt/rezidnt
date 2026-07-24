@@ -10,11 +10,15 @@
 use std::sync::Arc;
 
 use rezidnt_gate::permit::{PermitLayer, PermitVerifierSpec};
-use rezidnt_mcp::{BoxFuture, KillAck, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes};
+use rezidnt_mcp::{
+    BoxFuture, FanOutOutcome, KillAck, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes,
+};
+use rezidnt_run::RunId;
 use rezidnt_types::WorkspaceId;
+use rezidnt_types::mcp::FanOutTask;
 use ulid::Ulid;
 
-use crate::runs::{Daemon, begin_open, launch_agent};
+use crate::runs::{Daemon, LeadDelegation, begin_open, launch_agent};
 
 /// Ontology cap on `agent.spawned.idempotency_key` (DEFAULT, ratified
 /// 2026-07-17): a key is a short opaque token, trivially inside I2.
@@ -119,6 +123,9 @@ impl McpSubstrate for McpBridge {
                 // log-derivable across restart (I3; envelope workspace is set
                 // by launch_agent, the ontology's keyed-spawn obligation).
                 Some(&idempotency_key),
+                // A standalone `spawn_agent` has no delegating lead: allocator
+                // stays `"rezidnt"`, no delegation edge (DR-044 §Decision 3).
+                None,
             )
             .await
             .map_err(|e| ToolRefusal::new(codes::SPAWN_FAILED, format!("{e:#}")))?;
@@ -238,6 +245,258 @@ impl McpSubstrate for McpBridge {
             })
         })
     }
+
+    /// DR-044 §Decision 1/2b/3: the live lead→sub fan-out. Drives the EXISTING
+    /// rails and adds no substrate (I4): the same `launch_agent` path
+    /// `spawn_agent` uses, the same per-workspace `spawn_keys` dedup map, the
+    /// same worktree allocation. What is new is the recorded PRINCIPAL
+    /// (`allocator: "run:<lead ULID>"`) and the lead-parented `permit.delegated`
+    /// edge, both emitted inside `launch_agent` where the sub's injected badge is
+    /// in scope.
+    ///
+    /// The core has already run the DR-045 door and the DR-044 §Decision 4 width
+    /// cap, so a refused call never reaches here (no allocation, no spawn, no
+    /// fact — I3).
+    ///
+    /// Shape of the work, per task, IN CALL ORDER:
+    /// - the task's `idempotency_key` resolves through the EXISTING per-workspace
+    ///   `spawn_keys` map (log-derived from `agent.spawned.idempotency_key`, I3
+    ///   — it survives a daemon restart because it is a fold, not memory). A hit
+    ///   re-returns the SAME run and spawns nothing new, emitting no fact;
+    /// - a per-task failure becomes that task's refused outcome and the remaining
+    ///   tasks STAND. There is no all-or-nothing rollback: a mid-fan-out failure
+    ///   does not un-spawn the subs that already started, and pretending
+    ///   otherwise would be a lie (DR-044 §Decision 1);
+    /// - a task that mints no run is REFUSED, never a failed sub — there is no
+    ///   run to fail (I6, DR-044 §Decision 3).
+    ///
+    /// Tasks run SEQUENTIALLY under the registry lock, exactly as `spawn_agent`
+    /// holds it across one spawn: a concurrent same-key retry waits and then hits
+    /// the key map, so idempotency holds without a double spawn (§9). Sequential
+    /// also declines to fire N concurrent allocations at the sole-allocator
+    /// registry — the load risk DR-044 §Consequences names, against which the
+    /// width cap is the only backpressure. There is NO in-daemon retry loop on a
+    /// failed allocation: that is a livelock against a sole allocator, and
+    /// re-issuing the call with the same keys is the honest retry.
+    ///
+    /// I2: nothing here reads or carries sub content. Outcomes are run ULIDs and
+    /// refusal codes; sub work folds back through the existing per-run CAS-ref
+    /// paths (DR-044 §Decision 5).
+    fn fan_out(
+        &self,
+        workspace: String,
+        lead_badge_id: String,
+        tasks: Vec<FanOutTask>,
+    ) -> BoxFuture<Result<Vec<FanOutOutcome>, ToolRefusal>> {
+        let daemon = Arc::clone(&self.daemon);
+        Box::pin(async move {
+            let ws = Ulid::from_string(&workspace).map_err(|_| {
+                ToolRefusal::new(
+                    codes::WORKSPACE_UNKNOWN,
+                    format!("workspace {workspace:?} is not a ULID"),
+                )
+            })?;
+
+            // The LEAD's run is LOG-DERIVED from the badge id the §12 door
+            // verified: fold `agent.spawned.badge_id == lead_badge_id` (I3). No
+            // session object, no side table — DR-044 §Decision 5's whole point,
+            // and the reason the tool has no caller-declared `lead_run` arg.
+            // A badge that maps to no spawned run is a WHOLE-CALL refusal: there
+            // is no lead to key the edges on, and an unparented sub is exactly
+            // what DR-045 exists to make unreachable.
+            let lead_run = badge_run(&daemon, &lead_badge_id).await.ok_or_else(|| {
+                ToolRefusal::new(
+                    codes::RUN_UNKNOWN,
+                    format!(
+                        "no run on this log was spawned under badge {lead_badge_id}; fan_out is \
+                         lead-only and the lead must be a run this daemon spawned (DR-044 \
+                         §Decision 2b, DR-045 §Decision 1)"
+                    ),
+                )
+            })?;
+
+            // The registry lock is held across the WHOLE fan-out (see the doc
+            // comment): same discipline as `spawn_agent`, one call wide.
+            let mut workspaces = daemon.workspaces.lock().await;
+            if !workspaces.contains_key(&ws) {
+                return Err(ToolRefusal::new(
+                    codes::WORKSPACE_UNKNOWN,
+                    format!("workspace {workspace} is not open on this daemon"),
+                ));
+            }
+
+            // ONE correlation for the whole fan-out: the N sub spawns are one
+            // causal unit, and the envelope's `correlation` is the causal chain
+            // (design §5). Mirrors the open chain, whose spawns already share the
+            // open's correlation.
+            let correlation = Ulid::new();
+            let lead = LeadDelegation {
+                lead_run,
+                lead_badge_id,
+            };
+
+            let mut outcomes = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                let FanOutTask {
+                    agent,
+                    idempotency_key,
+                } = task;
+
+                // Ontology constraint on `agent.spawned.idempotency_key` (v1):
+                // non-empty, ≤ 256 bytes UTF-8. Refused PER TASK, so one bad key
+                // costs one sub and the rest of the fan-out stands.
+                if idempotency_key.is_empty() || idempotency_key.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+                    outcomes.push(refused(
+                        agent,
+                        idempotency_key,
+                        codes::ARGS_INVALID,
+                        format!(
+                            "idempotency_key must be non-empty and at most \
+                             {IDEMPOTENCY_KEY_MAX_BYTES} bytes UTF-8"
+                        ),
+                    ));
+                    continue;
+                }
+
+                let Some(entry) = workspaces.get(&ws) else {
+                    // Unreachable in practice (checked above, lock held), but the
+                    // registry is not this function's invariant to assert.
+                    return Err(ToolRefusal::new(
+                        codes::WORKSPACE_UNKNOWN,
+                        format!("workspace {workspace} closed mid-fan-out"),
+                    ));
+                };
+
+                // §9 idempotency, PER TASK, through the EXISTING map — no new
+                // dedup mechanism (DR-044 §Decision 1). A hit spawns nothing and
+                // emits nothing; the run it returns already carries its edge.
+                if let Some(run) = entry.spawn_keys.get(&idempotency_key) {
+                    outcomes.push(spawned(agent, idempotency_key, run.to_string()));
+                    continue;
+                }
+
+                let Some(agent_spec) = entry.agents.iter().find(|a| a.name == agent).cloned()
+                else {
+                    outcomes.push(refused(
+                        agent.clone(),
+                        idempotency_key,
+                        codes::AGENT_UNKNOWN,
+                        format!("workspace {workspace} defines no agent {agent:?}"),
+                    ));
+                    continue;
+                };
+                let root = entry.root.clone();
+                let gate_defs = entry.gates.clone();
+                let egress_spec = entry.egress.clone();
+
+                let root = match tokio::fs::canonicalize(&root).await {
+                    Ok(root) => root,
+                    Err(e) => {
+                        outcomes.push(refused(
+                            agent,
+                            idempotency_key,
+                            codes::SPAWN_FAILED,
+                            format!("canonicalize workspace root {}: {e}", root.display()),
+                        ));
+                        continue;
+                    }
+                };
+
+                match launch_agent(
+                    &daemon,
+                    &agent_spec,
+                    &root,
+                    WorkspaceId::new(ws),
+                    correlation,
+                    None,
+                    &gate_defs,
+                    &egress_spec,
+                    Some(&idempotency_key),
+                    // The delegating lead: this is what makes the allocation
+                    // record `run:<lead ULID>` and mints the lead-keyed
+                    // `permit.delegated` edge (DR-044 §Decision 2b/3).
+                    Some(&lead),
+                )
+                .await
+                {
+                    Ok(run) => {
+                        if let Some(entry) = workspaces.get_mut(&ws) {
+                            entry.spawn_keys.insert(idempotency_key.clone(), run.ulid());
+                        }
+                        outcomes.push(spawned(agent, idempotency_key, run.ulid().to_string()));
+                    }
+                    // A failed task mints NO run, so nothing can fold as `fail` —
+                    // it is reported REFUSED (I6, DR-044 §Decision 3) and the
+                    // remaining tasks continue. NOTE (honest scope): the failure
+                    // that reaches here is whatever `launch_agent` reports,
+                    // including a worktree it could not claim. This path allocates
+                    // through the daemon's own git-CLI `allocate_worktree`
+                    // (`runs.rs`), NOT the git adapter's registry, so it produces
+                    // no `worktree.conflict` fact and cannot honestly claim that
+                    // code — the refusal carries `spawn.failed` with the real
+                    // message rather than a guessed conflict.
+                    Err(e) => outcomes.push(refused(
+                        agent,
+                        idempotency_key,
+                        codes::SPAWN_FAILED,
+                        format!("{e:#}"),
+                    )),
+                }
+            }
+            Ok(outcomes)
+        })
+    }
+}
+
+/// One admitted task's outcome: a run, no refusal.
+fn spawned(agent: String, idempotency_key: String, run: String) -> FanOutOutcome {
+    FanOutOutcome {
+        agent,
+        idempotency_key,
+        run: Some(run),
+        code: None,
+        message: None,
+    }
+}
+
+/// One refused task's outcome: a machine-readable code, NO run — a refused sub
+/// is never a failed sub, because no run was minted (I6, DR-044 §Decision 3).
+fn refused(agent: String, idempotency_key: String, code: &str, message: String) -> FanOutOutcome {
+    FanOutOutcome {
+        agent,
+        idempotency_key,
+        run: None,
+        code: Some(code.to_string()),
+        message: Some(message),
+    }
+}
+
+/// Fold the log to find the run spawned under a given badge id — the honest,
+/// log-derived lead identity (I3), off the async threads (SQLite replay is
+/// blocking). `agent.spawned.badge_id` is a REQUIRED v1 field, so this is a
+/// direct read of an existing fact; `None` when no run on the log runs under
+/// that badge.
+async fn badge_run(daemon: &Arc<Daemon>, badge_id: &str) -> Option<RunId> {
+    let fabric = Arc::clone(&daemon.fabric);
+    let badge_id = badge_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let events = fabric.replay_since(None).ok()?;
+        events.into_iter().find_map(|e| {
+            if e.subject.as_str() == "agent.spawned"
+                && e.payload()["badge_id"].as_str() == Some(&badge_id)
+            {
+                e.payload()["run"]
+                    .as_str()
+                    .and_then(|r| Ulid::from_string(r).ok())
+                    .map(RunId::new)
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Fold the log to find a run's pid (recorded on its `agent.spawned` fact by

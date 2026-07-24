@@ -642,6 +642,9 @@ async fn try_materialize_open(
             // Spec-driven open-chain spawns are keyless (ontology: the key is
             // never synthesized).
             None,
+            // The daemon opens on its own initiative: no delegating lead, so the
+            // allocator stays `"rezidnt"` and no delegation edge is emitted.
+            None,
         )
         .await
         {
@@ -657,6 +660,23 @@ async fn try_materialize_open(
     }
 }
 
+/// DR-044 §Decision 2b/3 — the delegating LEAD behind a fan-out sub spawn.
+/// Present ONLY on the `fan_out` path ([`crate::mcp::McpBridge::fan_out`]);
+/// `None` on every ordinary spawn, which is what keeps "the daemon allocated
+/// this on its own initiative" expressible on the log.
+///
+/// Carries the two things a sub spawn needs from its lead and nothing else: the
+/// lead's RUN (the key the delegation edge is emitted on, and the ULID inside
+/// the scheme-tagged `run:<ULID>` allocator principal) and the lead's VERIFIED
+/// §12 badge id (the parent end of the edge — never the token, I2/§12).
+pub struct LeadDelegation {
+    /// The lead's RunId — the run that CALLED `fan_out`.
+    pub lead_run: RunId,
+    /// The lead's badge id as the §12 door verified it (`hex(blake3(sig)[..8])`,
+    /// DR-018 §Decision (a)). Never the badge token.
+    pub lead_badge_id: String,
+}
+
 /// Allocate a worktree and spawn one agent under capture; returns the minted
 /// run id. `causation` is the triggering fact (`workspace.spec.applied` on
 /// the open chain; `None` for a standalone MCP `spawn_agent`).
@@ -664,6 +684,11 @@ async fn try_materialize_open(
 /// `agent.spawned` payload so the key→run map is log-derivable (I3; ontology
 /// v1 additive field, ratified 2026-07-17) — `None` for keyless paths (socket
 /// `open` chain), never synthesized.
+///
+/// `lead` (DR-044 §Decision 2b/3) marks this spawn as a fan-out SUB: it changes
+/// the recorded allocator principal and adds ONE lead-parented
+/// `permit.delegated` edge. `None` — the overwhelmingly common case — leaves
+/// every emitted fact byte-identical to the pre-DR-044 path.
 #[allow(clippy::too_many_arguments)]
 pub async fn launch_agent(
     daemon: &Arc<Daemon>,
@@ -675,6 +700,7 @@ pub async fn launch_agent(
     gate_defs: &BTreeMap<String, GateSpec>,
     egress_spec: &rezidnt_run::spec::EgressSpec,
     idempotency_key: Option<&str>,
+    lead: Option<&LeadDelegation>,
 ) -> anyhow::Result<RunId> {
     let run = RunId::new(Ulid::new());
     let run_str = run.ulid().to_string();
@@ -712,6 +738,27 @@ pub async fn launch_agent(
     // 3. worktree.allocated — minimal git-CLI allocation (S2 owns the full
     // RepoSubstrate adapter; S1 keeps this to allocate-and-emit).
     let (worktree, branch) = allocate_worktree(repo, agent, run).await?;
+    // `worktree.allocated.allocator` v1 (ontology, value vocabulary widened by
+    // the warden 2026-07-24 under DR-044 §Decision 3) — the allocating
+    // PRINCIPAL: on whose initiative rezidnt allocated this tree.
+    //
+    // `None` ⇒ `"rezidnt"` VERBATIM: the daemon on its own initiative, with no
+    // delegating lead. Every ordinary (non-fan-out) allocation keeps this value
+    // unchanged — a delegating value is NEVER retrofitted onto an ordinary
+    // spawn, because that would make "on its own initiative" unexpressible.
+    //
+    // `Some(lead)` ⇒ scheme-TAGGED `run:<lead RunId ULID>` (a bare ULID is not
+    // legal on this field), so the log ALONE answers "which lead allocated this
+    // worktree". The sole-allocator model is untouched (DR-001): a lead is not a
+    // second allocator — it requests a tree through this same path under the same
+    // registry with the same conflict semantics; what widened is the recorded
+    // principal, not the set of allocators. The discovery branches that test
+    // `allocator == "human"` (`crates/rezidnt-adapters/git/src/lib.rs:412`,
+    // `:579`) correctly land a `run:<ULID>` value in the not-human branch.
+    let allocator = match lead {
+        Some(lead) => format!("run:{}", lead.lead_run.ulid()),
+        None => "rezidnt".to_string(),
+    };
     let allocated_id = publish(
         &daemon.fabric,
         Event::new(
@@ -724,7 +771,7 @@ pub async fn launch_agent(
             json!({
                 "path": worktree.display().to_string(),
                 "branch": branch,
-                "allocator": "rezidnt",
+                "allocator": allocator,
             }),
         )?,
     )
@@ -998,6 +1045,50 @@ pub async fn launch_agent(
                     "parent_badge_id": base_badge.badge_id(),
                     "child_badge_id": child.badge_id(),
                     "added_caveats": added_caveats,
+                }),
+            )?,
+        )
+        .await?;
+    }
+
+    // DR-044 §Decision 2b: the genuinely LEAD-PARENTED delegation edge, emitted
+    // ONLY on the `fan_out` path. Keyed `run` = the LEAD's run (NOT this sub's),
+    // so the reducer folds it onto the LEAD's dossier and `orchestration_graph`
+    // reads a CROSS-RUN sub. `parent_badge_id` = the lead's VERIFIED §12 badge id
+    // (never the token — I2/§12). `child_badge_id` = `injected_badge.badge_id()`,
+    // which is the SAME binding `agent.spawned.badge_id` is read from a few lines
+    // below — the identity is structural here, not reconstructed, because DR-044
+    // warns that if the two ever diverge the graph silently reports `fan_out: 0`.
+    //
+    // A DIFFERENT AXIS from the DR-017 self-edge above, which stays exactly as
+    // it is: that one is a capability-chain record (ONE run, a parent→child
+    // caveat hop when the spec declares a role); this one records a delegation of
+    // authority from one run to ANOTHER. They share the subject deliberately —
+    // DR-044 §Decision 2b mints no discriminator field, because "a lead-keyed
+    // edge whose child badge belongs to a different run" IS the discriminator,
+    // and the projection's `sub_run != lead_run` guard is what reads it.
+    //
+    // `added_caveats` is `[]` and means it: this hop appends NO caveat to the
+    // parent badge. The sub's badge is a fresh mint over the SUB's own run scope
+    // (above), not an offline attenuation of the lead's macaroon, so there is no
+    // appended predicate to record — and the ontology's `added_caveats` is a
+    // REQUIRED field, making the empty list the only truthful value available.
+    // The record fixes the three id fields and says nothing about this one.
+    if let Some(lead) = lead {
+        publish(
+            &daemon.fabric,
+            Event::new(
+                SourceId::new("rezidnt-run"),
+                Some(workspace),
+                Subject::new("permit.delegated"),
+                correlation,
+                Some(allocated_id),
+                1,
+                json!({
+                    "run": lead.lead_run,
+                    "parent_badge_id": lead.lead_badge_id,
+                    "child_badge_id": injected_badge.badge_id(),
+                    "added_caveats": [],
                 }),
             )?,
         )

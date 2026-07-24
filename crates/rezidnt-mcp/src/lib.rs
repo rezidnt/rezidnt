@@ -16,7 +16,8 @@
 //! Surface pinned by the board:
 //! - tools: `open_project`, `spawn_agent`, `gate_explain`, `tail_events`,
 //!   `board_view` (DR-039 read-only fleet projection),
-//!   `get_escalations` (DR-040 read-only outstanding-escalations projection);
+//!   `get_escalations` (DR-040 read-only outstanding-escalations projection),
+//!   `fan_out` (DR-044 lead→sub delegation, DR-045 lead-only door);
 //!   every `inputSchema` served by `tools/list` MUST equal
 //!   `schemars::schema_for!` of the matching `rezidnt_types::mcp` type
 //!   (doc §9 no-drift rule).
@@ -78,7 +79,30 @@ pub mod codes {
     /// permanent) is structurally unreachable on the log. Additive code — older
     /// peers tolerate an unknown refusal code (I5).
     pub const SCOPE_REQUIRES_TTL: &str = "scope.requires_ttl";
+    /// DR-044 §Decision 4 — `fan_out` carried more tasks than the
+    /// `[orchestrator] max_fan_out` DEFAULT ([`crate::MAX_FAN_OUT_DEFAULT`]).
+    /// Refuses the WHOLE call after the badge door and BEFORE any allocation or
+    /// spawn: zero partial effect. This cap is the slice's ONLY backpressure
+    /// (`rezidnt-supervise` does not exist), so it is a single door, not
+    /// defence-in-depth. Additive code — older peers tolerate an unknown
+    /// refusal code (the `scope.requires_ttl` precedent, I5).
+    pub const FAN_OUT_TOO_WIDE: &str = "fan_out.too_wide";
+    /// DR-045 §Decision 2 — `fan_out` is LEAD-ONLY: the presented value is an
+    /// ADMITTED DR-005 operator token, which is *valid* but the wrong KIND for a
+    /// run-scoped capability. Deliberately NOT `BADGE_INVALID`: telling the
+    /// caller its badge is bad would be false, an honesty regression (I6,
+    /// DR-045 §Invariant posture). Refused on POLICY, before any effect.
+    pub const FAN_OUT_LEAD_ONLY: &str = "fan_out.lead_only";
 }
+
+/// DR-044 §Decision 4 — the DEFAULT width cap: at most this many tasks ride one
+/// `fan_out` call. Overridable per project via `[orchestrator] max_fan_out` (a
+/// DEFAULT, revisable without a DR); exposed as a const so the cap is ONE number
+/// in ONE place. A call at exactly the cap is ADMITTED (the check is a strict
+/// `>`). Honesty (DR-044 §Decision 4): the plan's `rezidnt-supervise` backoff /
+/// circuit-breaker does not exist in this tree, so this cap is the only
+/// backpressure the fan-out path has.
+pub const MAX_FAN_OUT_DEFAULT: usize = 8;
 
 /// MCP protocol version this server speaks (DEFAULT: the current spec rev).
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -173,6 +197,42 @@ pub struct KillAck {
     /// SIGTERM; `"kill"`/`Some("kill")` → escalated to SIGKILL). `None` when the
     /// substrate reports no escalation detail.
     pub escalation: Option<String>,
+}
+
+/// DR-044 §Decision 1 — ONE delegated task's outcome. Exactly one of `run`
+/// (spawned, or deduped onto an existing run by its idempotency key) or `code`
+/// (refused) is present; the response is a VECTOR of these, one per task, in
+/// CALL ORDER. Mirrors [`KillAck`]/[`OpenAck`]: a substrate ack type owned by
+/// this crate and serialized into the tool result.
+///
+/// Partial failure is normal and honest (DR-044 §Decision 1): a refused task
+/// does NOT collapse the call and does NOT roll back the subs that already
+/// spawned — spawns are not transactional and pretending otherwise would be a
+/// lie. A task whose worktree could not be claimed mints NO run: it is REFUSED,
+/// never reported as a failed sub (there is no run to fail — I6, DR-044
+/// §Decision 3).
+///
+/// I2 (DR-044 §Decision 5, "a criterion, not a guideline"): these five fields
+/// are the CLOSED set. Run ULIDs and refusal codes only — no sub diff, dossier,
+/// or transcript bytes ride the control plane; sub work folds back through the
+/// existing per-run CAS-ref paths and the lead reads `orchestration_graph`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FanOutOutcome {
+    /// The spec agent name this task named, echoed so the caller can correlate.
+    pub agent: String,
+    /// The task's idempotency key, echoed — the correlation the caller keys on.
+    pub idempotency_key: String,
+    /// The sub's run ULID when the task was admitted (a same-key retry
+    /// re-returns the SAME run). `None` on a refused task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// The machine-readable refusal code when the task was refused. `None` on an
+    /// admitted task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Why, on a refusal — prose for triage, never a substitute for `code`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// The resolved `[gates.permit]` verifier set for a run — the ordered verifier
@@ -349,6 +409,42 @@ pub trait McpSubstrate: Send + Sync {
     /// writer. A `ToolRefusal` here (e.g. the run is not live) becomes a
     /// machine-readable tool error and emits NO fact.
     fn kill_run(&self, run: String) -> BoxFuture<Result<KillAck, ToolRefusal>>;
+
+    /// DR-044 §Decision 1/2b/3: delegate N sub-runs for ONE lead, in call order.
+    /// The core drives this ONLY after the DR-045 lead-only door admits the
+    /// caller and the DR-044 §Decision 4 width cap passes — a refused call never
+    /// reaches here, so it allocates no worktree, spawns nothing, and writes no
+    /// fact (I3).
+    ///
+    /// `lead_badge_id` is the id the §12 door VERIFIED, never a caller-declared
+    /// field (DR-044 §Decision 1/2b: the lead is the identity the door
+    /// established). The substrate resolves the lead's RUN from it by folding
+    /// `agent.spawned.badge_id == lead_badge_id` — log-derived, no session
+    /// object (I3).
+    ///
+    /// Returns one [`FanOutOutcome`] per task, in call order. A `ToolRefusal`
+    /// here is a WHOLE-CALL refusal (e.g. the badge maps to no run on this log);
+    /// a per-TASK failure rides its own outcome and leaves the other tasks
+    /// standing (DR-044 §Decision 1: no all-or-nothing rollback).
+    ///
+    /// DEFAULTED so every existing implementation compiles untouched: adding
+    /// this method must not require editing a single existing test. A substrate
+    /// that does not implement it answers `SUBSTRATE_UNAVAILABLE` — honest
+    /// absence, never a synthesized success.
+    fn fan_out(
+        &self,
+        workspace: String,
+        lead_badge_id: String,
+        tasks: Vec<rezidnt_types::mcp::FanOutTask>,
+    ) -> BoxFuture<Result<Vec<FanOutOutcome>, ToolRefusal>> {
+        let _ = (workspace, lead_badge_id, tasks);
+        Box::pin(async {
+            Err(ToolRefusal::new(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "this substrate implements no fan_out path",
+            ))
+        })
+    }
 }
 
 /// The transport-agnostic MCP core: one JSON-RPC request in, one response
@@ -541,6 +637,7 @@ impl McpCore {
             "board_view" => self.call_board_view(args).await,
             "get_escalations" => self.call_get_escalations(args).await,
             "orchestration_graph" => self.call_orchestration_graph(args).await,
+            "fan_out" => self.call_fan_out(args).await,
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
@@ -702,6 +799,149 @@ impl McpCore {
         };
         match substrate.spawn_agent(workspace, agent, key).await {
             Ok(run) => Ok(tool_ok(json!({"run": run}))),
+            Err(refusal) => Ok(tool_refused(&refusal.code, &refusal.message)),
+        }
+    }
+
+    /// DR-045 §Decision 1 — the LEAD-ONLY §12 door, the third door beside
+    /// [`Self::check_badge`] (dual-path) and [`Self::check_operator_badge`]
+    /// (operator-only), in the DR-032 shape. `fan_out` admits ONLY an agent
+    /// MACAROON verified at the §12 door: fan-out is a run-scoped capability, and
+    /// an operator badge maps to NO run, so there would be no lead to key the
+    /// `permit.delegated` edge on (DR-044 §Decision 2b) and the graph would gain
+    /// an unparented sub.
+    ///
+    /// Door order (DR-045 §Decision 3), refusal BEFORE any effect:
+    /// 1. no `badge` arg → `BADGE_REQUIRED`;
+    /// 2. an ADMITTED DR-005 operator token → `FAN_OUT_LEAD_ONLY`, refused on
+    ///    POLICY, not on verification — the token IS valid, it is the wrong
+    ///    KIND, and calling it `BADGE_INVALID` would misstate why (I6);
+    /// 3. anything else → the macaroon leg of [`Self::check_badge`], which
+    ///    answers `BADGE_INVALID` for an unparseable value, a foreign root key, a
+    ///    broken MAC chain, an unsatisfied caveat, or a keyless core.
+    ///
+    /// Returns the VERIFIED sig-derived `badge_id` — the lead's identity, which
+    /// the substrate folds a run from. NEVER the token (§12/I2).
+    ///
+    /// This does NOT retrofit DR-032's `kill_run` door, which still answers
+    /// `BADGE_INVALID` for a valid macaroon (DR-045 §Decision 4: that conflation
+    /// is noted there, deliberately not fixed here — it needs its own record).
+    fn check_lead_badge(&self, args: &Value, verb: &str) -> Result<String, Value> {
+        let Some(presented) = args.get("badge").and_then(Value::as_str) else {
+            return Err(tool_refused(
+                codes::BADGE_REQUIRED,
+                "fan_out requires the lead's own badge argument (doc §12, DR-044 §Decision 1)",
+            ));
+        };
+        // Step 2 — the POLICY refusal. Scoped so the read lock is released
+        // before `check_badge` takes it again on the fall-through.
+        let is_operator_token = {
+            let book = self
+                .badges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            book.id_for(presented).is_some()
+        };
+        if is_operator_token {
+            return Err(tool_refused(
+                codes::FAN_OUT_LEAD_ONLY,
+                "fan_out is lead-only: this operator badge is VALID but is the wrong kind — \
+                 fan-out is a run-scoped capability and an operator badge maps to no lead run \
+                 (DR-045 §Decision 1). Spawn a lead, or use spawn_agent for parallel runs.",
+            ));
+        }
+        // Step 3 — reuse the EXISTING macaroon verification verbatim. The
+        // operator leg inside re-checks the BadgeBook and misses by construction
+        // (we just proved this value is not an admitted token), so this is the
+        // macaroon path and its `BADGE_INVALID` refusals carry through unchanged.
+        self.check_badge(args, verb)
+    }
+
+    /// `fan_out` — DR-044 §Decision 1 (one call, N tasks) under DR-045's
+    /// lead-only door. The lead delegates N sub-runs as ONE unit: N separate
+    /// `delegate` calls are rejected by the record because a per-call shape can
+    /// neither enforce the width cap atomically nor report a fan-out as one unit.
+    ///
+    /// Ordering is the whole contract, and every step before the substrate takes
+    /// ZERO effect — no worktree allocated, no agent spawned, no fact written:
+    /// 1. the DR-045 lead-only door ([`Self::check_lead_badge`], verb `"spawn"` —
+    ///    DR-044 §Decision 1 derives the EXISTING verb; no new verb, no new badge
+    ///    kind);
+    /// 2. args deserialized THROUGH the advertised shape so the served
+    ///    `inputSchema` and the accepted args cannot diverge (doc §9 no-drift);
+    /// 3. the DR-044 §Decision 4 width cap, refusing the WHOLE call;
+    /// 4. only then the substrate.
+    ///
+    /// The response is `{"outcomes": [...]}`, one entry per task IN CALL ORDER
+    /// (DR-044 §Decision 1). A per-task refusal is NOT a call failure: the
+    /// surviving subs stand and are reported. There is no all-or-nothing
+    /// rollback — see [`FanOutOutcome`].
+    async fn call_fan_out(&self, args: Value) -> RpcOutcome {
+        // 1. The door FIRST (§12). Its verified id IS the lead's identity — the
+        //    caller never declares parentage (DR-044 §Decision 1/2b), which is
+        //    why `FanOutArgs` has no `lead_run` field.
+        let lead_badge_id = match self.check_lead_badge(&args, "spawn") {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
+        // 2. Deserialize through the advertised shape (doc §9 no-drift).
+        let parsed: rezidnt_types::mcp::FanOutArgs = match serde_json::from_value(args.clone()) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Ok(tool_refused(
+                    codes::ARGS_INVALID,
+                    "fan_out requires badge, workspace, and tasks[{agent, idempotency_key}]",
+                ));
+            }
+        };
+        // 3a. A ZERO-task call is a caller bug, refused LOUDLY rather than
+        //     answered with an empty outcome vector: `{"outcomes": []}` would let
+        //     a broken caller believe it fanned out. DR-044 does not define this
+        //     case; the house posture (loud honesty over a silent no-op) settles
+        //     it. Ordinary arg validation, so it reuses `ARGS_INVALID` — the same
+        //     idiom as the daemon's non-empty/≤256-byte `idempotency_key` check —
+        //     and mints no code. Sits WITH the width cap because both are
+        //     arg-shape refusals that must leave the log untouched; the two are
+        //     disjoint (a list cannot be both empty and over-wide), so the order
+        //     between them carries no meaning.
+        if parsed.tasks.is_empty() {
+            return Ok(tool_refused(
+                codes::ARGS_INVALID,
+                "fan_out requires at least one task: a zero-task call is refused rather than \
+                 answered with an empty outcome vector, so a caller can never mistake it for a \
+                 fan-out that happened",
+            ));
+        }
+        // 3b. The width cap — the WHOLE call, before any allocation or spawn
+        //     (DR-044 §Decision 4). A strict `>`: a call at exactly the cap is
+        //     admitted. This is the slice's ONLY backpressure.
+        if parsed.tasks.len() > MAX_FAN_OUT_DEFAULT {
+            return Ok(tool_refused(
+                codes::FAN_OUT_TOO_WIDE,
+                format!(
+                    "fan_out carried {} tasks; the max_fan_out DEFAULT is {MAX_FAN_OUT_DEFAULT} \
+                     (DR-044 §Decision 4). The whole call is refused — nothing was allocated and \
+                     nothing was spawned.",
+                    parsed.tasks.len()
+                ),
+            ));
+        }
+        // 4. The substrate.
+        let Some(substrate) = &self.substrate else {
+            return Ok(tool_refused(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "no run substrate is wired to this MCP core",
+            ));
+        };
+        match substrate
+            .fan_out(parsed.workspace, lead_badge_id, parsed.tasks)
+            .await
+        {
+            Ok(outcomes) => {
+                let encoded = serde_json::to_value(&outcomes)
+                    .map_err(|e| (-32603, format!("encode fan_out outcomes: {e}")))?;
+                Ok(tool_ok(json!({"outcomes": encoded})))
+            }
             Err(refusal) => Ok(tool_refused(&refusal.code, &refusal.message)),
         }
     }
@@ -1861,6 +2101,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "orchestration_graph",
                 "description": "Read the derived lead -> parallel sub-runs orchestration graph (whole-log fold, projected): one row per lead with its DERIVED fan-out and one SubRow per delegated sub (sub_run, status, gate verdicts verbatim, integrity_alarms). The lead->sub edge is derived (delegation child_badge_id == sub spawn badge_id); inconclusive verdicts surface verbatim. Optional `run` filters to one lead. Read-class, no badge (DR-042).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::OrchestrationViewArgs))?,
+            },
+            {
+                "name": "fan_out",
+                "description": "Delegate N sub-runs from one lead in a single call (mutating: LEAD-ONLY). Admits only a verified agent macaroon under the existing `spawn` verb; an operator badge is refused fan_out.lead_only (DR-045). A call wider than max_fan_out is refused fan_out.too_wide as a whole, before any allocation or spawn (DR-044 §4). Returns one outcome per task in call order, each either {run} or {code, message}: partial failure is honest and there is no rollback.",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::FanOutArgs))?,
             },
         ]
     }))

@@ -250,11 +250,15 @@ pub struct FanOutArgs {
     /// Workspace ULID (canonical 26-char text form). One workspace per call —
     /// cross-workspace fan-out is deferred by name (DR-044 §Consequences (d)).
     pub workspace: String,
-    /// The tasks to fan out, one sub-run each. Required and never empty in
-    /// practice; a call wider than the `[orchestrator] max_fan_out` DEFAULT is
-    /// refused WHOLE with `FAN_OUT_TOO_WIDE` at the tool boundary, after the
-    /// badge door and before any effect (DR-044 §Decision 4 — the cap is this
-    /// slice's only backpressure, `rezidnt-supervise` does not exist).
+    /// The tasks to fan out, one sub-run each. BOTH ends of the length are
+    /// refused at the tool boundary, after the badge door and before any effect
+    /// — the schema cannot express either bound, so the door enforces them:
+    /// an EMPTY list is refused `ARGS_INVALID` (a zero-task call is a caller bug
+    /// and is answered loudly, never with an empty outcome vector that a broken
+    /// caller could read as a fan-out that happened), and a list wider than the
+    /// `[orchestrator] max_fan_out` DEFAULT is refused WHOLE with
+    /// `FAN_OUT_TOO_WIDE` (DR-044 §Decision 4 — the cap is this slice's only
+    /// backpressure, `rezidnt-supervise` does not exist).
     pub tasks: Vec<FanOutTask>,
 }
 

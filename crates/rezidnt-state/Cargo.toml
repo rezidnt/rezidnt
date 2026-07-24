@@ -18,3 +18,11 @@ ulid.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 time.workspace = true
+# rezidnt-fabric + tempfile (DR-042 rebuild-equivalence oracle only): the I3
+# owed test persists the orchestration fan-out to a REAL SQLite `EventLog` and
+# reads it back exactly as `rezidnt rebuild` does (`EventLog::open` →
+# `read_from(1)` → fold), proving the graph survives a persist→rebuild
+# round-trip, not just an in-memory Materializer replay. Test-only; no runtime
+# dependency added (I7). `rezidnt-fabric` is already a workspace member.
+rezidnt-fabric.workspace = true
+tempfile.workspace = true

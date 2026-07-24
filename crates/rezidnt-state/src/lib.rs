@@ -1538,6 +1538,42 @@ pub struct SubRow {
     /// The sub's replay-divergence alarm count, from
     /// [`AgentRunState::integrity_alarms`] length. Honest zero when clean.
     pub integrity_alarms: usize,
+    /// DR-042 §Consequences ("recorded cost"): the sub's recorded cost in USD,
+    /// folded VERBATIM from `agent.completed.cost.total_usd`
+    /// ([`AgentRunState::total_usd`], a shipped S1 fold) — an EXISTING fact, no
+    /// new subject. `None` for a sub with no `agent.completed` yet (mid-flight):
+    /// honest absence, NEVER synthesized to 0.0 (I3/DR-012 declared-vs-absent).
+    /// `#[serde(default)]` keeps pre-existing serialized views parsing (I3).
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// DR-032/DR-042: the loggable operator badge id if a human KILLED this sub,
+    /// folded VERBATIM from [`AgentRunState::killed_by`] (`agent.signaled`, a
+    /// shipped fold) — an EXISTING fact, no new subject. `None` = not
+    /// operator-killed (a daemon-reaper stop carries no operator id). Interrogable
+    /// alongside `status` (I6); `#[serde(default)]` keeps older views parsing (I3).
+    #[serde(default)]
+    pub killed_by: Option<String>,
+}
+
+/// DR-042 §Decision 2 ("folded verdicts") / §Invariant I6 ("the orchestrator
+/// folds verdicts") — a lead's folded verdict tally across its delegated subs, a
+/// PURE derivation over the subs' ALREADY-folded gate state (no new subject, no
+/// new fold: [`SubRow::verdicts`] is the input). Each sub lands in EXACTLY ONE
+/// bucket (conservation): `failed` if ANY of its gates is `fail` (a fail
+/// dominates); else `inconclusive` if ANY gate is `inconclusive` (I6 — an
+/// inconclusive sub is NEVER counted as passed); else `passed` if it has ≥1 gate
+/// and all are `pass`; else `pending` (no terminal verdict — no gates, or only
+/// `entered`). The four buckets sum to the lead's `fan_out`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VerdictRollup {
+    /// Subs whose gates are all `pass` (≥1 gate).
+    pub passed: usize,
+    /// Subs with any `fail` gate — a fail dominates a mixed sub.
+    pub failed: usize,
+    /// Subs with any `inconclusive` gate and no `fail` — I6, never coerced up.
+    pub inconclusive: usize,
+    /// Subs with no terminal gate verdict yet (no gates, or only `entered`).
+    pub pending: usize,
 }
 
 /// DR-042: one lead run's fan-out over its delegated sub-runs. The lead→sub edge
@@ -1554,6 +1590,12 @@ pub struct LeadRow {
     /// One row per matched delegated sub, in deterministic (sub run ULID) key
     /// order.
     pub subs: Vec<SubRow>,
+    /// DR-042 §Decision 2/§Invariant I6: the folded verdict tally across this
+    /// lead's subs — a PURE derivation over the subs' already-folded gate state
+    /// (no new subject). An `inconclusive` sub is its own bucket, never coerced
+    /// (I6). `#[serde(default)]` keeps older serialized views parsing (I3).
+    #[serde(default)]
+    pub verdict_rollup: VerdictRollup,
 }
 
 /// DR-042: the fleet's lead → parallel sub-runs orchestration graph.
@@ -1608,18 +1650,61 @@ pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
                         .map(|(gate, state)| (gate.clone(), state.verdict.clone()))
                         .collect(),
                     integrity_alarms: sub.integrity_alarms.len(),
+                    // Recorded cost + operator-kill attribution, carried VERBATIM
+                    // from EXISTING folds (`agent.completed` / `agent.signaled`) —
+                    // no new subject, honest absence stays `None` (I3, DR-042).
+                    cost_usd: sub.total_usd,
+                    killed_by: sub.killed_by.clone(),
                 })
                 .collect();
             if subs.is_empty() {
                 return None;
             }
+            // DR-042 §Decision 2/I6: fold the verdict tally across the subs — a
+            // PURE derivation over their already-folded `verdicts` (no new fold).
+            let verdict_rollup = roll_up_verdicts(&subs);
             Some(LeadRow {
                 lead_run: lead_run.clone(),
                 // fan_out is the DERIVED count of matched subs (DR-042).
                 fan_out: subs.len(),
                 subs,
+                verdict_rollup,
             })
         })
         .collect();
     OrchestrationView { leads }
+}
+
+/// DR-042 §Decision 2/§Invariant I6: fold a [`VerdictRollup`] across a lead's
+/// subs — a PURE tally over the subs' already-folded `(gate, verdict)` pairs
+/// ([`SubRow::verdicts`]), no new fold and no new subject. Each sub lands in
+/// EXACTLY ONE bucket (the buckets sum to `subs.len()`), by DOMINANCE:
+/// - any `fail` gate → `failed` (a fail dominates a mixed sub);
+/// - else any `inconclusive` gate → `inconclusive` (I6 — an inconclusive sub is
+///   NEVER counted as passed, never coerced up);
+/// - else ≥1 gate and all `pass` → `passed`;
+/// - else `pending` (no terminal verdict yet — no gates, or only `entered`).
+///
+/// Verdict strings are matched VERBATIM against the reducer's recorded values
+/// (`"pass"`/`"fail"`/`"inconclusive"`/`"entered"`) — the tally re-interprets
+/// nothing (I3).
+fn roll_up_verdicts(subs: &[SubRow]) -> VerdictRollup {
+    let mut rollup = VerdictRollup::default();
+    for sub in subs {
+        let any_fail = sub.verdicts.iter().any(|(_, v)| v == "fail");
+        let any_inconclusive = sub.verdicts.iter().any(|(_, v)| v == "inconclusive");
+        let all_pass = !sub.verdicts.is_empty() && sub.verdicts.iter().all(|(_, v)| v == "pass");
+        if any_fail {
+            rollup.failed += 1;
+        } else if any_inconclusive {
+            // I6: an inconclusive sub is its own bucket, never coerced to passed.
+            rollup.inconclusive += 1;
+        } else if all_pass {
+            rollup.passed += 1;
+        } else {
+            // No terminal verdict yet (no gates, or only `entered`).
+            rollup.pending += 1;
+        }
+    }
+    rollup
 }

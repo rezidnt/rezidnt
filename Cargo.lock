@@ -2569,9 +2569,11 @@ name = "rezidnt-state"
 version = "0.0.1"
 dependencies = [
  "proptest",
+ "rezidnt-fabric",
  "rezidnt-types",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "ulid",
 ]

@@ -1702,7 +1702,7 @@ pub struct OrchestrationView {
 ///
 /// DEFENSIVE ONLY, and that is a change from lane 1. Under the badge match this
 /// guard was LOAD-BEARING: the DR-017 self-edge (a run attenuating its own badge
-/// when its spec declares a role, `bins/rezidentd/src/runs.rs:1032-1052`) put
+/// when its spec declares a role, `bins/rezidentd/src/runs.rs:1075-1095`) put
 /// the run's own attenuated badge on both ends, so a badge-only match read every
 /// role-declaring run as a lead of ITSELF with `fan_out: 1`. On the `lead_run`
 /// axis that class CANNOT ARISE: the DR-017 self-edge is a `permit.delegated`

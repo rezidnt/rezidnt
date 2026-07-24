@@ -104,7 +104,7 @@ fn ev(subject: &str, payload: Value) -> Event {
 
 /// The two facts a ROLE-DECLARING spawn emits, in the order production emits
 /// them: the DR-017 capability-chain `permit.delegated` (keyed on the spawning
-/// run itself, `bins/rezidentd/src/runs.rs:1032-1052`) then `agent.spawned`
+/// run itself, `bins/rezidentd/src/runs.rs:1075-1095`) then `agent.spawned`
 /// carrying the SAME attenuated badge. This path is UNTOUCHED by DR-046 — it is
 /// a real attenuation and remains correct.
 fn role_declaring_spawn(run: &str, base_badge: &str, child_badge: &str) -> Vec<Event> {

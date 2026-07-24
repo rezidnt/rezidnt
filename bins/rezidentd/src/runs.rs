@@ -755,9 +755,18 @@ pub async fn launch_agent(
     // `Some(lead)` ⇒ scheme-TAGGED `run:<lead RunId ULID>` (a bare ULID is not
     // legal on this field), so the log ALONE answers "which lead allocated this
     // worktree". The sole-allocator model is untouched (DR-001): a lead is not a
-    // second allocator — it requests a tree through this same path under the same
-    // registry with the same conflict semantics; what widened is the recorded
-    // principal, not the set of allocators. The discovery branches that test
+    // second allocator — what widened is the recorded principal, not the set of
+    // allocators.
+    //
+    // HONESTY (DR-046 §Decision 8, and `spec/ontology.md` ~218 as corrected): do
+    // NOT read the above as "the lead requests a tree through the §7 registry".
+    // THIS path never reaches `GitAdapter` — it allocates via the minimal git-CLI
+    // `allocate_worktree` below and publishes `worktree.allocated` itself, and no
+    // crate even depends on `rezidnt-adapter-git`. So DR-044 §Decision 3's
+    // conflict semantics are UNREACHED here: isolation holds by ULID uniqueness
+    // of the worktree path, not by any registry guard. The registry-convergence
+    // slice (DR-046 §Decision 8) is what makes that clause true. The discovery
+    // branches that test
     // `allocator == "human"` (`crates/rezidnt-adapters/git/src/lib.rs:412`,
     // `:579`) correctly land a `run:<ULID>` value in the not-human branch.
     let allocator = match lead {

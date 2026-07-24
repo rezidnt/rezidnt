@@ -1,78 +1,70 @@
-# Handoff — 2026-07-23 (session 22: DR-037 installer arc + §16 S3 MCP surface — Phase-1 golden path now demonstrable END-TO-END)
+# Handoff — 2026-07-24 (session 24: 3-lane parallel fan-out — DR-041 verify-lints + dependency-audit shipped, DR-042 read-side deepened, DR-043 drafted)
 
 ## State of play
-A long, multi-arc session. Two things shipped, both complete: (1) the whole **DR-037 installer arc** (a real `curl|sh`
-installer + a published `v0.0.1` pre-release), and (2) **§16 S3, the MCP surface** — the Phase-1 exit. Everything
-/vet + /debrief PASS, pushed to `origin/main` (synced, `e465d67`). High autonomy ON ([[autonomy-high-trust]]).
-`current-slice` = `s3-exit-demo` (**done**). Untracked `.playwright-mcp/` + `docs/site/` are stray — leave them.
+Owner asked to "make progress quicker" by fanning out a team to build vertical slices. Ran a **3-lane parallel
+fan-out** (implementer subagents in isolated git worktrees, orchestrator holding the single-lane debrief/vet/merge gate
+— pattern captured in [[fan-out-parallel-build-pattern]]). Everything merged to `origin/main` (synced, `92a4c55`), host
+`/vet` GREEN (`{"verdict":"pass"}`), each lane through an independent auditor /debrief. High autonomy ON
+([[autonomy-high-trust]]). `current-slice` = `secret-scan-native` (gated on DR-043 ratification).
 
-**The headline: the Phase-1 golden path is now demonstrable END-TO-END** — curl-installed static binary → `rezidentd`
-→ Claude Code over MCP via `rezidnt mcp` → open_project → spawn_agent → dossier → gate_explain. Both BINDING §1/§18
-steps that were aspirational (the `curl` install AND the MCP client path) are now real and proven in tests.
-
-## What shipped this session (each through the full loop)
-1. **Two DR-036 follow-ups** (`724068b`) — nested-verb lockstep + socket-precedence pin.
-2. **DR-037 installer arc** — ACCEPTED (`0aefd51`), then `release-ci` (`0137bcf`/`21afaef`), `install-script`
-   (`90d11f9`), pre-release prep (`4380c77`), and `quickstart-real` (`a50e576`). Cut **`v0.0.1`** (GitHub pre-release,
-   static musl assets + SHA256SUMS); the real `curl|sh` was PROVEN end-to-end. Details: [[installer-arc-progress]].
-3. **§16 S3 — MCP surface** (owner set as focus; no DR — stdio is §9-specified, proxy shape forced by I3):
-   - **`mcp-stdio`** (`69c3385` + `9fd41ea`) — `rezidnt mcp`, a stdio↔loopback-HTTP JSON-RPC PROXY to the resident
-     daemon in `bins/rezidnt/src/main.rs` (`mcp_serve`/`inject_operator_badge`/`MUTATING_MCP_TOOLS`). Reuses the
-     existing `loopback_post` (I7, no HTTP crate); injects the operator badge into mutating tool calls only; fail-closed
-     (exit 4 no-lockfile; JSON-RPC error + keep-serving on mid-session daemon loss). Host-runnable oracle
-     `bins/rezidnt/tests/mcp_stdio_proxy.rs` (fake `/mcp` server, 5 tests).
-   - **`s3-exit-demo`** (`e465d67`) — `bins/rezidentd/tests/s3_exit_demo_e2e.rs` (`#[cfg(unix)]`/WSL): one real daemon +
-     one real `rezidnt mcp` subprocess, drives the full S3 sequence as JSON-RPC over the proxy's stdio, all mutating
-     calls UN-BADGED (green proves badge injection — the daemon refuses `badge.required` otherwise). Details:
-     [[mcp-surface-s3-state]].
-
-## Key finding worth carrying: the MCP surface was ALREADY BUILT
-The survey (see [[mcp-surface-s3-state]]) found all four S3 tools (`open_project`/`spawn_agent`/dossier-resource/
-`gate_explain`) already real + tested, both transports (stdio + loopback-HTTP), schemars schemas with a drift oracle,
-and dual-path badge auth — built across the operator-client arc (DR-031..035). The "verify rmcp at S3" question was
-already resolved: deliberately HAND-ROLLED JSON-RPC, not the SDK. So S3's real gap was only the client CONNECTION PATH
-(`rezidnt mcp`) + the recorded e2e demo — both now closed. No production wiring change was needed for the e2e.
+## What shipped this session (each merged, vet-green, independently debriefed)
+1. **DR-042 orchestrator read-side deepening** (Lane B, merge `dfac65c`) — advances the two owed tests the DR named:
+   an I3 rebuild-from-persisted-log equivalence test (real `rezidnt rebuild` path: `EventLog::open`→`read_from(1)`→fold),
+   a §9 schema no-drift golden pin for the orchestration MCP tool args, plus a design-legal richer read-side fold
+   (`SubRow.cost_usd`/`killed_by` from existing agent.completed/agent.signaled facts; `LeadRow.verdict_rollup` — I6-honest
+   tally, inconclusive never coerced, buckets partition fan_out). Phase-3 live fan-out stayed GATED OFF; no subject minted
+   (sub-worktree linkage correctly deferred to a warden /subject). See [[orchestrator-dr042]].
+2. **DR-041 `verify-lints`** (Lane A, merge `ef75cfb`) — real `rezidnt verify clippy` + `rezidnt verify fmt-check` §8 exec
+   verifiers through `resolve_one` into the daemon pre_merge gate. clippy names the lint; fmt-check discriminates
+   mis-format `fail` / genuine-syntax-error `inconclusive` / type-error-in-formatted-crate `pass` (rustfmt is syntax-layer).
+   17 CLI + 4 unix e2e green.
+3. **DR-041 `dependency-audit`** (Lane A, same merge) — `rezidnt verify dependency-audit` EXEC verifier (`cargo audit
+   --json`); tool-absent/DB-unreachable/unparseable → inconclusive, never a silent pass; 6 CLI tests (pass/fail legs
+   honestly capability-SKIP since cargo-audit is absent host+WSL). Progress tracked in [[verifier-pack-dr041]].
+4. **DR-022 benchmark harness** (Lane C) — scope scout found it ALREADY BUILT + green; no rework. Recorded
+   [[dr022-benchmark-harness-built]].
 
 ## Owner-settled this session
-- Installer: Linux/WSL-first; musl x86_64 only; two static binaries now (combined literal-I7 binary = named follow-up);
-  raw GitHub-asset endpoint; **pre-release v0.0.1** (golden path not shippable-complete until Phase-1 exit).
-- S3 forced-failure: **accept the escalation demo as S3-done** (owner agreed 2026-07-23). The demo interrogates a live
-  `permit.escalated` (verdict "ask", asserted NOT allow/pass, I6) — an honest demonstration of the interrogability
-  property; a true `gate.failed` demo is the natural **S4** deliverable (its verifier engine does not exist yet).
+- Fan-out width: all 3 lanes at once; self-drive per lane (high autonomy).
+- **secret-scan blocker → Option A.** Owner chose to keep secret-scan NATIVE and fix the input shape (below), over
+  reclassifying it exec.
 
-## Open follow-ups (NON-BLOCKING, none blocks done)
-- **S4 is the natural next phase focus**: the verifier engine (native pack + exec contract), `vet`/`pre_merge` on the
-  golden path, and a true `gate.failed` that `gate_explain` interrogates (strengthens the S3 exit's "forced failure"
-  from an escalation to a real fail). §16 Phase 2. A true permit-DENY variant of the S3 demo is reachable NOW (denying
-  verifier config + a role) if a harder forced-failure recording is wanted before S4 — additive, owner's call.
-- `s3_exit_demo_e2e.rs::read_response` (~:220) doesn't enforce the wall-clock deadline on the blocking `read_line`
-  itself (only on blank lines) — sound here (bounded by the daemon's 500ms unblock budget) but a foot-gun for a future
-  beat that holds a request open without a daemon-side timeout.
-- Combined multi-call single binary (literal-I7 installer form) — a daemon-crate extraction; named in DR-037. Its own
-  slice/DR. `aarch64-linux-musl` + the `rezidnt.dev` vanity domain are deferred (DR-037).
-- quickstart "What you just saw" narration reads more finished than Phase-1 status warrants (only line 25 hedges);
-  worth a scribe pass when S1/S3 fully close. Prior: macOS/Windows backends; 1Password egress backend.
+## The one real blocker → DR-043 (PROPOSED, needs your ratification)
+`secret-scan-native` can't be built as DR-041 Decision 2 wrote it: at pre_merge the daemon hands natives only a
+content-free path-status summary (`git_diff_summary` → `refs["diff"]`, `bins/rezidentd/src/runs.rs:1576`) — no file
+bytes, so a native scanner can't detect an in-file key (I6-dishonest). **DR-043**
+(`docs/decisions/DR-043-secret-scan-content-ref.md`, PROPOSED, pushed) resolves it Option-A: the daemon git adapter
+`cas.put()`s per-file added content and exposes a new `refs["content"]` CasRef, keeping secret-scan native +
+CAS-replayable (the I3/I6 property exec-reads-live-worktree would forfeit). **NEXT ACTION on it: owner flips DR-043
+PROPOSED→ACCEPTED**, then a slice builds it (owed: input-contract pin test, CAS-replay-equivalence test,
+inconclusive-on-unscannable-content). It's a daemon-side change (`gates.rs`/`runs.rs`) — a new lane/worktree, crosses the
+old Lane A file boundary.
+
+## Open follow-ups (NON-BLOCKING)
+- **`git stash@{0}`** holds the subsumed prior-session verify-lints WIP ("prior-session verify-lints WIP (subsumed by
+  Lane A, DR-041) — recoverable"). Lane A superseded it and is pushed+vet-green, so the stash is now redundant — safe to
+  `git stash drop` whenever; kept for now since it was prior work not created this session.
+- **`bench/harness/src/lib.rs` stale doc** (lines ~27–34) still narrates the fns as `todo!()` stubs though implemented —
+  doc-only cleanup owed ([[dr022-benchmark-harness-built]]).
+- Two DR-041 auditor forward-notes still standing for any content-emitting verifier: I2 bytes→CAS on uncapped failure
+  evidence; gate `input.timeout_ms` not propagated to the in-binary verifier budget (both fine today) — see
+  [[verifier-pack-dr041]].
 
 ## Decisions still needing a /dr
-- None outstanding. A true-deny S3 variant or the combined-binary form would each be small DRs if pursued.
+- **DR-043 ratification** (PROPOSED → ACCEPTED) — owner's word. On acceptance, also add the §20 index row +
+  "next record is DR-044" bump in `docs/rezidnt-architecture.md`.
 
 ## Environment (essentials)
-Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done). `rezidnt mcp` + its oracle are cross-platform
-(host-lintable); the S3 e2e (`s3_exit_demo_e2e.rs`) + the installer e2e are `#[cfg(unix)]` → WSL clippy+test
-([[vet-is-host-side-wsl-insufficient]]). WSL: `wsl.exe -d Ubuntu-24.04 -e bash -lc 'cd /mnt/d/github/rezidnt && export
-CARGO_TARGET_DIR=$HOME/.cache/rezidnt-target PATH=$HOME/.cargo/bin:$PATH && cargo …'` ([[wsl-dev-environment]]).
-Build BOTH bins on WSL before an e2e (the harness locates the sibling `rezidnt`/`rezidentd`). Host+WSL SEQUENTIAL
-([[vet-concurrency-flake]]). **musl toolchain is installed on WSL** (musl-tools + the target); build recipe in
-[[installer-arc-progress]]. Traps hit this session: the `clippy doc_lazy_continuation` trap (blank `//!` needed after a
-`//!` list before a prose paragraph) bit twice; the Windows UAC install-name trap (`*install*` exe → os error 740)
-forced `install_script_unix.rs` → `curl_sh_unix.rs` ([[windows-test-binary-update-uac]]). `gh` is authed (`smithdak`);
-`gh workflow run release.yml --ref main` = build+verify dispatch (no publish).
+Host `/vet` = `bash .claude/hooks/vet.sh` (definition-of-done; it ended `{"verdict":"pass","evidence":[]}` this session).
+verify-lints/dependency-audit CLI oracles are cross-platform (host-lintable); the pre_merge e2e (`verify_lints_e2e.rs`) is
+`#[cfg(unix)]` → WSL ([[wsl-dev-environment]], [[vet-is-host-side-wsl-insufficient]]). Fan-out ops recipe +
+gotchas in [[fan-out-parallel-build-pattern]] (KEY: worktrees fork committed HEAD, not dirty WIP — commit/stash before
+fanning out). Host+WSL SEQUENTIAL for vet ([[vet-concurrency-flake]]). `gh` authed. Stray untracked `.playwright-mcp/`,
+`docs/site/` — leave them.
 
 ---
-**NEXT ACTION → DR-037 installer arc + §16 S3 MCP surface both COMPLETE this session; Phase-1 golden path is now
-demonstrable END-TO-END (curl install → daemon → Claude-over-MCP-via-`rezidnt mcp` → open/spawn/dossier/gate_explain),
-every slice /vet + /debrief PASS, pushed to origin/main (`e465d67`). `v0.0.1` pre-release live. `current-slice` =
-s3-exit-demo (done). NO forced next — owner's steer. Strongest candidate: **S4 / Phase-2** (the verifier engine — native
-pack + exec contract, `vet`/`pre_merge` on the golden path, and a true `gate.failed` that upgrades the S3 exit's
-forced-failure from an escalation to a real fail). Alternatives: the benchmark harness (DR-022), macOS/Windows backends,
-or the small named follow-ups above. High autonomy ON.**
+**NEXT ACTION → session's 3-lane fan-out COMPLETE: DR-042 read-side deepening + DR-041 verify-lints + dependency-audit
+all merged to origin/main (`92a4c55`), host /vet GREEN, each independently debriefed. `current-slice` =
+secret-scan-native, BLOCKED pending owner ratification of DR-043 (PROPOSED) — the CAS-content-ref fix that makes the
+native scanner buildable. On ACCEPT: bump §20 index, then build secret-scan-native in a fresh lane (daemon-side
+`gates.rs`/`runs.rs` change, owed the 3 tests named in DR-043). High autonomy ON.**

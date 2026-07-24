@@ -40,6 +40,11 @@ serde_json.workspace = true
 # I3) — seeding goes through the real EventLog so the chain column is honest.
 rezidnt-fabric.workspace = true
 rezidnt-types.workspace = true
+# DR-044 oracle board (dev): fan_out_live_e2e folds the daemon's PERSISTED log
+# and projects `orchestration_graph` over it — the I3 fold-equivalence guard over
+# a log a REAL fan-out produced (DR-044 §Consequences (b)). Read-only over the
+# log; never enters production [dependencies] (I7, testkit_dev_only.rs guard).
+rezidnt-state.workspace = true
 # S4 oracle board: the debrief-replay CLI tests seed the daemon's CAS
 # (db-relative `cas/` default) with the recorded verifier inputs BEFORE the
 # daemon starts - replay is log + CAS, nothing else (I3/I6).

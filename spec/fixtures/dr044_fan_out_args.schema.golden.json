@@ -1,0 +1,41 @@
+{
+  "$defs": {
+    "FanOutTask": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "idempotency_key"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "badge": {
+      "type": "string"
+    },
+    "tasks": {
+      "items": {
+        "$ref": "#/$defs/FanOutTask"
+      },
+      "type": "array"
+    },
+    "workspace": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "badge",
+    "workspace",
+    "tasks"
+  ],
+  "title": "FanOutArgs",
+  "type": "object"
+}

@@ -2389,6 +2389,7 @@ dependencies = [
  "rezidnt-mcp",
  "rezidnt-proto",
  "rezidnt-run",
+ "rezidnt-state",
  "rezidnt-testkit",
  "rezidnt-types",
  "serde_json",

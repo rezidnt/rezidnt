@@ -89,19 +89,24 @@ enum Cmd {
         json: bool,
     },
     /// Run a production verifier (DR-041) against a target directory and emit a
-    /// §8 `VerifierOutput` document on stdout. In v1 `<name>` is `cargo-test`:
-    /// it runs the project test suite in `--dir` and maps the result to the
-    /// three-valued verdict (I6, never coerced): tests pass → `pass`; a real
-    /// test failure → `fail` naming the failing test(s); a compile error or
-    /// `cargo` absent from PATH → `inconclusive` (could-not-run); a wall-clock
-    /// timeout → `inconclusive` (timeout). The cannot-run/timeout conditions are
-    /// VERDICTS on stdout, not error exits — the daemon's exec runner reads the
-    /// document back when this subcommand is named as an exec argv in
-    /// `[gates.pre_merge]`. `--json` mirrors every other verb; the document IS
-    /// the machine-readable output. Exit 0 whenever a document was emitted (the
-    /// verdict rides the output, not the code).
+    /// §8 `VerifierOutput` document on stdout. The v1 pack `<name>` is one of
+    /// `cargo-test` (project test suite), `clippy` (lint), or `fmt-check`
+    /// (formatting): each runs its tool in `--dir` and maps the result to the
+    /// three-valued verdict (I6, never coerced): the tool ran and reported a real
+    /// defect (a failing test, a clippy lint, a mis-formatted file) → `fail`,
+    /// naming the defect; the tool could not reach a verdict (a compile error for
+    /// cargo-test/clippy, a syntax error rustfmt cannot parse for fmt-check, or
+    /// `cargo`/`clippy`/`rustfmt` absent from PATH) → `inconclusive`
+    /// (could-not-run); a wall-clock overrun → `inconclusive` (timeout); a clean
+    /// run → `pass`. The cannot-run/timeout conditions are VERDICTS on stdout, not
+    /// error exits — the daemon's exec runner reads the document back when this
+    /// subcommand is named as an exec argv in `[gates.pre_merge]`. `--json`
+    /// mirrors every other verb; the document IS the machine-readable output. Exit
+    /// 0 whenever a document was emitted (the verdict rides the output, not the
+    /// code).
     Verify {
-        /// The verifier name. v1: `cargo-test`.
+        /// The verifier name. v1 pack: `cargo-test`, `clippy`, `fmt-check`,
+        /// `dependency-audit`.
         name: String,
         /// The target directory (the cargo project / worktree). Absent = cwd.
         #[arg(long)]
@@ -1505,7 +1510,8 @@ fn vet(spec_path: &Path, as_json: bool) -> anyhow::Result<()> {
 // ===========================================================================
 // `rezidnt verify <name>` (DR-041 production verifier pack, v1) — the real
 // exec verifiers, shipped in-binary as subcommands (I7: no external verifier
-// files to install; DR-041 Decision 3). v1 core name: `cargo-test`. Each
+// files to install; DR-041 Decision 3). v1 core names: `cargo-test`, `clippy`,
+// `fmt-check`. Each
 // verifier emits a §8 `VerifierOutput` document on stdout — the SAME shape the
 // daemon's exec runner reads back (`rezidnt_gate::parse_verifier_output`), so
 // the wire and the log can never drift.
@@ -1535,13 +1541,19 @@ fn verify(
 
     let output = match name {
         "cargo-test" => verify_cargo_test(target, timeout_ms),
+        "clippy" => verify_clippy(target, timeout_ms),
+        "fmt-check" => verify_fmt_check(target, timeout_ms),
+        "dependency-audit" => verify_dependency_audit(target, timeout_ms),
         // An unknown verifier name is could-not-run (undecidable), never a
         // silent pass and never a fail — the honest three-valued mapping (I6).
         other => rezidnt_gate::VerifierOutput {
             verdict: rezidnt_gate::Verdict::Inconclusive,
             evidence: vec![rezidnt_gate::Evidence {
                 kind: "cannot-run".to_string(),
-                msg: format!("unknown verifier `{other}` (v1 pack: cargo-test)"),
+                msg: format!(
+                    "unknown verifier `{other}` \
+                     (v1 pack: cargo-test, clippy, fmt-check, dependency-audit)"
+                ),
                 cas_ref: None,
             }],
             cost_ms: 0,
@@ -1696,6 +1708,477 @@ fn verify_cargo_test(dir: &Path, timeout_ms: u64) -> rezidnt_gate::VerifierOutpu
         }],
         cost_ms,
     }
+}
+
+/// A verifier-tool subprocess ran to completion: its captured stdout/stderr and
+/// the wall-clock cost. Returned by [`run_verifier_tool`] on the happy path.
+struct ToolRun {
+    stdout: String,
+    stderr: String,
+    cost_ms: u64,
+}
+
+/// The two SHARED inconclusive traps every §8 exec verifier maps identically
+/// (DR-041 Decision 4), factored out of the per-verifier verdict logic: spawn
+/// ENOENT (`program` not on PATH → could-not-run) and a wall-clock overrun (the
+/// child is killed so the run returns in bounded time → timeout). Neither is ever
+/// coerced to pass/fail (I6). On success the tool's captured output is handed
+/// back for the CALLER to map to a verdict — the discriminator (test result,
+/// lint diagnostic, fmt diff vs parse error) is verifier-specific and stays out
+/// of this shared plumbing.
+///
+/// `Err(VerifierOutput)` carries the ready-made inconclusive document; `Ok` the
+/// captured run. Mirrors the `verify_cargo_test` trap structure exactly.
+fn run_verifier_tool(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    timeout_ms: u64,
+    absent_msg: &str,
+) -> Result<ToolRun, rezidnt_gate::VerifierOutput> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let inconclusive = |kind: &str, msg: String, cost_ms: u64| rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Inconclusive,
+        evidence: vec![rezidnt_gate::Evidence {
+            kind: kind.to_string(),
+            msg,
+            cas_ref: None,
+        }],
+        cost_ms,
+    };
+
+    let started = Instant::now();
+
+    // Spawn the tool in the target dir. A spawn failure (ENOENT: the toolchain is
+    // not on PATH) is could-not-run → inconclusive, NEVER a fail and never a crash
+    // (DR-041 Decision 3/4).
+    let mut child = match Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(inconclusive(
+                "cannot-run",
+                absent_msg.to_string(),
+                elapsed_ms(started),
+            ));
+        }
+        Err(e) => {
+            return Err(inconclusive(
+                "cannot-run",
+                format!("could not spawn {program}: {e}"),
+                elapsed_ms(started),
+            ));
+        }
+    };
+
+    // Wall-clock timeout: poll for completion, killing the child on overrun
+    // (inconclusive { timeout }, never coerced — DR-041 Decision 4).
+    let deadline = started + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(inconclusive(
+                        "timeout",
+                        format!("{program} exceeded the {timeout_ms} ms wall-clock budget"),
+                        elapsed_ms(started),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(inconclusive(
+                    "cannot-run",
+                    format!("waiting on {program} failed: {e}"),
+                    elapsed_ms(started),
+                ));
+            }
+        }
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+
+    Ok(ToolRun {
+        stdout,
+        stderr,
+        cost_ms: elapsed_ms(started),
+    })
+}
+
+/// Run `cargo clippy --message-format=json` in `dir` and map the result to a §8
+/// `VerifierOutput` under the I6 verdict rules (DR-041 Decision 4, NEVER coerced):
+/// - `cargo`/`clippy` absent from PATH (spawn ENOENT) → `inconclusive` (could-not-run).
+/// - a wall-clock overrun → `inconclusive` (timeout); the child is killed.
+/// - the crate does not COMPILE (a compiler `error`-level diagnostic) →
+///   `inconclusive` (could-not-run) — a build break is NOT a lint failure, and
+///   clippy cannot lint a crate that does not build.
+/// - a clippy LINT diagnostic present (a `clippy::*` warning/error) → `fail`, with
+///   evidence NAMING the lint(s) (interrogability, I6). NB: clippy's default lints
+///   are WARNINGS (exit 0) — the `fail` decision comes from DIAGNOSTIC PRESENCE,
+///   not the exit code.
+/// - a clean crate (compiles, no clippy diagnostic) → `pass`.
+///
+/// The verdict rides the JSON diagnostic stream (`--message-format=json`), not the
+/// exit code — the parse is deterministic and interrogable. `cost_ms` is recorded,
+/// not asserted.
+fn verify_clippy(dir: &Path, timeout_ms: u64) -> rezidnt_gate::VerifierOutput {
+    let run = match run_verifier_tool(
+        "cargo",
+        &["clippy", "--message-format=json", "--color=never"],
+        dir,
+        timeout_ms,
+        "cargo/clippy is not resolvable on PATH — the clippy toolchain is a host \
+         prerequisite the static binary does not carry (DR-041 Decision 3)",
+    ) {
+        Ok(run) => run,
+        Err(inconclusive) => return inconclusive,
+    };
+
+    // Parse the cargo JSON diagnostic stream. Each line is a JSON object; the ones
+    // we care about are `{"reason":"compiler-message","message":{...}}`. From the
+    // inner `message` we read `level` ("error" | "warning" | …) and `code.code`
+    // (the lint path, e.g. `clippy::needless_return`).
+    let mut compiler_error = false;
+    let mut compiler_error_detail: Option<String> = None;
+    let mut lint_names: Vec<String> = Vec::new();
+
+    for line in run.stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value["reason"].as_str() != Some("compiler-message") {
+            continue;
+        }
+        let message = &value["message"];
+        let level = message["level"].as_str().unwrap_or("");
+        let code = message["code"]["code"].as_str();
+
+        match code {
+            // A `clippy::*` diagnostic (warning OR error) is a real lint finding →
+            // fail, and its NAME reaches the evidence (interrogability, I6).
+            Some(c) if c.starts_with("clippy::") => {
+                let name = c.to_string();
+                if !lint_names.contains(&name) {
+                    lint_names.push(name);
+                }
+            }
+            // A compiler error (`error[E...]`, or an error-level message with no
+            // lint code, e.g. `error: could not compile`) means the crate does not
+            // build — clippy could not lint it → could-not-run, NOT a lint fail.
+            _ if level == "error" => {
+                compiler_error = true;
+                if compiler_error_detail.is_none()
+                    && let Some(rendered) = message["message"].as_str()
+                {
+                    compiler_error_detail = Some(rendered.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A lint finding is a fail EVEN IF a later message is error-level — but a crate
+    // that did not compile cannot have been fully linted, so a genuine build break
+    // (with no lint findings) is could-not-run. Lint presence wins: clippy emitting
+    // a `clippy::*` diagnostic means it ran the lint pass.
+    if !lint_names.is_empty() {
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Fail,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "clippy-lint".to_string(),
+                msg: format!("clippy lint(s): {}", lint_names.join(", ")),
+                cas_ref: None,
+            }],
+            cost_ms: run.cost_ms,
+        };
+    }
+
+    if compiler_error {
+        let detail = compiler_error_detail.unwrap_or_else(|| compile_error_detail(&run.stderr));
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Inconclusive,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "cannot-run".to_string(),
+                msg: format!(
+                    "the crate did not compile — clippy could not lint it (could-not-run): {detail}"
+                ),
+                cas_ref: None,
+            }],
+            cost_ms: run.cost_ms,
+        };
+    }
+
+    // No lint diagnostic and no compile error → the crate is clean under clippy.
+    rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Pass,
+        evidence: vec![],
+        cost_ms: run.cost_ms,
+    }
+}
+
+/// Run `cargo fmt --check` in `dir` and map the result to a §8 `VerifierOutput`
+/// under the I6 verdict rules (DR-041 Decision 4, NEVER coerced). THE CRITICAL
+/// DISCRIMINATOR (rustfmt works at the SYNTAX layer, so exit 1 alone cannot tell a
+/// mis-format from a parse failure):
+/// - a `Diff in <path>` line on stdout (a real formatting defect rustfmt CAN parse)
+///   → `fail`, with evidence NAMING the offending file (interrogability, I6).
+/// - an `error:` line on stderr (rustfmt CANNOT PARSE — e.g. an unclosed delimiter)
+///   → `inconclusive` (could-not-run). This is the ONLY fmt inconclusive-by-content
+///   case.
+/// - a well-formatted, syntactically-valid crate that does NOT TYPE-CHECK → `pass`:
+///   rustfmt does not type-check, so a semantic/type error is a real fmt pass — the
+///   `fmt_check_type_error_is_a_real_pass_not_inconclusive` oracle test forbids the
+///   lazy "any compile error → inconclusive" copy from cargo-test.
+/// - a clean crate (no diff, no parse error) → `pass`.
+/// - `cargo`/`rustfmt` absent → `inconclusive` (could-not-run); timeout →
+///   `inconclusive` (timeout).
+///
+/// `cost_ms` is recorded, not asserted.
+fn verify_fmt_check(dir: &Path, timeout_ms: u64) -> rezidnt_gate::VerifierOutput {
+    let run = match run_verifier_tool(
+        "cargo",
+        &["fmt", "--check"],
+        dir,
+        timeout_ms,
+        "cargo/rustfmt is not resolvable on PATH — the rustfmt toolchain is a host \
+         prerequisite the static binary does not carry (DR-041 Decision 3)",
+    ) {
+        Ok(run) => run,
+        Err(inconclusive) => return inconclusive,
+    };
+
+    // A genuine SYNTAX error (rustfmt cannot PARSE the file) surfaces as an
+    // `error:`-prefixed line on stderr → could-not-run. This MUST be checked before
+    // the mis-format branch: a file rustfmt cannot parse produces no `Diff in`
+    // line, and the exit code (1) is shared with a mis-format, so the stderr
+    // `error:` is the ONLY discriminator (DR-041 slice distinction).
+    if let Some(err_line) = fmt_parse_error(&run.stderr) {
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Inconclusive,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "cannot-run".to_string(),
+                msg: format!("rustfmt could not parse the crate (could-not-run): {err_line}"),
+                cas_ref: None,
+            }],
+            cost_ms: run.cost_ms,
+        };
+    }
+
+    // A mis-format prints `Diff in <path>` on stdout — a real formatting defect
+    // rustfmt CAN parse → fail, naming the offending file(s) (interrogability, I6).
+    let misformatted: Vec<String> = fmt_diff_files(&run.stdout);
+    if !misformatted.is_empty() {
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Fail,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "fmt-diff".to_string(),
+                msg: format!("mis-formatted file(s): {}", misformatted.join(", ")),
+                cas_ref: None,
+            }],
+            cost_ms: run.cost_ms,
+        };
+    }
+
+    // No parse error and no diff → the crate is rustfmt-clean. A type/semantic error
+    // never reaches here as inconclusive: rustfmt does not type-check, so a
+    // syntactically-valid, well-formatted crate is a real PASS (the load-bearing
+    // distinction).
+    rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Pass,
+        evidence: vec![],
+        cost_ms: run.cost_ms,
+    }
+}
+
+/// Run `cargo audit --json` in `dir` (the RustSec advisory audit — DR-041
+/// fast-follow `dependency-audit`, EXEC kind: it consults an EXTERNAL advisory
+/// DB, so per DR-041 Decision 2 it is exec, not native). Map the result to a §8
+/// `VerifierOutput` under the I6 verdict rules (DR-041 Decision 4, NEVER coerced),
+/// honoring the no-network / DB-unreachable posture — a DB the tool could not
+/// reach is INCONCLUSIVE (could-not-run), NEVER a silent pass:
+/// - `cargo`/`cargo-audit` absent from PATH (spawn ENOENT) → `inconclusive`
+///   (could-not-run) — the audit toolchain is a host prerequisite the static
+///   binary does not carry (DR-041 Decision 3). This is ALSO the honest verdict
+///   on a box where the advisory tool is simply not installed.
+/// - a wall-clock overrun → `inconclusive` (timeout); the child is killed.
+/// - the tool ran but its JSON report is ABSENT/UNPARSEABLE (e.g. it could not
+///   fetch/refresh the advisory DB — the DB-unreachable case) → `inconclusive`
+///   (could-not-run), NEVER a silent pass. The verdict rides the PARSED report,
+///   not the exit code, so a "no verdict reached" state is inconclusive by
+///   construction.
+/// - the report names one or more advisories against the dependency tree
+///   (`vulnerabilities.found == true`, or `vulnerabilities.count > 0`) → `fail`,
+///   with evidence NAMING the advisory id(s) (interrogability, I6).
+/// - a clean report (the tool ran, reached the DB, found nothing) → `pass`.
+///
+/// `cost_ms` is recorded, not asserted.
+fn verify_dependency_audit(dir: &Path, timeout_ms: u64) -> rezidnt_gate::VerifierOutput {
+    let run = match run_verifier_tool(
+        "cargo",
+        &["audit", "--json"],
+        dir,
+        timeout_ms,
+        "cargo/cargo-audit is not resolvable on PATH — the advisory-audit toolchain is \
+         a host prerequisite the static binary does not carry (DR-041 Decision 3); a box \
+         without it CANNOT reach a verdict, so this is could-not-run, never a silent pass",
+    ) {
+        Ok(run) => run,
+        Err(inconclusive) => return inconclusive,
+    };
+
+    // `cargo audit --json` prints a single JSON report object on stdout. Parse it;
+    // an ABSENT or UNPARSEABLE report is could-not-run → inconclusive (the
+    // DB-unreachable / tool-error case — the tool ran but reached no verdict).
+    // NEVER a silent pass (I6, DR-041 slice-3 posture).
+    let report: serde_json::Value = match run
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('{'))
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    {
+        Some(report) => report,
+        None => {
+            let detail = audit_error_detail(&run.stderr);
+            return rezidnt_gate::VerifierOutput {
+                verdict: rezidnt_gate::Verdict::Inconclusive,
+                evidence: vec![rezidnt_gate::Evidence {
+                    kind: "cannot-run".to_string(),
+                    msg: format!(
+                        "cargo audit produced no parseable JSON report — could not reach a \
+                         verdict (advisory DB unreachable / tool error, could-not-run): {detail}"
+                    ),
+                    cas_ref: None,
+                }],
+                cost_ms: run.cost_ms,
+            };
+        }
+    };
+
+    // Vulnerability presence rides the report, not the exit code. `cargo audit
+    // --json` reports `{"vulnerabilities":{"found":bool,"count":n,"list":[…]}}`.
+    let vulns = &report["vulnerabilities"];
+    let found =
+        vulns["found"].as_bool().unwrap_or(false) || vulns["count"].as_u64().is_some_and(|c| c > 0);
+
+    if found {
+        let ids = audit_advisory_ids(vulns);
+        let msg = if ids.is_empty() {
+            "cargo audit reported one or more advisories against the dependency tree".to_string()
+        } else {
+            format!("advisory(ies): {}", ids.join(", "))
+        };
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Fail,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "dependency-advisory".to_string(),
+                msg,
+                cas_ref: None,
+            }],
+            cost_ms: run.cost_ms,
+        };
+    }
+
+    // The tool ran, reached the DB, and found nothing → pass.
+    rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Pass,
+        evidence: vec![],
+        cost_ms: run.cost_ms,
+    }
+}
+
+/// The RustSec advisory id(s) named in a `cargo audit --json`
+/// `vulnerabilities.list[].advisory.id` array (first-seen order, deduped —
+/// deterministic; interrogability names WHICH advisory). Bounded to the ids, not
+/// the full advisory bodies (I2).
+fn audit_advisory_ids(vulns: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(list) = vulns["list"].as_array() {
+        for v in list {
+            if let Some(id) = v["advisory"]["id"].as_str() {
+                let id = id.to_string();
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// A short error detail from cargo-audit's stderr for the inconclusive evidence
+/// msg: the first `error`-prefixed line, else a trimmed head. Bounded (I2).
+fn audit_error_detail(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error") || l.starts_with("Error"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let head: String = stderr.trim().chars().take(200).collect();
+            if head.is_empty() {
+                "cargo audit reached no verdict".to_string()
+            } else {
+                head
+            }
+        })
+}
+
+/// The offending file(s) named by `cargo fmt --check`, parsed from stdout lines of
+/// the form `Diff in <path> at line N:` (first-seen order, deduped —
+/// deterministic). Only the file PATH is carried into evidence (bounded — no full
+/// diff body, per I2; the auditor flagged unbounded evidence last slice).
+fn fmt_diff_files(stdout: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        // `Diff in <path> at line N:` (rustfmt) — take the token after `Diff in `
+        // up to ` at line`.
+        if let Some(rest) = line.strip_prefix("Diff in ") {
+            let path = rest.split(" at line ").next().unwrap_or(rest).trim();
+            let path = path.trim_end_matches(':').to_string();
+            if !path.is_empty() && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// The first `error:`-prefixed line on rustfmt's stderr, if any — the signal that
+/// rustfmt could NOT PARSE the file (a genuine syntax error, e.g. an unclosed
+/// delimiter), as distinct from a mis-format. Returns `None` when stderr carries no
+/// parse error (a clean run, a mis-format, or a type-only error all leave stderr
+/// free of an `error:` line). Bounded to a single line (I2).
+fn fmt_parse_error(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error:") || l.starts_with("error["))
+        .map(str::to_string)
 }
 
 /// Milliseconds elapsed since `started`, saturating at `u64::MAX`.

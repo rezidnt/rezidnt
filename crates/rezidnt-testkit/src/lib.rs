@@ -985,6 +985,165 @@ verifiers = [
     (dir, spec)
 }
 
+/// A stub harness for the DR-041 `verify-lints` e2e: emits the S1 stream-json
+/// lines AND OVERWRITES `src/lib.rs` with `new_body` in its working directory
+/// (the daemon runs a harness in its allocated worktree), so the S2 watcher
+/// produces a real `diff.ready` and the real `clippy` / `fmt-check` verifier then
+/// gates the change. Unlike [`cargo_test_gated_harness`] (which APPENDS a test),
+/// this OVERWRITES the whole file — a mis-format fixture must control the entire
+/// file's formatting, not just add a line. The heredoc writes EXACTLY `new_body`
+/// (a `cat >`, truncating).
+pub fn lints_gated_harness(dir: &Path, gap_ms: u64, new_body: &str) -> PathBuf {
+    let gap_s = gap_ms as f64 / 1000.0;
+    let script = dir.join("lints-harness.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo '{{"type":"system","subtype":"init","session_id":"fixture-session","claude_code_version":"2.1.191","tools":[]}}'
+cat > src/lib.rs <<'RS'
+{new_body}RS
+sleep {gap_s}
+echo '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}]}}}}'
+sleep {gap_s}
+echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.001,"usage":{{"input_tokens":1,"output_tokens":1}},"session_id":"fixture-session"}}'
+"#
+        ),
+    )
+    .expect("write lints harness stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// Which production lint verifier a [`make_lints_gated_project`] fixture gates on,
+/// and (for the fail leg) what kind of defect the harness leaves in the worktree.
+/// The `verifier_name` is the `rezidnt verify <name>` token named in the
+/// pre_merge spec.
+#[derive(Clone, Copy)]
+pub enum LintGate {
+    /// `rezidnt verify clippy`. Clean leg → a lint-free body; fail leg → a body
+    /// tripping `clippy::needless_return` (a stable default-on lint).
+    Clippy,
+    /// `rezidnt verify fmt-check`. Clean leg → a rustfmt-clean body; fail leg →
+    /// a deliberately mis-formatted body (rustfmt reports a diff naming the file).
+    FmtCheck,
+}
+
+impl LintGate {
+    /// The `rezidnt verify <name>` token (the pre_merge exec arg).
+    fn verifier_name(self) -> &'static str {
+        match self {
+            LintGate::Clippy => "clippy",
+            LintGate::FmtCheck => "fmt-check",
+        }
+    }
+
+    /// The `src/lib.rs` body the harness leaves for the `pass` leg (clean under
+    /// the gate) or the `fail` leg (a real defect the gate names).
+    fn body(self, pass: bool) -> &'static str {
+        match (self, pass) {
+            // clippy-clean, rustfmt-clean.
+            (LintGate::Clippy, true) => "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            // trips clippy::needless_return; rustfmt-clean (so the defect is the LINT).
+            (LintGate::Clippy, false) => "pub fn f(x: i32) -> i32 {\n    return x + 1;\n}\n",
+            // rustfmt-clean, clippy-clean.
+            (LintGate::FmtCheck, true) => "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            // deliberately mis-formatted (one line, no spacing) — rustfmt names it.
+            (LintGate::FmtCheck, false) => "pub fn f()->i32{let x=1;x+2}\n",
+        }
+    }
+}
+
+/// A temp GATED project whose repo IS a real (tiny, dependency-free) cargo crate,
+/// gated on a DR-041 `verify-lints` production verifier — `rezidnt verify clippy`
+/// or `rezidnt verify fmt-check` (DR-041 slice `verify-lints`). The stub harness
+/// leaves a body that is CLEAN under the gate (`pass = true`) or carries a real
+/// defect the gate NAMES (`pass = false`): a `clippy::needless_return` lint, or a
+/// mis-formatted file. `[gates.pre_merge]` names the verifier as the same
+/// multi-token exec argv cargo-test uses (`exec = <rezidnt>`, `args = ["verify",
+/// "<name>"]`), run by the daemon in the allocated worktree so the tool sees the
+/// real tree. The crate resolves NOTHING off-box (determinism + no-network).
+///
+/// `rezidnt_bin` is the absolute path to the `rezidnt` CLI the exec runner invokes
+/// as `argv[0]` (the caller passes [`cli_bin`]). Mirrors
+/// [`make_cargo_test_gated_project`] — a lint/fmt-gated variant, NOT a duplicated
+/// harness.
+pub fn make_lints_gated_project(
+    gate: LintGate,
+    pass: bool,
+    gap_ms: u64,
+    rezidnt_bin: &Path,
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir repo/src");
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "oracle@rezidnt.test"]);
+    git(&["config", "user.name", "rezidnt oracle"]);
+
+    // A dependency-free cargo crate seeded with a clean, formatted body — the
+    // committed base the harness's change diffs against.
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"verify_lints_e2e_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .expect("seed Cargo.toml");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn seed() -> i32 {\n    0\n}\n",
+    )
+    .expect("seed lib.rs");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "verify-lints e2e cargo fixture seed"]);
+
+    // The harness overwrites lib.rs with the clean-or-defective body for this gate.
+    let harness = lints_gated_harness(dir.path(), gap_ms, gate.body(pass));
+    let name = gate.verifier_name();
+
+    let spec = format!(
+        r#"[project]
+name = "verify-lints-e2e"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["vet", "pre_merge"]
+bare = true
+harness_version = "2.1.191"
+allowed_tools = ["Read", "Edit"]
+bin_override = "{harness}"
+
+# DR-041 verify-lints: the pre_merge gate names a REAL production lint verifier as
+# an exec argv — `rezidnt verify {name}`, the same Decision 3 multi-token
+# invocation cargo-test uses. The daemon runs it in the allocated worktree so the
+# tool (clippy / rustfmt) sees the real tree.
+[gates.pre_merge]
+verifiers = [
+  {{ exec = "{rezidnt}", name = "{name}", args = ["verify", "{name}"] }},
+]
+"#,
+        repo = repo.display(),
+        harness = harness.display(),
+        rezidnt = rezidnt_bin.display(),
+        name = name,
+    );
+    (dir, spec)
+}
+
 /// Read one reply line from a socket connection with a deadline; panics on
 /// timeout (the caller's message is the failure).
 pub fn read_reply_line(

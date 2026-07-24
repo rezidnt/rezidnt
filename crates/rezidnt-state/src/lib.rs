@@ -1643,9 +1643,13 @@ pub struct OrchestrationView {
 /// `agent.spawned.badge_id` is that same attenuated badge (`:929`) — so a
 /// badge-only match reads every role-declaring run as a lead of ITSELF with
 /// `fan_out: 1`. Guarding on the SUB side (not by skipping self-delegating
-/// leads) is what keeps a real lead — which is itself role-declaring, so it
-/// ALWAYS carries a self-edge too — reporting its genuine cross-run subs and a
-/// correct derived `fan_out`. No discriminator field is minted on the fact:
+/// leads) is what keeps a real lead reporting its genuine cross-run subs and a
+/// correct derived `fan_out`. That distinction bites whenever the lead's OWN
+/// spec declares a role, since the self-edge is emitted ONLY then
+/// (`bins/rezidentd/src/runs.rs:766` — a roleless run emits no
+/// `permit.delegated` at all, so for a roleless lead the two placements
+/// coincide). The role-declaring case is where the whole argument lives.
+/// No discriminator field is minted on the fact:
 /// with this guard, "lead-keyed edge whose child badge belongs to a DIFFERENT
 /// run" IS the discriminator, derivable from existing fields (DR-044
 /// §Decision 2b). The guard is depth-agnostic; nested fan-out is out of slice

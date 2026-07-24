@@ -428,6 +428,19 @@ pub struct AgentRunState {
     /// unedited (I3 rebuild-stability), exactly as `pep` does.
     #[serde(default)]
     pub role: Option<String>,
+    /// DR-042 §Decision 2: this sub-run's spawn-time badge id, folded VERBATIM
+    /// from `agent.spawned.badge_id` (ontology line 223, a REQUIRED v1 field:
+    /// `hex(blake3(sig)[..8])`, the loggable id — NEVER the token, I2). This is
+    /// the id the lead→sub orchestration edge keys on: a lead's
+    /// [`DelegationRecord::child_badge_id`] matches the sub whose spawn folded
+    /// the same `badge_id` ([`orchestration_graph`]). `None` = a spawn that
+    /// carried no badge (a pre-DR-042 fixture, or a run the log minted without a
+    /// spawn) — ABSENT, never synthesized (DR-012 declared-vs-absent). Folded
+    /// exactly as `pep` / `role` are (an optional string off the spawn payload).
+    /// `#[serde(default)]` keeps every pre-DR-042 golden fixture parsing (and
+    /// comparing equal) unedited — I3 rebuild-stability.
+    #[serde(default)]
+    pub badge_id: Option<String>,
     /// DR-017 §Decision 2 (SP4b): this run's capability-delegation chain, folded
     /// from `permit.delegated` facts (ontology). Each attenuation-and-handoff at
     /// a sub-agent spawn earns one [`DelegationRecord`], in append (log) order so
@@ -687,6 +700,15 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 // `role`) folds role-less, keeping rebuild stable (I3).
                 if let Some(role) = event.payload()["role"].as_str() {
                     state.role = Some(role.to_string());
+                }
+                // DR-042 §Decision 2: fold the spawn badge id VERBATIM when
+                // present; ABSENT stays `None` — never synthesized (DR-012; the
+                // honest "no badge on this spawn"). This is the id the lead→sub
+                // orchestration edge keys on (`lead.delegations[].child_badge_id
+                // == sub.badge_id`, [`orchestration_graph`]). Folded exactly as
+                // `pep`/`role`, keeping rebuild stable (I3).
+                if let Some(badge_id) = event.payload()["badge_id"].as_str() {
+                    state.badge_id = Some(badge_id.to_string());
                 }
             }
         }
@@ -1495,4 +1517,109 @@ pub fn escalations(graph: &Graph, filter: Option<&str>) -> Vec<EscalationRow> {
                 })
         })
         .collect()
+}
+
+/// DR-042: one delegated sub-run's row in a lead's fan-out. A pure read of
+/// already-folded [`AgentRunState`] (I3): every field is carried VERBATIM from
+/// the sub's own derived state — the projection re-interprets nothing. Verdicts
+/// are three-valued and an `inconclusive` gate surfaces VERBATIM, NEVER coerced
+/// to pass/fail (I6). Derives `Serialize + Deserialize` so `orchestration_graph`
+/// serves it and the oracle deserializes the served payload back for equality.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubRow {
+    /// The sub's run ULID key (graph `agent_runs` key).
+    pub sub_run: String,
+    /// The sub's status, verbatim from [`AgentRunState::status`] (I3).
+    pub status: String,
+    /// The sub's `(gate, verdict)` pairs, verbatim from
+    /// [`AgentRunState::gates`] in `BTreeMap` key order — an `inconclusive`
+    /// verdict surfaces verbatim, never coerced (I6).
+    pub verdicts: Vec<(String, String)>,
+    /// The sub's replay-divergence alarm count, from
+    /// [`AgentRunState::integrity_alarms`] length. Honest zero when clean.
+    pub integrity_alarms: usize,
+}
+
+/// DR-042: one lead run's fan-out over its delegated sub-runs. The lead→sub edge
+/// is DERIVED purely (I3): a [`DelegationRecord::child_badge_id`] on the lead
+/// matches the sub whose spawn folded the same [`AgentRunState::badge_id`]
+/// (`lead.delegations[].child_badge_id == sub.badge_id`, DR-042 §Decision 2).
+/// `fan_out` is the DERIVED count of matched subs — never a stored fact.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LeadRow {
+    /// The lead's run ULID key (graph `agent_runs` key).
+    pub lead_run: String,
+    /// The DERIVED count of subs this lead delegated to (== `subs.len()`).
+    pub fan_out: usize,
+    /// One row per matched delegated sub, in deterministic (sub run ULID) key
+    /// order.
+    pub subs: Vec<SubRow>,
+}
+
+/// DR-042: the fleet's lead → parallel sub-runs orchestration graph.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrchestrationView {
+    /// One row per lead that has delegated to at least one folded sub, in
+    /// deterministic (lead run ULID) key order.
+    pub leads: Vec<LeadRow>,
+}
+
+/// PURE projection: `&Graph` -> [`OrchestrationView`]. No IO, no clocks, no
+/// randomness — a read of already-folded state (I3): the lead→sub edge is
+/// DERIVED (`lead.delegations[].child_badge_id == sub.badge_id`, DR-042
+/// §Decision 2), never a stored fact, and every sub field is carried VERBATIM
+/// from the sub's [`AgentRunState`] — the projection re-interprets nothing. An
+/// `inconclusive` gate verdict surfaces VERBATIM, NEVER coerced (I6).
+/// Deterministic in `BTreeMap` key order (`agent_runs`, twice) — same
+/// content-hashed log yields the same view (I3 rebuild-stability). A lead with
+/// no delegation that matches a folded sub produces NO row; `fan_out` is the
+/// derived count of matched subs.
+pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
+    let leads = graph
+        .agent_runs
+        .iter()
+        .filter_map(|(lead_run, lead)| {
+            // The set of child badge ids this lead delegated to (DR-042 edge).
+            // A running lead with no delegations produces no LeadRow.
+            if lead.delegations.is_empty() {
+                return None;
+            }
+            // Match each candidate sub (in deterministic run-key order) whose
+            // folded `badge_id` equals one of this lead's delegated child badge
+            // ids. Iterating `agent_runs` (a BTreeMap) dedupes by sub run and
+            // pins the order — a repeated delegation of the same child badge
+            // still yields one sub (I3 idempotent fold).
+            let subs: Vec<SubRow> = graph
+                .agent_runs
+                .iter()
+                .filter(|(_, sub)| match &sub.badge_id {
+                    Some(badge) => lead.delegations.iter().any(|d| &d.child_badge_id == badge),
+                    None => false,
+                })
+                .map(|(sub_run, sub)| SubRow {
+                    sub_run: sub_run.clone(),
+                    // Status carried verbatim from the sub's folded state (I3).
+                    status: sub.status.clone(),
+                    // Verdicts carried verbatim in gate-key order — an
+                    // inconclusive verdict surfaces verbatim, never coerced (I6).
+                    verdicts: sub
+                        .gates
+                        .iter()
+                        .map(|(gate, state)| (gate.clone(), state.verdict.clone()))
+                        .collect(),
+                    integrity_alarms: sub.integrity_alarms.len(),
+                })
+                .collect();
+            if subs.is_empty() {
+                return None;
+            }
+            Some(LeadRow {
+                lead_run: lead_run.clone(),
+                // fan_out is the DERIVED count of matched subs (DR-042).
+                fan_out: subs.len(),
+                subs,
+            })
+        })
+        .collect();
+    OrchestrationView { leads }
 }

@@ -13,7 +13,8 @@
       "total_usd": 0.190075,
       "input_tokens": 7441,
       "output_tokens": 45,
-      "session_id": "83c61e05-aecf-4c70-93f4-ada974db33df"
+      "session_id": "83c61e05-aecf-4c70-93f4-ada974db33df",
+      "badge_id": "deadbeef01234567"
     }
   }
 }

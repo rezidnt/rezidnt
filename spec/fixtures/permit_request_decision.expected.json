@@ -17,6 +17,7 @@
       "input_tokens": null,
       "output_tokens": null,
       "session_id": null,
+      "badge_id": "cafef00d01234567",
       "gates": {},
       "integrity_alarms": [],
       "permit_ledger": {

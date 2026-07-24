@@ -6,3 +6,4 @@
 *.expected.json text eol=lf
 *.golden.txt text eol=lf
 *.golden text eol=lf
+*.golden.json text eol=lf

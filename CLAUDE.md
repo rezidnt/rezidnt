@@ -15,12 +15,14 @@ Maker and checker are different agents on purpose: a checker that can edit is a 
 
 ## Commands (the workflow)
 /slice show current slice + acceptance criteria · /oracle write failing tests from criteria · /vet run the gauntlet ·
-/debrief auditor verdict on the diff · /subject change the ontology (warden-gated) · /intel scoped competitor read (memo) ·
-/dr draft a decision record · /handoff write session state for the next run.
+/debrief auditor verdict on the diff · /gauntlet vet ∥ debrief concurrently (the done gate, halves the tail) ·
+/lanes parallel-lane build for disjoint work items · /subject change the ontology (warden-gated) ·
+/intel scoped competitor read (memo) · /dr draft a decision record · /handoff write session state for the next run.
 
 ## The loop (per slice)
-/slice → /oracle <component> → implementer builds to green → /vet → /debrief → (fix or) advance. Definition of done = slice
-criteria pass /vet and /debrief. Nothing else counts as done.
+/slice → /oracle <component> → implementer builds to green (≥2 disjoint items → /lanes, in parallel) → /gauntlet →
+(fix with `vet.sh --fast` inner loops, then re-/gauntlet) or advance. Definition of done = slice criteria pass /vet and
+/debrief — /gauntlet is those two gates run concurrently, not a third gate. Nothing else counts as done.
 
 ## Guardrails (hooks, enforced)
 - `spec/ontology.md` edits are blocked outside a /subject session (ontology-gate).

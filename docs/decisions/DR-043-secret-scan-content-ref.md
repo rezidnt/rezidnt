@@ -3,7 +3,7 @@
 # Decision Record DR-043 — Unblock the `secret-scan` native verifier: pin the diff's added content to CAS as a new input ref
 
 **Date:** 2026-07-24
-**Status:** PROPOSED
+**Status:** ACCEPTED
 **Amends:** [DR-041](DR-041-production-verifier-pack-v1.md) Decision 2 (native vs exec rule) — KEEPS `secret-scan` classified NATIVE, and closes the input-shape gap that made that classification unbuildable. Amends the §8 verifier INPUT CONTRACT for `pre_merge` natives: adds a per-file added-content CAS ref alongside the existing path-status summary. Mints NO new invariant, badge, PDP path, reducer arm, or daemon dependency. Whether a NEW event subject/field is owed is flagged for the warden (Decision 4), not minted here. Adds a §20 index row.
 
 ## Context

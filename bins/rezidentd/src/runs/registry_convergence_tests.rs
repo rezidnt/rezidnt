@@ -65,9 +65,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use rezidnt_adapter_git::{DynRepoSubstrate, GitError, Worktree, WorktreeReq};
+use rezidnt_adapter_git::{DynRepoSubstrate, GitError, Worktree, WorktreeId, WorktreeReq};
 use rezidnt_cas::Cas;
 use rezidnt_fabric::{EventLog, Fabric};
+use rezidnt_types::refs::CasRef;
 
 use crate::mcp::allocation_refusal_code;
 use crate::runs::{Daemon, RunRegistry};
@@ -184,6 +185,15 @@ async fn the_repo_adapter_cache_is_keyed_on_the_canonicalized_repo_root() {
 /// injected stand-in for a contended tree — which cannot otherwise be produced,
 /// because worktree paths are ULID-derived and no test can pre-claim the path a
 /// task will take (DR-046 Item 3(a)).
+///
+/// `diff_summary` / `release_worktree` are implemented because
+/// `DynRepoSubstrate` mirrors all three `RepoSubstrate` methods (a wrapper
+/// covering only allocation would leave the daemon holding two handles to one
+/// adapter through two traits). Neither is reachable from this board — the
+/// substrate never allocates, so no `WorktreeId` it could be asked about
+/// exists — and each says exactly that with the trait's own honest error rather
+/// than a `todo!()` that would turn an unexpected call into a panic instead of
+/// a diagnosable refusal.
 struct ConflictingSubstrate;
 
 impl DynRepoSubstrate for ConflictingSubstrate {
@@ -197,6 +207,22 @@ impl DynRepoSubstrate for ConflictingSubstrate {
                 holder: "rezidnt".to_string(),
             })
         })
+    }
+
+    fn diff_summary(
+        &self,
+        wt: &WorktreeId,
+    ) -> Pin<Box<dyn Future<Output = Result<CasRef, GitError>> + Send + '_>> {
+        let wt = *wt;
+        Box::pin(async move { Err(GitError::UnknownWorktree(wt)) })
+    }
+
+    fn release_worktree(
+        &self,
+        wt: &WorktreeId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GitError>> + Send + '_>> {
+        let wt = *wt;
+        Box::pin(async move { Err(GitError::UnknownWorktree(wt)) })
     }
 }
 
@@ -289,7 +315,6 @@ async fn an_injected_substrate_makes_a_worktree_conflict_reachable() {
 /// mapping that answered one code for everything satisfies neither pair.
 #[test]
 fn a_registry_double_claim_maps_to_the_conflict_code_and_nothing_else_does() {
-    use anyhow::Context as _;
     use rezidnt_mcp::codes;
 
     let conflict = || GitError::Conflict {

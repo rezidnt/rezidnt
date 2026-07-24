@@ -10,6 +10,14 @@ anyhow.workspace = true
 # blake3: approved set; the hello's `schema` field is a blake3 hash of the
 # compiled-in taxonomy (doc §9: ontology hash).
 blake3.workspace = true
+# rezidnt-adapter-git (implementer, registry-convergence / DR-046 §Decision 8):
+# the daemon's FIRST dependency on a substrate adapter. `launch_agent` allocates
+# every worktree — ordinary spawn AND fan-out — through `RepoSubstrate`, so the
+# sole-allocator registry and its double-claim guard (DR-001) are on the golden
+# path instead of being unreachable code. Production, never dev-only: a dev-only
+# edge would let the tests reach the registry while production kept a private
+# git-CLI allocator, which is the split path this slice closes.
+rezidnt-adapter-git.workspace = true
 rezidnt-cas.workspace = true
 rezidnt-fabric.workspace = true
 # rezidnt-gate (implementer, S4): the verifier engine (doc §8) — vet pre-spawn,

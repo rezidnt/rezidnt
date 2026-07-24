@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use rezidnt_adapter_git::GitError;
 use rezidnt_gate::permit::{PermitLayer, PermitVerifierSpec};
 use rezidnt_mcp::{
     BoxFuture, FanOutOutcome, KillAck, McpSubstrate, OpenAck, PermitConfig, ToolRefusal, codes,
@@ -23,6 +24,33 @@ use crate::runs::{Daemon, LeadDelegation, begin_open, launch_agent};
 /// Ontology cap on `agent.spawned.idempotency_key` (DEFAULT, ratified
 /// 2026-07-17): a key is a short opaque token, trivially inside I2.
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
+
+/// Map a spawn failure onto its refusal code (DR-046 §Decision 9).
+///
+/// A sole-allocator double-claim answers [`codes::WORKTREE_CONFLICT`]: the tree
+/// was CONTENDED, and re-issuing the call with the same keys is the honest retry
+/// (DR-044 §Decision 3). Everything else stays [`codes::SPAWN_FAILED`] —
+/// collapsing the two is the defect §Decision 9 names, and so is the reverse:
+/// a git-CLI failure or a corrupt registry line told to "retry with the same
+/// keys" would loop forever.
+///
+/// Reads the error CHAIN, not just its head. `launch_agent` returns
+/// `anyhow::Result`, so an allocation failure arrives here already wrapped in
+/// whatever context the path added; a top-level-only match would degrade every
+/// REAL conflict to `spawn.failed` while still passing an unwrapped test — the
+/// failure mode is invisible exactly where it costs most. Matches the STRUCTURAL
+/// [`GitError::Conflict`] variant, never a message substring.
+pub(crate) fn allocation_refusal_code(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        if matches!(
+            cause.downcast_ref::<GitError>(),
+            Some(GitError::Conflict { .. })
+        ) {
+            return codes::WORKTREE_CONFLICT;
+        }
+    }
+    codes::SPAWN_FAILED
+}
 
 /// Bridges [`McpSubstrate`] onto the daemon's run substrate.
 pub struct McpBridge {
@@ -128,7 +156,7 @@ impl McpSubstrate for McpBridge {
                 None,
             )
             .await
-            .map_err(|e| ToolRefusal::new(codes::SPAWN_FAILED, format!("{e:#}")))?;
+            .map_err(|e| ToolRefusal::new(allocation_refusal_code(&e), format!("{e:#}")))?;
 
             if let Some(entry) = workspaces.get_mut(&ws) {
                 entry.spawn_keys.insert(idempotency_key, run.ulid());
@@ -429,18 +457,20 @@ impl McpSubstrate for McpBridge {
                     }
                     // A failed task mints NO run, so nothing can fold as `fail` —
                     // it is reported REFUSED (I6, DR-044 §Decision 3) and the
-                    // remaining tasks continue. NOTE (honest scope): the failure
-                    // that reaches here is whatever `launch_agent` reports,
-                    // including a worktree it could not claim. This path allocates
-                    // through the daemon's own git-CLI `allocate_worktree`
-                    // (`runs.rs`), NOT the git adapter's registry, so it produces
-                    // no `worktree.conflict` fact and cannot honestly claim that
-                    // code — the refusal carries `spawn.failed` with the real
-                    // message rather than a guessed conflict.
+                    // remaining tasks continue.
+                    //
+                    // As of the registry-convergence slice this path allocates
+                    // through the git adapter's sole-allocator registry, so a
+                    // CONTENDED tree is now a real, distinguishable outcome and
+                    // carries `worktree.conflict` (DR-046 §Decision 9) instead of
+                    // collapsing into `spawn.failed`. That is what makes DR-044
+                    // §Decision 3's refused-sub rule REACHED rather than
+                    // described. Every other failure still answers
+                    // `spawn.failed`, which is the honest code for it.
                     Err(e) => outcomes.push(refused(
                         agent,
                         idempotency_key,
-                        codes::SPAWN_FAILED,
+                        allocation_refusal_code(&e),
                         format!("{e:#}"),
                     )),
                 }

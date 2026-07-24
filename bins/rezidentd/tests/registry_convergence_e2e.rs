@@ -103,17 +103,27 @@ fn path_of(fact: &Event) -> String {
         .to_string()
 }
 
-/// Every line of the adapter's sole-allocator registry (`REGISTRY_PATH`,
-/// `<repo>/.rezidnt/worktrees`, JSONL).
+/// Every line of the adapter's sole-allocator registry ([`REGISTRY_PATH`],
+/// JSONL).
+///
+/// **The path is taken from the CONSTANT, corrected 2026-07-24 (Stage B).** As
+/// written, this helper hardcoded `<repo>/.rezidnt/worktrees` and its panic
+/// message named the collision it had spotted: the daemon uses that exact path
+/// as a worktree DIRECTORY while the adapter used it as its registry FILE, and
+/// the two cannot coexist. Stage A (`d56bcc7`) resolved that collision the only
+/// way that preserved the shipped on-disk layout — by moving `REGISTRY_PATH` to
+/// `.rezidnt/registry.jsonl` — which left this literal naming a directory. The
+/// criterion is untouched (every allocated path is claimed in the sole-allocator
+/// registry); only the file it reads is corrected, and reading it from the
+/// constant is strictly stronger than re-spelling it, since a future move
+/// cannot silently desynchronize the two again.
 fn registry_entries(repo: &Path) -> Vec<Value> {
-    let file = repo.join(".rezidnt").join("worktrees");
+    let file = repo.join(rezidnt_adapter_git::REGISTRY_PATH);
     let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
         panic!(
             "the sole-allocator registry must exist at {} after an allocation: {e}. \
-             NOTE: the daemon's private allocator uses that SAME path as a DIRECTORY \
-             (`repo/.rezidnt/worktrees/<agent>-<run>`), while the adapter uses it as its \
-             registry FILE — the repoint has to resolve that collision, and this panic is \
-             what it looks like when it has not been",
+             That file is written by `GitAdapter` and by nothing else, so its absence means \
+             the allocation never went through `RepoSubstrate` (DR-046 §Decision 8)",
             file.display()
         )
     });
@@ -236,7 +246,7 @@ fn the_allocation_fact_is_appended_with_its_workspace_and_vet_causation() {
 /// entry in the ADAPTER's sole-allocator registry.
 ///
 /// This is the test that cannot be satisfied by copying values around. The
-/// registry file (`REGISTRY_PATH`, `<repo>/.rezidnt/worktrees`) is written by
+/// registry file (`REGISTRY_PATH`) is written by
 /// `GitAdapter` and by nothing else in the tree; the daemon's private
 /// `allocate_worktree` shells out to `git worktree add` and writes no registry
 /// at all. So an allocated path appearing as a registry entry IS the proof that

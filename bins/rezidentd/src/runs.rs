@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use rezidnt_adapter_git::{
+    Allocator, DynRepoSubstrate, FactSink, GitAdapter, GitError, WorktreeReq,
+};
 use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
 use rezidnt_gate::Verdict;
@@ -179,6 +182,20 @@ pub struct Daemon {
     /// (the authority boundary). EMPTY when no admin source is wired — the
     /// pre-SP4c single-source (dev-only) behavior, no regression.
     pub admin_permit: Vec<PermitVerifierSpec>,
+    /// Repo substrates by CANONICALIZED REPO ROOT (DR-046 §Decision 8).
+    ///
+    /// Keyed on the repo, never on a workspace: the sole-allocator registry is
+    /// a per-repo file and its double-claim guard only sees claims made through
+    /// its OWN in-memory mirror, so two adapters over one repo are two
+    /// allocators, each claiming paths the other does not know about (DR-001).
+    /// Two workspaces opened over one repo is the ordinary case — and the case
+    /// a fan-out racing an ordinary spawn lands in — so a workspace-keyed cache
+    /// would defeat the guard exactly where it is needed.
+    repo_adapters: tokio::sync::Mutex<HashMap<PathBuf, Arc<dyn DynRepoSubstrate>>>,
+    /// An injected substrate that REPLACES the cache for every repo
+    /// ([`Daemon::with_repo_substrate`]) — the allocation seam DR-046 Item 3(a)
+    /// names. `None` in production.
+    repo_substrate: Option<Arc<dyn DynRepoSubstrate>>,
 }
 
 impl Daemon {
@@ -188,6 +205,8 @@ impl Daemon {
             cas,
             registry,
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
+            repo_adapters: tokio::sync::Mutex::new(HashMap::new()),
+            repo_substrate: None,
             // One key per Daemon instance = process-lifetime (a test that builds
             // a fresh Daemon gets its own key; the production daemon builds one).
             root_key: RootKey::mint(),
@@ -203,6 +222,119 @@ impl Daemon {
     pub fn with_admin_permit(mut self, admin: Vec<PermitVerifierSpec>) -> Self {
         self.admin_permit = admin;
         self
+    }
+
+    /// Replace the repo-adapter cache with one injected substrate, for every
+    /// repo (DR-046 Item 3(a), §Decision 8).
+    ///
+    /// THE seam the owed I6 conflict test needs. A registry double-claim cannot
+    /// be provoked black-box: worktree paths are ULID-derived, so no test can
+    /// pre-claim the path a task will take and two fan-out tasks can never
+    /// collide with each other. Substituting the allocator is what makes a
+    /// conflicted task reachable at all. Production never calls this — hence
+    /// the `dead_code` allowance, which states that fact rather than hiding it
+    /// behind a fake production caller.
+    #[allow(dead_code)]
+    pub fn with_repo_substrate(mut self, substrate: Arc<dyn DynRepoSubstrate>) -> Self {
+        self.repo_substrate = Some(substrate);
+        self
+    }
+
+    /// The repo substrate for `repo_root` — ONE per canonicalized repo root,
+    /// shared by every workspace over it (DR-046 §Decision 8, DR-001).
+    ///
+    /// Construction happens UNDER the cache lock, deliberately. Releasing the
+    /// lock to build and re-taking it to insert would let two callers over one
+    /// repo each open an adapter, and the loser's discard is not free: it
+    /// already ran its on-open reconciliation against the same registry file.
+    /// A second allocator existing at all — even briefly, even discarded — is
+    /// the thing this cache exists to prevent, so the lock is held for exactly
+    /// as long as "one adapter per repo" requires and not one await longer.
+    /// The lock is a leaf: nothing reached from here takes `workspaces`, so the
+    /// `workspaces` → `repo_adapters` order the spawn path establishes has no
+    /// counterpart to deadlock against.
+    pub async fn repo_adapter(
+        &self,
+        repo_root: &Path,
+    ) -> anyhow::Result<Arc<dyn DynRepoSubstrate>> {
+        if let Some(injected) = &self.repo_substrate {
+            return Ok(Arc::clone(injected));
+        }
+        let key = tokio::fs::canonicalize(repo_root)
+            .await
+            .with_context(|| format!("canonicalize repo root {}", repo_root.display()))?;
+
+        let mut cache = self.repo_adapters.lock().await;
+        if let Some(existing) = cache.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+
+        let adapter = GitAdapter::open_with_cas(&key, Arc::clone(&self.cas))
+            .await
+            .with_context(|| format!("open the git adapter over {}", key.display()))?
+            .with_sink(Arc::new(FabricSink {
+                fabric: Arc::clone(&self.fabric),
+            }));
+
+        // The on-open reconciliation scan runs INSIDE `open`, before any sink
+        // can be attached, so its facts (`worktree.conflict`, `worktree.observed`)
+        // reach only `startup_facts()` and the adapter's broadcast. A broadcast
+        // is not an append (I3): left undrained, a restarting daemon would
+        // reconcile its registry against reality and put NOTHING on the log —
+        // the exact hole this slice closes. Drained before the adapter is
+        // published to the cache, so no allocation fact can precede them.
+        for fact in adapter.startup_facts() {
+            publish(&self.fabric, fact)
+                .await
+                .context("append a git-adapter reconciliation fact")?;
+        }
+
+        let adapter: Arc<dyn DynRepoSubstrate> = Arc::new(adapter);
+        cache.insert(key, Arc::clone(&adapter));
+        Ok(adapter)
+    }
+}
+
+/// The daemon's [`FactSink`]: an adapter fact becomes a fabric APPEND (I3).
+///
+/// The adapter learns nothing about the fabric — it holds a `dyn FactSink` and
+/// knows only that an append either happened or did not (I4). Without this the
+/// adapter's facts would ride a broadcast channel alone, reaching live
+/// subscribers and never the log: unreplayable, unfoldable, and invisible to
+/// every `debrief`.
+struct FabricSink {
+    fabric: Arc<Fabric>,
+}
+
+impl FactSink for FabricSink {
+    fn emit(&self, event: &Event) -> Result<(), GitError> {
+        // `Fabric::publish` is a blocking SQLite append and its own docs say
+        // async callers must not call it inline. `FactSink::emit` is
+        // synchronous by contract (its failure has to fail the allocation that
+        // minted the fact, which an out-of-band task cannot do), so the
+        // available honest tool is `block_in_place`: it tells the multi-thread
+        // runtime to move the other tasks off this worker for the duration.
+        // It PANICS on a current-thread runtime rather than misbehaving, so the
+        // flavor is checked instead of assumed — a current-thread caller does
+        // the append inline, which is what it was going to do anyway.
+        let publish = || {
+            self.fabric
+                .publish(event.clone())
+                .map(|_seq| ())
+                // The single justified conversion into the adapter's error
+                // domain (Stage A's `FactSink` doc fixes `GitError::Registry`
+                // as the arm for "the durable record refused this fact").
+                .map_err(|e| {
+                    GitError::Registry(format!(
+                        "append {} to the fabric: {e}",
+                        event.subject.as_str()
+                    ))
+                })
+        };
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(publish),
+            _ => publish(),
+        }
     }
 }
 
@@ -746,56 +878,78 @@ pub async fn launch_agent(
         vet_causation = Some(outcome.verdict_id);
     }
 
-    // 3. worktree.allocated — minimal git-CLI allocation (S2 owns the full
-    // RepoSubstrate adapter; S1 keeps this to allocate-and-emit).
-    let (worktree, branch) = allocate_worktree(repo, agent, run).await?;
+    // 3. worktree.allocated — allocated THROUGH THE REPO SUBSTRATE (DR-046
+    // §Decision 8). The registry-convergence slice retired the daemon's private
+    // git-CLI allocator: both allocation paths, ordinary and fan-out, now claim
+    // their tree in the per-repo sole-allocator registry (DR-001), and the
+    // ADAPTER emits the single `worktree.allocated` fact. The daemon publishes
+    // none of its own — two emitters for one allocation would double every
+    // worktree count derived from the log and fold one allocation twice.
+    //
     // `worktree.allocated.allocator` v1 (ontology, value vocabulary widened by
     // the warden 2026-07-24 under DR-044 §Decision 3) — the allocating
     // PRINCIPAL: on whose initiative rezidnt allocated this tree.
     //
-    // `None` ⇒ `"rezidnt"` VERBATIM: the daemon on its own initiative, with no
-    // delegating lead. Every ordinary (non-fan-out) allocation keeps this value
-    // unchanged — a delegating value is NEVER retrofitted onto an ordinary
-    // spawn, because that would make "on its own initiative" unexpressible.
+    // `None` ⇒ [`Allocator::Rezidnt`], rendered `"rezidnt"` VERBATIM: the daemon
+    // on its own initiative, with no delegating lead. Every ordinary
+    // (non-fan-out) allocation keeps this value unchanged — a delegating value is
+    // NEVER retrofitted onto an ordinary spawn, because that would make "on its
+    // own initiative" unexpressible.
     //
-    // `Some(lead)` ⇒ scheme-TAGGED `run:<lead RunId ULID>` (a bare ULID is not
-    // legal on this field), so the log ALONE answers "which lead allocated this
-    // worktree". The sole-allocator model is untouched (DR-001): a lead is not a
-    // second allocator — what widened is the recorded principal, not the set of
-    // allocators.
-    //
-    // HONESTY (DR-046 §Decision 8, and `spec/ontology.md` ~218 as corrected): do
-    // NOT read the above as "the lead requests a tree through the §7 registry".
-    // THIS path never reaches `GitAdapter` — it allocates via the minimal git-CLI
-    // `allocate_worktree` below and publishes `worktree.allocated` itself, and no
-    // crate even depends on `rezidnt-adapter-git`. So DR-044 §Decision 3's
-    // conflict semantics are UNREACHED here: isolation holds by ULID uniqueness
-    // of the worktree path, not by any registry guard. The registry-convergence
-    // slice (DR-046 §Decision 8) is what makes that clause true. The discovery
-    // branches that test
-    // `allocator == "human"` (`crates/rezidnt-adapters/git/src/lib.rs:412`,
-    // `:579`) correctly land a `run:<ULID>` value in the not-human branch.
-    let allocator = match lead {
-        Some(lead) => format!("run:{}", lead.lead_run.ulid()),
-        None => "rezidnt".to_string(),
+    // `Some(lead)` ⇒ [`Allocator::Run`], rendered scheme-TAGGED `run:<lead RunId
+    // ULID>` (a bare ULID is not legal on this field), so the log ALONE answers
+    // "which lead allocated this worktree". The sole-allocator model is untouched
+    // (DR-001): a lead is not a second allocator — what widened is the recorded
+    // principal, not the set of allocators. As of this slice that sentence is
+    // true of the MECHANISM as well, not only of the vocabulary: the guard the
+    // ontology describes is the one this path now runs through.
+    let principal = match lead {
+        Some(lead) => Allocator::Run(lead.lead_run.ulid()),
+        None => Allocator::Rezidnt,
     };
-    let allocated_id = publish(
-        &daemon.fabric,
-        Event::new(
-            SourceId::new("daemon"),
-            Some(workspace),
-            Subject::new("worktree.allocated"),
-            correlation,
-            vet_causation,
-            1,
-            json!({
-                "path": worktree.display().to_string(),
-                "branch": branch,
-                "allocator": allocator,
-            }),
-        )?,
-    )
-    .await?;
+    let substrate = daemon.repo_adapter(repo).await?;
+    // Unchanged on-disk identity: `<repo>/.rezidnt/worktrees/<agent>-<run ULID>`,
+    // the name the retired allocator derived. ULID uniqueness still makes the
+    // path distinct; the registry is what now makes a collision an ERROR rather
+    // than a silent second claim.
+    let name = format!("{}-{}", agent.name, run.ulid());
+    let request = |branch: Option<String>, orphan: bool| WorktreeReq {
+        name: name.clone(),
+        detach: branch.is_none(),
+        branch,
+        orphan,
+        principal: principal.clone(),
+        // The envelope rides the REQUEST: one adapter serves every workspace
+        // over its repo, so a workspace-less allocation fact would fold into no
+        // workspace's graph (I3).
+        workspace: Some(workspace),
+        correlation: Some(correlation),
+        // On a vet-gated agent this is the vet VERDICT id, so "this tree was
+        // allocated BECAUSE vet passed" is answerable from the log alone (I6).
+        causation: vet_causation,
+    };
+    let allocated = match substrate.alloc_worktree(request(None, false)).await {
+        Ok(worktree) => worktree,
+        // An empty repo (`git init`, never committed) has no HEAD, so a detached
+        // checkout cannot resolve one. The retired allocator fell back to an
+        // orphan branch here and the fallback is live — the daemon's own
+        // `make_project` fixture builds exactly such a repo — so it is preserved
+        // rather than quietly dropped. Only a git-level failure retries: a
+        // CONFLICT is a contended tree and retrying it would claim the same
+        // registry key a second time.
+        Err(GitError::Git(detach)) => {
+            let branch = format!("rezidnt/{}-{}", agent.name, run.ulid());
+            substrate
+                .alloc_worktree(request(Some(branch), true))
+                .await
+                .with_context(|| format!("detached checkout first failed: {detach}"))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let worktree = allocated.path;
+    // The allocation fact's id — minted by the adapter and returned so the
+    // causal chain survives the repoint: `agent.spawned` below chains to it.
+    let allocated_id = allocated.allocated_event;
 
     // 4. agent.spawned — badge minted, env scrubbed, badge injected (§12).
     //    A permit-gated agent (its spec declares a `[gates.permit]` gate) also
@@ -1439,56 +1593,15 @@ fn insert_bwrap_chdir(argv: &mut Vec<String>, worktree: &Path) {
     }
 }
 
-/// `git worktree add` under the workspace dir. A repo with commits gets a
-/// detached checkout; an empty repo (no HEAD yet) falls back to an orphan
-/// worktree on a fresh `rezidnt/<agent>-<run>` branch (git ≥ 2.42).
-async fn allocate_worktree(
-    repo: &Path,
-    agent: &AgentSpec,
-    run: RunId,
-) -> anyhow::Result<(PathBuf, Option<String>)> {
-    let base = repo.join(".rezidnt").join("worktrees");
-    tokio::fs::create_dir_all(&base)
-        .await
-        .with_context(|| format!("create worktree base {}", base.display()))?;
-    let path = base.join(format!("{}-{}", agent.name, run.ulid()));
-
-    let detach = git_worktree_add(repo, &["--detach"], &path).await?;
-    if detach.status.success() {
-        let canonical = tokio::fs::canonicalize(&path).await?;
-        return Ok((canonical, None));
-    }
-
-    let branch = format!("rezidnt/{}-{}", agent.name, run.ulid());
-    let orphan = git_worktree_add(repo, &["--orphan", "-b", &branch], &path).await?;
-    if orphan.status.success() {
-        let canonical = tokio::fs::canonicalize(&path).await?;
-        return Ok((canonical, Some(branch)));
-    }
-
-    anyhow::bail!(
-        "git worktree add failed for {}: detach: {}; orphan: {}",
-        path.display(),
-        String::from_utf8_lossy(&detach.stderr).trim(),
-        String::from_utf8_lossy(&orphan.stderr).trim(),
-    )
-}
-
-async fn git_worktree_add(
-    repo: &Path,
-    mode: &[&str],
-    path: &Path,
-) -> anyhow::Result<std::process::Output> {
-    tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "add"])
-        .args(mode)
-        .arg(path)
-        .output()
-        .await
-        .context("run git worktree add (is git on PATH?)")
-}
+// RETIRED 2026-07-24 (registry-convergence, DR-046 §Decision 8): the daemon's
+// private `allocate_worktree` / `git_worktree_add` pair. It shelled out to
+// `git worktree add` directly, wrote no registry entry, and published its own
+// `worktree.allocated` — so the sole-allocator guard (DR-001) never saw a
+// daemon allocation and isolation held by ULID uniqueness of the path alone.
+// `launch_agent` now allocates through `RepoSubstrate` for both paths. Its two
+// behaviors that were NOT free to lose are preserved there: the in-repo
+// `<repo>/.rezidnt/worktrees/<agent>-<run>` layout (which the adapter adopted in
+// Stage A) and the empty-repo orphan-branch fallback (now `WorktreeReq.orphan`).
 
 struct RunTaskContext {
     daemon: Arc<Daemon>,

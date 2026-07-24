@@ -200,6 +200,21 @@ pub struct WorktreeReq {
     pub branch: Option<String>,
     /// `git worktree add --detach`: check out the current HEAD, no branch.
     pub detach: bool,
+    /// `git worktree add --orphan -b <branch>`: create the branch with NO
+    /// parent commit. Requires `branch`; incompatible with `detach`.
+    ///
+    /// **Added 2026-07-24 (registry-convergence Stage B; DEFAULT `false`, so
+    /// every existing caller is unchanged).** This is not a convenience: a repo
+    /// that has been `git init`-ed but never committed has no HEAD, so
+    /// `worktree add --detach` and `worktree add -b` both fail, and an orphan
+    /// checkout (git ≥ 2.42) is the only way to allocate in one. The daemon's
+    /// retired private allocator had exactly this fallback
+    /// (`bins/rezidentd/src/runs.rs`, `rezidnt/<agent>-<run>`) and the daemon's
+    /// own `make_project` fixture — the base of `golden_path`, `open_flow`,
+    /// `fan_out_live_e2e`, `run_persistence` and five more suites — builds an
+    /// empty repo, so the repoint would have lost a live, load-bearing
+    /// capability without it. DR-046 §Decision 8's brief does not mention it.
+    pub orphan: bool,
     /// Who is allocating. Defaults to [`Allocator::Rezidnt`].
     pub principal: Allocator,
     /// Workspace this allocation belongs to. `None` folds into no workspace's
@@ -220,6 +235,16 @@ pub struct Worktree {
     /// On-disk location (canonicalizes to the registry key).
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// The id of the `worktree.allocated` fact this allocation minted.
+    ///
+    /// **Added 2026-07-24 (registry-convergence Stage B).** Returned because
+    /// the allocation fact is now the adapter's to emit, and the caller still
+    /// has to chain to it: the daemon sets its `agent.spawned` causation to the
+    /// allocation fact's id, so a repoint that returned only the tree would
+    /// have severed the allocated → spawned causal edge (I3). The adapter
+    /// already had this value — it persists it as `RegistryEntry.allocated_event`
+    /// — so this exposes an existing fact rather than minting a new one.
+    pub allocated_event: Ulid,
 }
 
 /// Errors for the git adapter (thiserror per lib convention).
@@ -292,6 +317,61 @@ pub trait RepoSubstrate: Send + Sync {
     /// Release: git-CLI worktree removal, registry entry closed,
     /// `worktree.released` fact (exactly one), watch stopped.
     async fn release_worktree(&self, wt: &WorktreeId) -> Result<(), GitError>;
+}
+
+/// A boxed, `Send`-bounded future — the dyn-safe rendering of one
+/// [`RepoSubstrate`] method.
+pub type RepoFuture<'a, T> =
+    std::pin::Pin<Box<dyn Future<Output = Result<T, GitError>> + Send + 'a>>;
+
+/// The OBJECT-SAFE face of [`RepoSubstrate`] — the "Send-bounded dyn wrapper"
+/// that trait's own doc comment already puts in implementer scope.
+///
+/// [`RepoSubstrate`] uses native `async fn` in trait, whose desugared return
+/// type is neither nameable nor `Send`-bounded, so `dyn RepoSubstrate` does not
+/// exist. The daemon needs one anyway, for two reasons that are not about
+/// convenience:
+///
+/// - **One adapter per repo, held in a cache.** The registry is per-repo, so a
+///   second adapter over the same repo is a SECOND ALLOCATOR whose in-memory
+///   mirror does not see the first's claims (DR-001). A cache of concrete
+///   generic adapters cannot be a `HashMap`, so the cache needs a trait object.
+/// - **The injectable allocation seam** (DR-046 Item 3(a)): a registry
+///   double-claim is unreachable from a black-box test, because worktree paths
+///   are ULID-derived and nothing can pre-claim the path a task will take. A
+///   substitutable allocation seam is what makes the owed I6 conflict test
+///   writable at all, and substitution needs a trait object.
+///
+/// ALL THREE methods are mirrored, deliberately. Mirroring only
+/// `alloc_worktree` would leave the daemon reaching for the concrete adapter to
+/// summarize or release — two handles to one adapter through two traits, which
+/// is the split-path shape this slice exists to dissolve, one level up.
+pub trait DynRepoSubstrate: Send + Sync {
+    fn alloc_worktree(&self, req: WorktreeReq) -> RepoFuture<'_, Worktree>;
+    fn diff_summary(&self, wt: &WorktreeId) -> RepoFuture<'_, CasRef>;
+    fn release_worktree(&self, wt: &WorktreeId) -> RepoFuture<'_, ()>;
+}
+
+/// [`GitAdapter`] through the object-safe face. Written out rather than
+/// blanket-implemented over `T: RepoSubstrate`: the blanket form cannot compile,
+/// because `async fn` in trait yields an opaque future that is not provably
+/// `Send` from the bound alone, and forcing it would mean re-spelling
+/// [`RepoSubstrate`]'s signatures as `-> impl Future + Send` — a change to the
+/// S2 seam that this slice has no mandate to make.
+impl DynRepoSubstrate for GitAdapter {
+    fn alloc_worktree(&self, req: WorktreeReq) -> RepoFuture<'_, Worktree> {
+        Box::pin(RepoSubstrate::alloc_worktree(self, req))
+    }
+
+    fn diff_summary(&self, wt: &WorktreeId) -> RepoFuture<'_, CasRef> {
+        let wt = *wt;
+        Box::pin(async move { RepoSubstrate::diff_summary(self, &wt).await })
+    }
+
+    fn release_worktree(&self, wt: &WorktreeId) -> RepoFuture<'_, ()> {
+        let wt = *wt;
+        Box::pin(async move { RepoSubstrate::release_worktree(self, &wt).await })
+    }
 }
 
 /// One live registry line (JSONL at [`REGISTRY_PATH`]). `path` is the
@@ -455,15 +535,33 @@ pub struct GitAdapter {
 
 impl GitAdapter {
     /// Open the adapter over a repo root. Loads (or creates) the
-    /// [`REGISTRY_PATH`] registry and opens the CAS at `cas_root`.
+    /// [`REGISTRY_PATH`] registry and opens its OWN CAS at `cas_root`.
+    ///
+    /// A caller that already holds a CAS handle must use
+    /// [`GitAdapter::open_with_cas`] instead — see there for why two roots is a
+    /// defect, not a preference.
     pub async fn open(repo_root: &Path, cas_root: &Path) -> Result<Self, GitError> {
+        let cas_root = cas_root.to_path_buf();
+        let cas = tokio::task::spawn_blocking(move || Cas::open(&cas_root))
+            .await
+            .map_err(join_err)??;
+        Self::open_with_cas(repo_root, Arc::new(cas)).await
+    }
+
+    /// Open the adapter over a repo root, SHARING the caller's CAS.
+    ///
+    /// **Added 2026-07-24 (registry-convergence Stage B).** The daemon holds an
+    /// `Arc<Cas>` and [`GitAdapter::open`] opened a second one at whatever root
+    /// it was handed. Two CAS roots split content addressing: a `diff.ready`
+    /// carrying a [`CasRef`] the adapter minted would be UNRESOLVABLE from the
+    /// daemon's CAS, so the fact would name content no reader of the log could
+    /// fetch (I2 — the ref is the whole point of keeping bytes off the fabric).
+    /// Sharing the handle is what makes the ref mean the same thing on both
+    /// sides. DR-046 §Decision 8's brief does not mention this.
+    pub async fn open_with_cas(repo_root: &Path, cas: Arc<Cas>) -> Result<Self, GitError> {
         let span = tracing::info_span!("adapter", kind = "git", op = "open");
         async move {
             let repo_root = tokio::fs::canonicalize(repo_root).await?;
-            let cas_root = cas_root.to_path_buf();
-            let cas = tokio::task::spawn_blocking(move || Cas::open(&cas_root))
-                .await
-                .map_err(join_err)??;
 
             let registry_file = repo_root.join(REGISTRY_PATH);
             if let Some(parent) = registry_file.parent() {
@@ -488,7 +586,7 @@ impl GitAdapter {
                 inner: Arc::new(Inner {
                     repo_root,
                     registry_file,
-                    cas: Arc::new(cas),
+                    cas,
                     tx,
                     sink: OnceLock::new(),
                     correlation: Ulid::new(),
@@ -955,19 +1053,30 @@ impl RepoSubstrate for GitAdapter {
                 tokio::fs::create_dir_all(base).await?;
             }
             let target_cli = cli_path(&target);
-            match (&req.branch, req.detach) {
-                (Some(branch), false) => {
+            match (&req.branch, req.detach, req.orphan) {
+                (Some(branch), false, false) => {
                     self.run_git(&["worktree", "add", "-b", branch, &target_cli])
                         .await?
                 }
-                (None, true) => {
+                // No HEAD to branch from (a repo `git init`-ed but never
+                // committed): the branch is created parentless. git ≥ 2.42.
+                (Some(branch), false, true) => {
+                    self.run_git(&["worktree", "add", "--orphan", "-b", branch, &target_cli])
+                        .await?
+                }
+                (None, true, false) => {
                     self.run_git(&["worktree", "add", "--detach", &target_cli])
                         .await?
                 }
-                (None, false) => self.run_git(&["worktree", "add", &target_cli]).await?,
-                (Some(_), true) => {
+                (None, false, false) => self.run_git(&["worktree", "add", &target_cli]).await?,
+                (Some(_), true, _) => {
                     return Err(GitError::Git(
                         "contradictory request: both a branch and detach".into(),
+                    ));
+                }
+                (None, _, true) => {
+                    return Err(GitError::Git(
+                        "contradictory request: an orphan checkout needs a branch to create".into(),
                     ));
                 }
             };
@@ -1083,6 +1192,7 @@ impl RepoSubstrate for GitAdapter {
                 id,
                 path: canonical,
                 branch: req.branch,
+                allocated_event: allocated,
             })
         }
         .instrument(span)

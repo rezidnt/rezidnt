@@ -1,15 +1,36 @@
-//! DR-044 ORACLE (width-cap refusal + I2 response cleanliness + honest partial
-//! failure) — guards (d) and the response half of (e)/I2 from DR-044
-//! §Consequences. Runs against a bare `McpCore` with a RECORDING substrate, so
-//! it is deterministic and HOST-LINTABLE: no daemon, no process, no worktree.
+//! DR-044 + DR-045 ORACLE (the `fan_out` door, the width cap, I2 response
+//! cleanliness, honest partial failure) — DR-044 §Consequences guard (d) and the
+//! response half of (e)/I2, plus the single guard DR-045 §Consequences owes.
+//! Runs against a bare `McpCore` with a RECORDING substrate, so it is
+//! deterministic and HOST-LINTABLE: no daemon, no process, no worktree.
+//!
+//! ## DR-045 re-cut (2026-07-24)
+//!
+//! This board was first cut while DR-044 left the door's badge-KIND semantics
+//! undefined — the oracle flagged that gap as unanswerable and routed it to
+//! `/dr`. DR-045 answered it: `fan_out` is LEAD-ONLY. It admits ONLY a verified
+//! agent macaroon; an admitted DR-005 operator token is refused on POLICY with
+//! `FAN_OUT_LEAD_ONLY`, deliberately distinct from `BADGE_INVALID` because an
+//! operator badge is *valid*, just the wrong kind, and saying otherwise would be
+//! an honesty regression (I6).
+//!
+//! Every admitted path here therefore presents a real lead MACAROON over a
+//! ROOT-KEYED core — the badge kind the daemon actually injects. The original
+//! cut presented an operator token on those paths and wired no root key, which
+//! asserted the behavior DR-045 now forbids.
+//!
+//! Door order pinned by this board (DR-045 §Decision 3): `BADGE_REQUIRED` →
+//! `FAN_OUT_LEAD_ONLY` → `BADGE_INVALID` → width cap → substrate, with zero
+//! effect before any refusal.
 //!
 //! ## RED MODE
 //!
 //! COMPILE-RED on the seam types (`rezidnt_mcp::MAX_FAN_OUT_DEFAULT`,
-//! `FanOutOutcome`, `McpSubstrate::fan_out`, `codes::FAN_OUT_TOO_WIDE`) and
-//! ASSERT-RED on dispatch (`fan_out` is an unknown tool, so `tools_call` returns
-//! a `-32602` JSON-RPC error and `util::tool_call`'s "expected a result" panic
-//! fires). Both are red for the right reason: the tool and its seam do not exist.
+//! `FanOutOutcome`, `McpSubstrate::fan_out`, `codes::FAN_OUT_TOO_WIDE`,
+//! `codes::FAN_OUT_LEAD_ONLY`) and ASSERT-RED on dispatch (`fan_out` is an
+//! unknown tool, so `tools_call` returns a `-32602` JSON-RPC error and
+//! `util::tool_call`'s "expected a result" panic fires). Both are red for the
+//! right reason: the tool and its seam do not exist.
 //!
 //! ## API surface this board PINS (implementer builds to EXACTLY this)
 //!
@@ -25,6 +46,10 @@
 //!
 //! `pub const codes::FAN_OUT_TOO_WIDE: &str = "fan_out.too_wide";` — the
 //! machine-readable whole-call refusal.
+//!
+//! `pub const codes::FAN_OUT_LEAD_ONLY: &str = "fan_out.lead_only";` — DR-045
+//! §Decision 2, the badge-KIND policy refusal. Structurally a third door beside
+//! `check_badge` and `check_operator_badge`, in the DR-032 shape.
 //!
 //! ```ignore
 //! /// One task's outcome. Exactly one of `run` (spawned/deduped) or `code`
@@ -89,11 +114,15 @@ use rezidnt_mcp::{
     BadgeBook, BoxFuture, FanOutOutcome, KillAck, McpCore, McpSubstrate, OpenAck, PermitConfig,
     ToolRefusal, codes,
 };
-use rezidnt_run::badge::Badge;
+use rezidnt_run::badge::{Badge, Caveat, Macaroon, RootKey};
 use rezidnt_types::mcp::FanOutTask;
 use serde_json::{Value, json};
 
 const WS: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+/// The run the lead macaroon is minted over — its identifier, the value the
+/// daemon uses when it mints a run's base badge (`bins/rezidentd/src/runs.rs:752`).
+const LEAD_RUN: &str = "01DR045LEADRVN000000000001";
 
 /// Deterministic run ULIDs the fake substrate hands back, one per admitted task.
 const RUN_TEMPLATE: [&str; 8] = [
@@ -206,8 +235,47 @@ impl McpSubstrate for RecordingFanOutSubstrate {
     }
 }
 
-/// A core with the operator badge admitted and the recording fan-out substrate
-/// wired, over a fresh temp log (so side effects and their ABSENCE are readable).
+/// The daemon root key this board's macaroons are minted and verified against.
+/// Fixed bytes so the board is deterministic (mirrors `kill_run_door::root`).
+fn root() -> RootKey {
+    RootKey::from_bytes([45u8; 32])
+}
+
+/// The LEAD's own badge — an agent MACAROON, the badge kind the daemon injects
+/// under `REZIDNT_BADGE` and the ONLY kind `fan_out` admits (DR-045 §Decision 1).
+/// Narrowed by `Verb{spawn}`, the verb DR-044 §Decision 1 derives for this tool,
+/// so the caveat is genuinely evaluated rather than absent.
+///
+/// Deliberately carries NO `Expiry` caveat. The door falls back to wall-clock
+/// `now` when the caller sends none (`crates/rezidnt-mcp/src/lib.rs`), so a
+/// dated expiry would turn this board into a time bomb that goes red on a
+/// calendar date rather than on a behavior change. Expiry evaluation is already
+/// pinned by `badge_macaroon_verify.rs`; it is not this board's subject.
+fn lead_macaroon() -> Macaroon {
+    Macaroon::mint(
+        &root(),
+        LEAD_RUN,
+        vec![
+            Caveat::Workspace {
+                workspace: WS.into(),
+            },
+            Caveat::Verb {
+                verbs: vec!["spawn".into()],
+            },
+        ],
+    )
+}
+
+/// The wire form a lead presents on a `fan_out` call.
+fn lead_badge() -> String {
+    lead_macaroon().to_wire()
+}
+
+/// A core carrying BOTH badge kinds so the DR-045 door is judged honestly:
+/// the DR-005 operator token is ADMITTED in the `BadgeBook` (so its refusal is a
+/// POLICY refusal, not a verification failure) AND the daemon root key is wired
+/// (so a lead macaroon genuinely verifies on this same core). Over a fresh temp
+/// log, so side effects and their ABSENCE are readable.
 fn core_with(
     operator: &Badge,
     substrate: Arc<RecordingFanOutSubstrate>,
@@ -217,7 +285,9 @@ fn core_with(
     let fabric = Fabric::new(log, 1024);
     let mut book = BadgeBook::new();
     book.admit(operator);
-    let core = McpCore::new(fabric, book).with_substrate(substrate);
+    let core = McpCore::new(fabric, book)
+        .with_root_key(root())
+        .with_substrate(substrate);
     (dir, Arc::new(core))
 }
 
@@ -267,7 +337,7 @@ async fn over_wide_fan_out_is_refused_whole_call_with_no_effect() {
         1,
         "fan_out",
         json!({
-            "badge": operator.token_hex(),
+            "badge": lead_badge(),
             "workspace": WS,
             "tasks": tasks(over),
         }),
@@ -301,7 +371,7 @@ async fn a_fan_out_at_exactly_the_cap_is_admitted() {
         2,
         "fan_out",
         json!({
-            "badge": operator.token_hex(),
+            "badge": lead_badge(),
             "workspace": WS,
             "tasks": tasks(at_cap),
         }),
@@ -389,7 +459,7 @@ async fn a_partial_failure_reports_per_task_and_does_not_roll_back() {
         4,
         "fan_out",
         json!({
-            "badge": operator.token_hex(),
+            "badge": lead_badge(),
             "workspace": WS,
             "tasks": tasks(3),
         }),
@@ -459,7 +529,7 @@ async fn the_fan_out_response_carries_no_sub_content() {
         5,
         "fan_out",
         json!({
-            "badge": operator.token_hex(),
+            "badge": lead_badge(),
             "workspace": WS,
             "tasks": tasks(2),
         }),
@@ -492,4 +562,155 @@ async fn the_fan_out_response_carries_no_sub_content() {
             "the fan_out response must carry no sub content — found {banned:?} in {serialized}"
         );
     }
+}
+
+// --- DR-045: fan_out is lead-only -------------------------------------------
+
+/// CRITERION (DR-045 §Consequences, the one guard that record owes) — a
+/// `fan_out` call carrying a VALID DR-005 operator badge is refused
+/// `FAN_OUT_LEAD_ONLY` and emits NO `worktree.allocated` and NO `agent.spawned`.
+///
+/// The operator token here is genuinely admitted in this core's `BadgeBook`, so
+/// the refusal is a POLICY refusal on badge KIND, not a verification failure —
+/// the same shape as DR-032's operator-only `kill_run`, inverted. Fan-out is a
+/// run-scoped capability: an operator badge maps to no run, so there would be no
+/// lead to key `permit.delegated` on (DR-044 §Decision 2b) and the graph would
+/// gain an unparented sub.
+///
+/// NON-VACUITY (named by DR-045 §Consequences): the SAME core, the SAME
+/// substrate, the SAME task list, presented with a real lead MACAROON, is
+/// ADMITTED and reaches the substrate. Without this leg a door that refused
+/// everything would satisfy the assertion above.
+#[tokio::test]
+async fn an_operator_badge_is_refused_lead_only_and_a_lead_macaroon_is_admitted() {
+    let operator = Badge::mint().expect("mint operator badge");
+    let substrate = Arc::new(RecordingFanOutSubstrate::default());
+    let (_dir, core) = core_with(&operator, Arc::clone(&substrate));
+
+    // --- the refusal leg: a VALID operator badge, wrong KIND ---------------
+    let refused = util::tool_call(
+        &core,
+        6,
+        "fan_out",
+        json!({
+            "badge": operator.token_hex(),
+            "workspace": WS,
+            "tasks": tasks(2),
+        }),
+    )
+    .await;
+
+    util::assert_tool_refusal(&refused, codes::FAN_OUT_LEAD_ONLY);
+    assert_eq!(
+        substrate.calls.load(Ordering::SeqCst),
+        0,
+        "an operator-badged fan_out never reaches the substrate — the door refuses before any \
+         allocation or spawn (DR-045 §Decision 3)"
+    );
+    assert_no_fan_out_effect(&core, "operator-badged call");
+
+    // --- the non-vacuity leg: the SAME core admits a real lead macaroon ----
+    let admitted = util::tool_call(
+        &core,
+        7,
+        "fan_out",
+        json!({
+            "badge": lead_badge(),
+            "workspace": WS,
+            "tasks": tasks(2),
+        }),
+    )
+    .await;
+
+    assert_ne!(
+        admitted["isError"],
+        json!(true),
+        "the SAME core, root key wired, ADMITTS a real lead macaroon — so the refusal above is \
+         about badge KIND, not about this core being unable to verify anything (DR-045 \
+         §Consequences non-vacuity leg): {admitted:#}"
+    );
+    assert_eq!(
+        substrate.calls.load(Ordering::SeqCst),
+        1,
+        "the lead-badged call DID reach the substrate — the door is discriminating, not closed"
+    );
+}
+
+/// CRITERION (DR-045 §Decision 2/4) — the new code is DISTINGUISHABLE from a
+/// failed badge, which is the entire reason for minting it rather than reusing
+/// `BADGE_INVALID`. An operator token is *valid*; calling it invalid would be
+/// false, and I6 does not permit a refusal that misstates why (DR-045
+/// §Invariant posture).
+///
+/// So both directions are pinned:
+/// an admitted operator token is `FAN_OUT_LEAD_ONLY` and NEVER `BADGE_INVALID`;
+/// a genuinely unverifiable macaroon (unparseable, or well-formed under a
+/// FOREIGN root key) is `BADGE_INVALID` and NEVER `FAN_OUT_LEAD_ONLY`.
+/// Every one of them takes zero effect.
+#[tokio::test]
+async fn lead_only_is_distinguishable_from_an_invalid_badge() {
+    let operator = Badge::mint().expect("mint operator badge");
+    let substrate = Arc::new(RecordingFanOutSubstrate::default());
+    let (_dir, core) = core_with(&operator, Arc::clone(&substrate));
+
+    // A well-formed macaroon minted under a DIFFERENT root key: it parses, it
+    // is the right KIND, and it still cannot verify on this core.
+    let foreign = Macaroon::mint(
+        &RootKey::from_bytes([99u8; 32]),
+        LEAD_RUN,
+        vec![Caveat::Workspace {
+            workspace: WS.into(),
+        }],
+    )
+    .to_wire();
+
+    for (id, badge, expected, why) in [
+        (
+            8u64,
+            operator.token_hex(),
+            codes::FAN_OUT_LEAD_ONLY,
+            "an ADMITTED operator token is valid — refusing it BADGE_INVALID would tell the \
+             caller its badge is bad, which is false (DR-045 §Invariant posture, I6)",
+        ),
+        (
+            9,
+            "not-a-macaroon".to_string(),
+            codes::BADGE_INVALID,
+            "an UNPARSEABLE value is a bad badge, and must NOT be dressed up as a lead-only \
+             policy refusal (DR-045 §Decision 3 door order)",
+        ),
+        (
+            10,
+            foreign,
+            codes::BADGE_INVALID,
+            "a well-formed macaroon under a FOREIGN root key is the right KIND but does not \
+             verify — that is BADGE_INVALID, not FAN_OUT_LEAD_ONLY",
+        ),
+    ] {
+        let result = util::tool_call(
+            &core,
+            id,
+            "fan_out",
+            json!({"badge": badge, "workspace": WS, "tasks": tasks(2)}),
+        )
+        .await;
+
+        util::assert_tool_refusal(&result, expected);
+        assert_ne!(
+            util::tool_payload(&result)["code"],
+            json!(if expected == codes::FAN_OUT_LEAD_ONLY {
+                codes::BADGE_INVALID
+            } else {
+                codes::FAN_OUT_LEAD_ONLY
+            }),
+            "{why}: {result:#}"
+        );
+    }
+
+    assert_eq!(
+        substrate.calls.load(Ordering::SeqCst),
+        0,
+        "no refused call of any kind reaches the substrate (DR-045 §Decision 3)"
+    );
+    assert_no_fan_out_effect(&core, "refused-badge calls");
 }

@@ -1181,6 +1181,191 @@ impl NativeVerifier for IntentLock {
     }
 }
 
+/// Production verifier-pack native (DR-041 Decision 2 + DR-043): `secret-scan`
+/// — scans the diff's ADDED CONTENT for committed secrets. STAYS native
+/// (DR-041's rule; DR-043 Decision 1 reaffirms it): its verdict is a pure,
+/// deterministic, CAS-replayable computation over a content-hashed input, NOT a
+/// subprocess-natural external tool. This is the property that earned it the
+/// native label (I3 replay-equivalence, I6 determinism).
+///
+/// ## Input contract (DR-043 Decision 2 — the §8 native-input-shape amendment)
+/// Reads `refs["content"]` — a NEW pinned input ref carrying the per-file ADDED
+/// CONTENT of the diff (`cas.put()`-ed by the daemon git adapter, DR-043
+/// Decision 2), sitting NEXT TO the retained `refs["diff"]` path-status summary.
+/// It scans the pinned content ref, NOT the live worktree and NOT the path-only
+/// summary (DR-043 Decision 3). The content-blob format the daemon pins is the
+/// oracle decision below (see `secret_scan_native.rs`): per-file added content,
+/// each file preceded by a `>>> <path>` banner line so a `fail` can NAME the
+/// file (interrogability, I6).
+///
+/// ## Verdicts (DR-043 Decision 3/4 — three-valued, never coerced, I6)
+/// - a committed secret in the added content → **Fail**, NAMING the file AND the
+///   secret pattern that fired (interrogability);
+/// - clean content → **Pass**;
+/// - content the scanner cannot faithfully read — a binary blob, or a blob
+///   exceeding the scan bound — → **Inconclusive** (cannot-run), NEVER a silent
+///   pass; the `refs["content"]` blob absent from the CAS is likewise cannot-run.
+///
+/// ## ORACLE STUB (DR-043 secret-scan-native slice)
+/// `verify` is `todo!()` so the secret-scan board is ASSERT-red, not compile-red
+/// (the S4 gate-skeleton + C3a `PathConfinement` precedent). The implementer
+/// writes the content scan (the pattern set, the file-naming, the binary/oversize
+/// inconclusive bound) and keeps this registered in [`builtin_natives`] so
+/// [`replay`] re-executes it (the I3 CAS-replay-equivalence property DR-043
+/// turns on). It is ALREADY registered below so the replay-equivalence board is
+/// exercisable the moment `verify` lands.
+pub struct SecretScan;
+
+/// The banner token that precedes each file's added content in the pinned
+/// `refs["content"]` blob (DR-043 Decision 2): `>>> <repo-relative-path>\n`.
+/// Owning it here is what lets a `fail` NAME the offending file (I6). If this
+/// token changes, the oracle header + fixtures move with it.
+const CONTENT_FILE_BANNER: &str = ">>> ";
+
+/// The upper bound (bytes) of content this scanner will faithfully read as
+/// text. A blob over this bound is `inconclusive` (cannot-run), NEVER a silent
+/// pass — the un-scanned tail is unproven (DR-043 Decision 4, I6). The pinned
+/// blob itself always rides the CAS (I2, the daemon's ≤32 KiB → CAS
+/// discipline); this is only the read-as-text scan bound.
+const SECRET_SCAN_MAX_BYTES: usize = 1024 * 1024;
+
+impl NativeVerifier for SecretScan {
+    fn name(&self) -> &'static str {
+        "secret-scan"
+    }
+    fn verify(&self, input: &VerifierInput, cas: &Cas) -> Result<VerifierOutput, GateError> {
+        // The native scans `refs["content"]` — the diff's per-file ADDED
+        // CONTENT (DR-043 Decision 2/3), NOT the path-only `refs["diff"]`
+        // summary and NOT the live worktree. A missing/diff-only input (no
+        // content ref) is cannot-run → inconclusive, never a synthesized pass.
+        let Some(ref_str) = input.refs.get("content") else {
+            return Ok(cannot_run(
+                "no content ref in inputs — the path summary has no bytes to scan; \
+                 inconclusive, not a pass (DR-043, I6)",
+            ));
+        };
+        let Some(blob) = resolve_ref(cas, ref_str)? else {
+            return Ok(cannot_run(
+                "content blob absent from CAS — undecidable, not a pass (I6)",
+            ));
+        };
+
+        // Oversized: a blob past the scan bound is inconclusive (the un-scanned
+        // tail is unproven), NEVER coerced to a pass (DR-043 Decision 4, I6).
+        if blob.len() > SECRET_SCAN_MAX_BYTES {
+            return Ok(cannot_run(&format!(
+                "content is {} bytes, over the {SECRET_SCAN_MAX_BYTES}-byte scan bound — \
+                 inconclusive, not a pass (DR-043 Decision 4, I6)",
+                blob.len()
+            )));
+        }
+
+        // Binary / non-text: content the scanner cannot faithfully read as text
+        // (a NUL byte or an invalid-UTF-8 sequence) is inconclusive — NEVER a
+        // silent pass, even if secret-shaped bytes happen to be present after a
+        // NUL (DR-043 Decision 4, I6).
+        let text = match std::str::from_utf8(&blob) {
+            Ok(t) if !t.contains('\u{0}') => t,
+            _ => {
+                return Ok(cannot_run(
+                    "content is binary / not faithfully readable as text — inconclusive, \
+                     not a pass (DR-043 Decision 4, I6)",
+                ));
+            }
+        };
+
+        // Deterministic scan: walk the per-file banner blocks, and within each
+        // block scan each added line for a committed-secret pattern. The FIRST
+        // match in file/line order is the named offender (same content ref →
+        // same verdict AND same evidence, I6). The banner names the file so the
+        // fail is interrogable.
+        let mut current_file = "(unknown)";
+        for line in text.lines() {
+            if let Some(path) = line.strip_prefix(CONTENT_FILE_BANNER) {
+                current_file = path.trim();
+                continue;
+            }
+            if let Some(pat) = secret_pattern_hit(line) {
+                let msg = format!(
+                    "committed secret in {current_file}: {} pattern matched",
+                    pat.label
+                );
+                return fail_evidence(cas, pat.kind, &msg);
+            }
+        }
+
+        // No secret pattern fired over readable content → pass (DR-043
+        // Decision 3), never coerced to a fail.
+        Ok(VerifierOutput {
+            verdict: Verdict::Pass,
+            evidence: vec![],
+            cost_ms: 0,
+        })
+    }
+}
+
+/// One committed-secret pattern the scanner recognizes: the evidence `kind`
+/// (the machine tag) and a human `label` that NAMES which shape fired (I6 —
+/// a bare boolean is not enough; the fail must say WHICH pattern tripped).
+struct SecretPattern {
+    kind: &'static str,
+    label: &'static str,
+}
+
+/// Scan one line for a committed-secret pattern, returning the FIRST class that
+/// matches (deterministic, order-stable). The v1 pattern set (DR-043: AWS access
+/// key shape + PEM private-key header, at minimum):
+///
+/// - an AWS access-key ID: an `AKIA` prefix followed by 16 uppercase-or-digit
+///   characters (the canonical committed-secret tripwire);
+/// - a PEM private-key header: `-----BEGIN … PRIVATE KEY-----`.
+fn secret_pattern_hit(line: &str) -> Option<SecretPattern> {
+    if line_has_aws_access_key(line) {
+        return Some(SecretPattern {
+            kind: "aws-access-key",
+            label: "aws access-key id (AKIA…)",
+        });
+    }
+    if line_has_pem_private_key_header(line) {
+        return Some(SecretPattern {
+            kind: "private-key",
+            label: "pem private key (BEGIN … PRIVATE KEY)",
+        });
+    }
+    None
+}
+
+/// True if `line` contains an AWS access-key ID: the literal `AKIA` followed by
+/// exactly 16 uppercase-ASCII-or-digit characters (the AWS access-key ID shape).
+/// A pure byte scan — no regex crate (I7: no new dependency).
+fn line_has_aws_access_key(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    const PREFIX: &[u8] = b"AKIA";
+    const BODY_LEN: usize = 16;
+    let mut i = 0;
+    while i + PREFIX.len() + BODY_LEN <= bytes.len() {
+        if &bytes[i..i + PREFIX.len()] == PREFIX {
+            let body = &bytes[i + PREFIX.len()..i + PREFIX.len() + BODY_LEN];
+            if body
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True if `line` carries a PEM private-key header — `-----BEGIN` … `PRIVATE
+/// KEY-----` (covering `RSA`/`EC`/`OPENSSH`/plain `PRIVATE KEY` variants). A
+/// substring check anchored on the BEGIN header and the `PRIVATE KEY-----`
+/// footer of the header line.
+fn line_has_pem_private_key_header(line: &str) -> bool {
+    line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----")
+}
+
 /// The v1 native pack, by name — also the registry [`replay`] re-executes
 /// against.
 pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
@@ -1197,6 +1382,9 @@ pub fn builtin_natives() -> Vec<Box<dyn NativeVerifier>> {
         Box::new(SpendCap),
         Box::new(RiskCap),
         Box::new(IntentLock),
+        // DR-043 secret-scan-native: registered so `replay` re-executes it (the
+        // I3 CAS-replay-equivalence property). `verify` is an ORACLE STUB today.
+        Box::new(SecretScan),
     ]
 }
 

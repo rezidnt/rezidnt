@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rezidnt_gate::{
     AllowedTools, BareMode, DiffScope, ExecVerifier, ForbiddenPath, GateDef, NativeVerifier,
-    PinnedVersion, Verdict, VerdictRecord, VerifierInput,
+    PinnedVersion, SecretScan, Verdict, VerdictRecord, VerifierInput,
 };
 use rezidnt_run::spec::{AgentSpec, GateSpec, VerifierSpec, agent_spec_toml};
 use rezidnt_types::{Event, SourceId, Subject, WorkspaceId};
@@ -46,6 +46,9 @@ fn native_by_name(name: &str) -> Option<Box<dyn NativeVerifier>> {
         "bare-mode" => Some(Box::new(BareMode)),
         "pinned-version" => Some(Box::new(PinnedVersion)),
         "allowed-tools" => Some(Box::new(AllowedTools)),
+        // DR-043 secret-scan-native: the native scans refs["content"] (the
+        // diff's pinned added content) for committed secrets.
+        "secret-scan" => Some(Box::new(SecretScan)),
         _ => None,
     }
 }
@@ -452,6 +455,97 @@ fn porcelain_letter(xy: &str) -> char {
     } else {
         'M'
     }
+}
+
+/// The banner that precedes each file's added content in the pinned
+/// `refs["content"]` blob (DR-043 Decision 2) — MUST match
+/// `rezidnt_gate`'s `CONTENT_FILE_BANNER` so the native's file-naming lines up.
+const CONTENT_FILE_BANNER: &str = ">>> ";
+
+/// Pin the diff's per-file ADDED CONTENT into the CAS and return its
+/// `cas:blake3:<hex>` ref — the pre_merge gate's NEW `refs["content"]`
+/// (DR-043 Decision 2), sitting alongside the retained `refs["diff"]` summary.
+/// A SIBLING of [`summarize_worktree`]: same worktree, same CAS-put shape, but
+/// it carries the actual added BYTES (each file preceded by a
+/// `>>> <repo-relative-path>\n` banner) so the native `secret-scan` can scan
+/// content and NAME the offending file (I6).
+///
+/// I2 discipline: the content is BYTES — it always rides the CAS as a ref,
+/// never inlined on the fabric (the daemon's ≤32 KiB → CAS rule). Deleted
+/// files carry no added content and are skipped.
+pub async fn summarize_worktree_content(
+    daemon: &Arc<Daemon>,
+    worktree: &Path,
+) -> anyhow::Result<String> {
+    let bytes = git_added_content(worktree).await?;
+    let cas = Arc::clone(&daemon.cas);
+    let r = tokio::task::spawn_blocking(move || cas.put(&bytes, "text/plain"))
+        .await
+        .context("cas put task panicked")?
+        .context("pin diff content into cas")?;
+    Ok(format!("cas:blake3:{}", r.hash))
+}
+
+/// Render the per-file added content of a worktree: for every touched,
+/// non-deleted file (in the same porcelain scan `git_diff_summary` uses), emit
+/// a `>>> <repo-relative-path>\n` banner followed by that file's current
+/// working-tree bytes. Deterministic (paths sorted), content-stable — the shape
+/// the native `secret-scan` reads (DR-043 Decision 2/3).
+async fn git_added_content(worktree: &Path) -> anyhow::Result<Vec<u8>> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .await
+        .context("run git status (is git on PATH?)")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "git status failed in {}: {}",
+        worktree.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let porcelain = String::from_utf8_lossy(&out.stdout);
+    // Collect touched, non-deleted paths (added/modified/untracked) in sorted
+    // order for determinism — the same file set the summary names, minus
+    // deletions (which have no added content to scan).
+    let mut paths: Vec<String> = Vec::new();
+    for line in porcelain.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = &line[..2];
+        if porcelain_letter(xy) == 'D' {
+            continue;
+        }
+        paths.push(line[3..].trim().to_string());
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut blob: Vec<u8> = Vec::new();
+    for path in paths {
+        // Read the file's current working-tree bytes off the blocking pool.
+        let full = worktree.join(&path);
+        let bytes = tokio::fs::read(&full)
+            .await
+            .with_context(|| format!("read added content of {}", full.display()))?;
+        blob.extend_from_slice(CONTENT_FILE_BANNER.as_bytes());
+        blob.extend_from_slice(path.as_bytes());
+        blob.push(b'\n');
+        // Pin the EXACT original file bytes — no lossy decode. `from_utf8_lossy`
+        // would substitute U+FFFD for invalid UTF-8 *before* the CAS put, so a
+        // non-UTF-8 file with no NUL byte would reach the native `secret-scan` as
+        // clean, NUL-free text and its "invalid-UTF-8 OR NUL → inconclusive"
+        // guard could never fire — the coercion DR-043 Decision 4 forbids (I6).
+        // Pinning raw bytes lets the native see the real content and return
+        // inconclusive for binary/non-UTF-8 files.
+        blob.extend_from_slice(&bytes);
+        if blob.last() != Some(&b'\n') {
+            blob.push(b'\n');
+        }
+    }
+    Ok(blob)
 }
 
 /// Merge a worktree's committed change into the repo's checked-out branch via

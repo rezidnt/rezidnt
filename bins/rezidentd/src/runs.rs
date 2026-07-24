@@ -1573,7 +1573,16 @@ async fn run_pre_merge(
 
     // 2. pre_merge — verify the CAS-pinned diff. gate.entered follows
     //    diff.ready (the test pins this order: the gate verifies the diff).
-    let refs = BTreeMap::from([("diff".to_string(), diff_ref)]);
+    //    DR-043 Decision 2: pin the diff's per-file ADDED CONTENT as a NEW
+    //    input ref `refs["content"]`, sitting ALONGSIDE the retained path-only
+    //    `refs["diff"]` summary — the bytes the native `secret-scan` scans. It
+    //    rides the EXISTING CAS + gate-refs map (no new event subject; the
+    //    content is pinned exactly as the diff summary is at diff.ready).
+    let content_ref = gates::summarize_worktree_content(&ctx.daemon, &ctx.worktree).await?;
+    let refs = BTreeMap::from([
+        ("diff".to_string(), diff_ref),
+        ("content".to_string(), content_ref),
+    ]);
     let verifiers = gates::resolve_verifiers(&plan.gate);
     let outcome = gates::run_gate(
         &ctx.daemon,

@@ -867,6 +867,206 @@ verifiers = [
     (dir, spec)
 }
 
+/// Which leg a [`make_secret_scan_gated_project`] fixture drives: a CLEAN added
+/// change (secret-scan → pass → merge) or a change that COMMITS A SECRET
+/// (secret-scan → fail → merge blocked). DR-043 secret-scan-native e2e.
+#[derive(Clone, Copy)]
+pub enum SecretScanFixture {
+    /// The harness writes clean source — no secret material in the added content.
+    Clean,
+    /// The harness writes a change that commits a FAKE AWS-key-shaped secret
+    /// (assembled at runtime, no credential literal in source). secret-scan must
+    /// fail on the pinned added CONTENT and block the merge.
+    CommitsSecret,
+    /// The harness writes a NON-UTF-8 file that carries NO NUL byte — the
+    /// production-path counterpart of the pure-logic board's `content_binary`
+    /// case, but chosen to DEFEAT a NUL-only binary check: invalid UTF-8 with no
+    /// `0x00` anywhere. The daemon MUST pin these RAW bytes; if it decodes them
+    /// `String::from_utf8_lossy` before the `cas.put()`, they reach the native as
+    /// clean, NUL-free text and the "invalid-UTF-8 OR NUL → inconclusive" guard
+    /// can never fire — a silent PASS on genuinely non-text content, the coercion
+    /// DR-043 Decision 4 forbids (I6). The e2e sibling of the pure-logic
+    /// `binary_content_maps_to_inconclusive_not_coerced` — that test feeds RAW
+    /// bytes straight to the native (so it passes even against a lossy daemon);
+    /// THIS drives the same content through the REAL pinning path where the loss
+    /// happens.
+    BinaryNoNul,
+}
+
+/// A temp GATED project whose `[gates.pre_merge]` names the NATIVE `secret-scan`
+/// verifier (DR-041 Decision 2 / DR-043 Decision 1 — it stays NATIVE). The stub
+/// harness leaves a real change in its worktree: CLEAN source (`Clean`) or a
+/// change that commits a FAKE secret (`CommitsSecret`). The daemon summarizes the
+/// worktree, pins the diff — and, per DR-043 Decision 2, must ALSO `cas.put()` the
+/// per-file ADDED CONTENT and expose `refs["content"]` — then runs `secret-scan`
+/// over that content ref at `pre_merge`.
+///
+/// Unlike the lint/cargo-test fixtures this gate is NATIVE, so there is no `exec`
+/// argv and no `rezidnt` binary to pass — the daemon dispatches the built-in.
+/// The seeded base file is committed clean; the harness's change is what the diff
+/// (and its added content) captures. The secret token is assembled from parts so
+/// no credential literal sits in the repo (the house secret-guard).
+pub fn make_secret_scan_gated_project(
+    fixture: SecretScanFixture,
+    gap_ms: u64,
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src/config")).expect("mkdir repo/src/config");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "oracle@rezidnt.test"]);
+    git(&["config", "user.name", "rezidnt oracle"]);
+    // Seed a clean, committed base — the diff's added content is the harness's
+    // change against THIS.
+    std::fs::write(repo.join("src/config/aws.rs"), "// config v0\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "secret-scan e2e seed"]);
+
+    // The added content the harness writes into its worktree. The secret leg's
+    // token is assembled at runtime so no credential literal lands in source.
+    // The two TEXT legs go through the heredoc harness; the BinaryNoNul leg
+    // carries RAW non-UTF-8 bytes that cannot survive a shell heredoc or a Rust
+    // `String`, so it is written to a sidecar file and copied verbatim by a
+    // byte-faithful harness (see `secret_scan_gated_harness_raw`).
+    let harness = match fixture {
+        SecretScanFixture::Clean => secret_scan_gated_harness(
+            dir.path(),
+            gap_ms,
+            "pub const REGION: &str = \"us-east-1\";\n",
+        ),
+        SecretScanFixture::CommitsSecret => {
+            let token = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+            secret_scan_gated_harness(
+                dir.path(),
+                gap_ms,
+                &format!("pub const KEY: &str = \"{token}\";\n"),
+            )
+        }
+        SecretScanFixture::BinaryNoNul => {
+            // Non-UTF-8, NUL-FREE bytes. `0xFF` is never a valid UTF-8 byte (not a
+            // legal lead or continuation byte), so `std::str::from_utf8` REJECTS
+            // this slice; yet there is NO `0x00` anywhere, so a NUL-only binary
+            // check would wave it through. We wrap the invalid bytes in ordinary
+            // ASCII so the file is genuinely a diff's added content, not an empty
+            // blob. A secret-shaped run (assembled FROM PARTS at runtime — the
+            // house secret-guard) rides along too: against a lossy daemon the
+            // `0xFF` becomes U+FFFD and the native sees clean text, so it would
+            // either PASS or FIRE — either way NOT the honest `inconclusive` the
+            // native owes on genuinely unreadable content (DR-043 Decision 4, I6).
+            let token = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+            let mut raw: Vec<u8> = Vec::new();
+            raw.extend_from_slice(b"pub const K: &str = \"");
+            raw.push(0xFF); // lone 0xFF — invalid UTF-8, NOT a NUL
+            raw.extend_from_slice(&[0x80, 0x81, 0x82]); // stray continuation bytes, still no NUL
+            raw.extend_from_slice(token.as_bytes());
+            raw.extend_from_slice(b"\";\n");
+            let sidecar = dir.path().join("binary-no-nul.bytes");
+            std::fs::write(&sidecar, &raw).expect("write raw non-utf8 sidecar");
+            secret_scan_gated_harness_raw(dir.path(), gap_ms, &sidecar)
+        }
+    };
+
+    // NATIVE secret-scan on pre_merge — no exec argv (DR-043 Decision 1). No
+    // params required (the scanner's pattern set is built-in).
+    let spec = format!(
+        r#"[project]
+name = "secret-scan-e2e"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["vet", "pre_merge"]
+bare = true
+harness_version = "2.1.191"
+allowed_tools = ["Read", "Edit"]
+bin_override = "{harness}"
+
+# DR-043 secret-scan-native: pre_merge gates on the NATIVE secret-scan, which
+# scans the diff's pinned added CONTENT (refs["content"]).
+[gates.pre_merge]
+verifiers = [
+  {{ native = "secret-scan" }},
+]
+"#,
+        repo = repo.display(),
+        harness = harness.display(),
+    );
+    (dir, spec)
+}
+
+/// The stub harness for the secret-scan e2e: emits the S1 stream-json lines and
+/// OVERWRITES `src/config/aws.rs` with `new_body` in its working directory (the
+/// daemon runs a harness in its allocated worktree), so the S2 watcher produces a
+/// real `diff.ready` and the native secret-scan then gates the pinned added
+/// content. The overwrite runs EXACTLY once.
+pub fn secret_scan_gated_harness(dir: &Path, gap_ms: u64, new_body: &str) -> PathBuf {
+    let gap_s = gap_ms as f64 / 1000.0;
+    let script = dir.join("secret-scan-harness.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo '{{"type":"system","subtype":"init","session_id":"fixture-session","claude_code_version":"2.1.191","tools":[]}}'
+cat > src/config/aws.rs <<'RS'
+{new_body}RS
+sleep {gap_s}
+echo '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}]}}}}'
+sleep {gap_s}
+echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.001,"usage":{{"input_tokens":1,"output_tokens":1}},"session_id":"fixture-session"}}'
+"#
+        ),
+    )
+    .expect("write secret-scan harness stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// A BYTE-FAITHFUL variant of [`secret_scan_gated_harness`] for the `BinaryNoNul`
+/// leg: instead of embedding the added content in a shell heredoc (which cannot
+/// carry raw non-UTF-8 bytes), it `cp`s a pre-written sidecar file verbatim over
+/// `src/config/aws.rs`. `cp` copies bytes, so the invalid-UTF-8, NUL-free content
+/// reaches the daemon's worktree EXACTLY as written — the whole point of this leg
+/// (the loss, if any, must happen in the DAEMON's pinning path, not in the
+/// harness). The copy runs EXACTLY once. `raw_source` is the absolute sidecar
+/// path (a sibling of the script under `dir`, both outside the worktree).
+pub fn secret_scan_gated_harness_raw(dir: &Path, gap_ms: u64, raw_source: &Path) -> PathBuf {
+    let gap_s = gap_ms as f64 / 1000.0;
+    let script = dir.join("secret-scan-harness-raw.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo '{{"type":"system","subtype":"init","session_id":"fixture-session","claude_code_version":"2.1.191","tools":[]}}'
+cp '{raw_source}' src/config/aws.rs
+sleep {gap_s}
+echo '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}]}}}}'
+sleep {gap_s}
+echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.001,"usage":{{"input_tokens":1,"output_tokens":1}},"session_id":"fixture-session"}}'
+"#,
+            raw_source = raw_source.display(),
+        ),
+    )
+    .expect("write raw secret-scan harness stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
 /// A stub harness for the DR-041 cargo-test e2e: emits the S1 stream-json lines
 /// AND appends ONE Rust `#[test]` (`added_test`) to `src/lib.rs` in its working
 /// directory (the daemon runs a harness in its allocated worktree), so the S2

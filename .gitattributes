@@ -4,3 +4,5 @@
 *.sh text eol=lf
 *.jsonl text eol=lf
 *.expected.json text eol=lf
+*.golden.txt text eol=lf
+*.golden text eol=lf

@@ -38,14 +38,20 @@
 //! contains BOTH kinds of edge, which is the honest live counterpart of the
 //! pure-logic guard in `crates/rezidnt-state/tests/orchestration_self_edge_guard.rs`.
 //!
-//! ## Ontology posture (DR-044 §Decision 6, warden `/subject` in flight)
+//! ## Ontology posture (DR-044 §Decision 6 — warden session now CLOSED)
 //!
-//! This file asserts only on the PRESENCE or ABSENCE of `worktree.allocated`,
-//! never on its `allocator` VALUE. The v1 vocabulary
-//! (`spec/ontology.md:215`) is being widened in a parallel warden session to
-//! admit a delegating lead-run-scoped allocator; whichever value the warden
-//! ratifies, nothing here needs to change. No test in this file, and no test in
-//! this DR-044 oracle set, pins the allocator's value.
+//! When this board was first cut, the `worktree.allocated.allocator` v1 value
+//! vocabulary was mid-widening in a parallel warden session, so every test here
+//! deliberately asserted only the PRESENCE or ABSENCE of `worktree.allocated`
+//! and never its VALUE — the warden's outcome could not invalidate the board.
+//!
+//! The warden has since ratified `"rezidnt" | "run:<ULID>"`
+//! (`spec/ontology.md:215`), which retired that isolation and left the value
+//! itself machine-unchecked. `ordinary_allocations_stay_rezidnt_and_fan_out_allocations_name_the_lead`
+//! closes that hole and is the ONLY test in this file that reads the allocator
+//! value; its doc comment carries the honesty note about being a
+//! regression pin over already-shipped behavior rather than a failing-first
+//! oracle.
 #![cfg(unix)]
 
 mod common;
@@ -474,17 +480,32 @@ fn each_sub_edge_is_lead_keyed_and_its_child_badge_matches_the_sub_spawn() {
 // --- CRITERION: Decision 1, per-task idempotency -----------------------------
 
 /// CRITERION (DR-044 §Decision 1) — "a retry with the same keys re-returns the
-/// same runs and spawns nothing new", including ACROSS A DAEMON RESTART, because
-/// the dedup map is log-derived from `agent.spawned.idempotency_key`
-/// (`bins/rezidentd/src/runs.rs:149`, `:229`, `:287`) rather than process
-/// memory. This is the fan-out-shaped counterpart of the shipped
-/// `mcp_workspace_recovery::spawn_key_idempotency_survives_daemon_restart`.
+/// same runs and spawns nothing new". Idempotency composes PER TASK, resolving
+/// through the EXISTING per-workspace `spawn_keys` map
+/// (`bins/rezidentd/src/runs.rs:149`, `:229`, `:287`) — no new dedup mechanism.
 ///
 /// The "spawns nothing new" leg is asserted on the LOG, by counting
 /// `agent.spawned` facts per run — not on the response, which a broken
 /// implementation could echo correctly while double-spawning.
+///
+/// ## Scope: SAME-PROCESS, and that is not a weakening
+///
+/// An earlier cut of this test also asserted the retry across a daemon restart.
+/// That assertion was **unsatisfiable by construction**, and no implementation
+/// could ever have made it green: DR-045 admits ONLY a verified agent macaroon,
+/// and DR-017 §Decision 6 mints the macaroon root key PER PROCESS and never
+/// persists it (`bins/rezidentd/src/runs.rs:187`). After a restart the daemon
+/// holds a different root key, so a lead's badge cannot verify and NO `fan_out`
+/// call is admissible at all — the door refuses before idempotency is ever
+/// reached. The owner ruled the ephemeral root key stays (persisting it would
+/// turn it into a long-lived stealable secret), so the test moved, not the code.
+///
+/// The cross-restart requirement was never in DR-044 either: §Decision 1 asks
+/// only that a retry re-return the same runs. What DOES survive a restart — the
+/// log-derived `spawn_keys` map itself — is proven by the sibling test below,
+/// through a path whose badge survives.
 #[test]
-fn fan_out_is_idempotent_per_task_across_a_daemon_restart() {
+fn fan_out_is_idempotent_per_task_within_one_process() {
     let (mut daemon, lock_path) = start_daemon_with_mcp(None);
     let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
     let url = lock["url"].as_str().expect("url").to_string();
@@ -514,22 +535,8 @@ fn fan_out_is_idempotent_per_task_across_a_daemon_restart() {
          TASK (DR-044 §Decision 1)"
     );
 
-    // Restart: the dedup map must survive as LOG-DERIVED state, not memory.
-    restart_daemon_with_mcp(&mut daemon, &lock_path);
-    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
-    let url = lock["url"].as_str().expect("url after restart").to_string();
-    initialize(&url);
-
-    let after_restart = outcome_runs(&fan_out(&url, 14, &lead_badge, &workspace, &keys));
-    assert_eq!(
-        after_restart, first,
-        "same keys, same runs — ACROSS a daemon restart. A fresh ULID here means the fan-out \
-         dedup map was process memory rather than a fold of agent.spawned.idempotency_key \
-         (I3, DR-044 §Decision 1)"
-    );
-
     // The log is the judge on "spawns nothing new": exactly one agent.spawned
-    // per run, after three fan_out calls carrying the same two keys.
+    // per run, after two fan_out calls carrying the same two keys.
     let log = cold_read(&mut daemon);
     for run in &first {
         let spawns = log
@@ -538,8 +545,412 @@ fn fan_out_is_idempotent_per_task_across_a_daemon_restart() {
             .count();
         assert_eq!(
             spawns, 1,
-            "run {run} was spawned EXACTLY ONCE despite three fan_out calls with its key — a \
+            "run {run} was spawned EXACTLY ONCE despite two fan_out calls with its key — a \
              keyed retry spawns nothing new (DR-044 §Decision 1)"
+        );
+    }
+}
+
+/// CRITERION (DR-044 §Decision 1, the half a restart CAN prove) — a `fan_out`
+/// task's idempotency key lands in the SAME per-workspace `spawn_keys` map that
+/// `spawn_agent` uses, and that map is genuinely LOG-DERIVED: it survives a
+/// daemon restart.
+///
+/// This is the honest cross-restart proof. `fan_out` itself cannot be re-called
+/// after a restart (the lead's macaroon cannot verify against a freshly minted
+/// root key — DR-017 §Decision 6), but `spawn_agent` rides the OPERATOR badge,
+/// which the lockfile re-announces. So: fan out with key K in process 1, restart,
+/// then present key K to `spawn_agent` in process 2 and demand the SAME run back.
+///
+/// It proves two things at once, neither of which the sibling same-process test
+/// can reach. **Shared map** — DR-044 §Decision 1 says fan-out resolves "through
+/// the *existing* per-workspace `spawn_keys` map ... no new dedup mechanism"; a
+/// separate fan-out-only key space would return a fresh run here. **Log-derived**
+/// — the map is a fold of `agent.spawned.idempotency_key`, not process memory,
+/// so it survives the restart that destroys the root key.
+///
+/// It is NOT a duplicate of `mcp_workspace_recovery::
+/// spawn_key_idempotency_survives_daemon_restart`: that test writes and reads the
+/// key through `spawn_agent` on both sides. This one writes through `fan_out` and
+/// reads through `spawn_agent` — the cross-mechanism claim is the whole point.
+#[test]
+fn a_fan_out_key_joins_the_shared_spawn_key_map_and_survives_restart() {
+    let (mut daemon, lock_path) = start_daemon_with_mcp(None);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url").to_string();
+    let operator = lock["badge"].as_str().expect("badge").to_string();
+    initialize(&url);
+
+    let (project_dir, base_spec) = make_project(20);
+    let harness = badge_dumping_harness(project_dir.path());
+    let spec = with_badge_dump_and_role(&base_spec, &harness);
+
+    let (workspace, _lead_run, lead_badge) = open_and_capture_lead(&url, &operator, &spec);
+    const SHARED_KEY: &str = "dr044-shared-key";
+
+    // Process 1: the key enters the map through FAN_OUT.
+    let via_fan_out = outcome_runs(&fan_out(&url, 15, &lead_badge, &workspace, &[SHARED_KEY]));
+    let run = via_fan_out.first().expect("one task, one run").clone();
+    tail_until(&url, FACT_DEADLINE, |e| {
+        e["subject"] == "agent.spawned" && e["payload"]["run"] == json!(run)
+    });
+
+    // Restart. The macaroon root key dies here (DR-017 §6) — which is exactly
+    // why the read-back below goes through the operator-badged `spawn_agent`.
+    restart_daemon_with_mcp(&mut daemon, &lock_path);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url after restart").to_string();
+    let operator = lock["badge"]
+        .as_str()
+        .expect("badge after restart")
+        .to_string();
+    initialize(&url);
+
+    // Process 2: the SAME key, presented to SPAWN_AGENT, must resolve to the run
+    // fan_out minted before the restart.
+    let result = mcp_tool_call(
+        &url,
+        16,
+        "spawn_agent",
+        json!({
+            "badge": operator,
+            "workspace": workspace,
+            "agent": "impl",
+            "idempotency_key": SHARED_KEY,
+        }),
+    );
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "a keyed spawn_agent retry after restart is the §9 contract, not an error: {result:#}"
+    );
+    let resolved = tool_payload(&result)["run"]
+        .as_str()
+        .expect("spawn_agent names the run ulid")
+        .to_string();
+
+    assert_eq!(
+        resolved, run,
+        "the key fan_out used in process 1 resolves, in process 2, to the run fan_out minted — \
+         so fan_out writes into the SHARED per-workspace spawn_keys map (DR-044 §Decision 1: \
+         \"no new dedup mechanism\") and that map is LOG-DERIVED, not process memory (I3). A \
+         fresh ULID here means either a fan-out-private key space or an in-memory map."
+    );
+
+    // And nothing new was spawned: still exactly one agent.spawned for that run.
+    let log = cold_read(&mut daemon);
+    let spawns = log
+        .iter()
+        .filter(|e| e.subject.as_str() == "agent.spawned" && e.payload()["run"] == json!(run))
+        .count();
+    assert_eq!(
+        spawns, 1,
+        "run {run} was spawned EXACTLY ONCE across the fan_out and the post-restart keyed \
+         spawn_agent — a keyed retry spawns nothing new (DR-044 §Decision 1)"
+    );
+}
+
+// --- CRITERION: the allocator PRINCIPAL, both directions ---------------------
+
+/// CRITERION (ontology `worktree.allocated.allocator` v1, widened by the warden
+/// for DR-044 §Decision 3) — the recorded allocating principal is correct in
+/// BOTH directions, on one log:
+///
+/// an ORDINARY (non-fan-out) allocation emits `allocator: "rezidnt"` VERBATIM —
+/// the daemon on its own initiative, with no delegating lead; and a FAN-OUT
+/// allocation emits the scheme-tagged `allocator: "run:<lead ULID>"`, naming the
+/// lead it allocated on behalf of.
+///
+/// ## Why both directions, in one test
+///
+/// The warden ratified the widening with an explicit warning: repointing
+/// ordinary allocations at a delegating value would make "the daemon allocated
+/// this on its own initiative" UNEXPRESSIBLE (`spec/ontology.md:215`). The two
+/// assertions are mutually exclusive by construction, so no single-value
+/// implementation can satisfy both — that is this test's non-vacuity, and it is
+/// why they are pinned together rather than in separate files.
+///
+/// ## Honesty: this is a REGRESSION pin, not a failing-first oracle
+///
+/// The value plumbing already shipped in lane 2 (`bins/rezidentd/src/runs.rs`
+/// selects the principal from the `LeadDelegation`), so this test is expected to
+/// be GREEN on arrival. It is written because NOTHING machine-checked the value
+/// before it: both existing boards assert only the PRESENCE or ABSENCE of
+/// `worktree.allocated`, deliberately, so that the warden session widening the
+/// vocabulary could not invalidate them. That isolation was correct then and
+/// leaves exactly this hole now, which the implementer flagged. A green-on-
+/// arrival pin over shipped behavior is a regression guard; it is not evidence
+/// that the oracle drove the behavior, and it is not presented as such.
+///
+/// The tagged form is asserted as a WHOLE STRING (`run:<ULID>`), never by
+/// prefix-only or by "contains the ULID": the ontology fixes the scheme prefix
+/// precisely so a consumer never has to guess whether a value is a sentinel or
+/// an id, and a bare ULID is explicitly NOT legal there.
+#[test]
+fn ordinary_allocations_stay_rezidnt_and_fan_out_allocations_name_the_lead() {
+    let (mut daemon, lock_path) = start_daemon_with_mcp(None);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url").to_string();
+    let operator = lock["badge"].as_str().expect("badge").to_string();
+    initialize(&url);
+
+    let (project_dir, base_spec) = make_project(20);
+    let harness = badge_dumping_harness(project_dir.path());
+    let spec = with_badge_dump_and_role(&base_spec, &harness);
+
+    // The lead's OWN allocation happens on the open chain — an ordinary spawn
+    // with no delegating lead.
+    let (workspace, lead_run, lead_badge) = open_and_capture_lead(&url, &operator, &spec);
+
+    let sub_runs = outcome_runs(&fan_out(
+        &url,
+        17,
+        &lead_badge,
+        &workspace,
+        &["dr044-alloc-a", "dr044-alloc-b"],
+    ));
+    assert_eq!(sub_runs.len(), 2, "two tasks, two subs");
+    for sub in &sub_runs {
+        tail_until(&url, FACT_DEADLINE, |e| {
+            e["subject"] == "agent.spawned" && e["payload"]["run"] == json!(sub)
+        });
+    }
+
+    let log = cold_read(&mut daemon);
+    let allocations: Vec<String> = log
+        .iter()
+        .filter(|e| e.subject.as_str() == "worktree.allocated")
+        .map(|e| {
+            e.payload()["allocator"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "worktree.allocated.allocator is a REQUIRED v1 field: {:#}",
+                        e.payload()
+                    )
+                })
+                .to_string()
+        })
+        .collect();
+
+    // 1 lead (ordinary, on the open chain) + 2 subs (fan-out).
+    assert_eq!(
+        allocations.len(),
+        3,
+        "one ordinary allocation for the lead plus one per sub: {allocations:?}"
+    );
+
+    let delegating = format!("run:{lead_run}");
+    let ordinary = allocations.iter().filter(|a| *a == "rezidnt").count();
+    let delegated = allocations.iter().filter(|a| **a == delegating).count();
+
+    assert_eq!(
+        ordinary, 1,
+        "the LEAD's own allocation — an ordinary spawn on the open chain, with no delegating \
+         lead — records `rezidnt` VERBATIM. Repointing ordinary allocations at a delegating \
+         value would make \"the daemon allocated this on its own initiative\" unexpressible \
+         (ontology `worktree.allocated.allocator` v1, warden 2026-07-24): {allocations:?}"
+    );
+    assert_eq!(
+        delegated, 2,
+        "each SUB's allocation records the scheme-tagged `{delegating}` — the daemon allocated \
+         on behalf of the named lead run, so the log ALONE answers \"which lead allocated this \
+         worktree\" (DR-044 §Decision 3): {allocations:?}"
+    );
+
+    // Nothing outside the ratified vocabulary, and specifically never a BARE
+    // ULID (the ontology fixes the `run:` scheme prefix so a consumer never has
+    // to guess sentinel-vs-id) and never the reserved `human` sentinel, which
+    // rezidnt does not emit on this subject.
+    for allocator in &allocations {
+        assert!(
+            allocator == "rezidnt" || *allocator == delegating,
+            "allocator {allocator:?} is outside the ratified v1 vocabulary \
+             {{\"rezidnt\", \"run:<ULID>\"}} — a bare ULID is NOT legal and `human` is reserved \
+             for out-of-band observation, never emitted by rezidnt here: {allocations:?}"
+        );
+        assert_ne!(
+            allocator, &lead_run,
+            "the delegating form is scheme-TAGGED `run:<ULID>`, never a bare ULID: {allocations:?}"
+        );
+    }
+}
+// --- CRITERION (DR-044 §Decision 3): a refused sub is not a failed sub -------
+
+/// Make the workspace's worktree base UN-WRITABLE so every subsequent
+/// allocation fails, without touching git internals or the lead's already-live
+/// worktree. `create_dir_all` still succeeds (the dir exists), but
+/// `git worktree add <base>/<name>` cannot create its subdir.
+///
+/// This is the only lever available: worktree paths are ULID-derived
+/// (`<base>/<agent>-<run ULID>`), so a test cannot predict — and therefore
+/// cannot pre-claim — the path a given task will take. See the honesty note on
+/// the test below for what that costs.
+fn block_allocations(repo: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = repo.join(".rezidnt").join("worktrees");
+    assert!(
+        base.is_dir(),
+        "precondition: the lead's own allocation created {}",
+        base.display()
+    );
+    let mut perms = std::fs::metadata(&base).expect("stat base").permissions();
+    perms.set_mode(0o555); // r-xr-xr-x: traversable, not writable
+    std::fs::set_permissions(&base, perms).expect("chmod worktree base read-only");
+}
+
+fn unblock_allocations(repo: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = repo.join(".rezidnt").join("worktrees");
+    if let Ok(meta) = std::fs::metadata(&base) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&base, perms);
+    }
+}
+
+/// CRITERION (DR-044 §Decision 3 / I6, §Consequences (e)) — a task whose
+/// worktree CANNOT be allocated is a REFUSED SUB, not a failed run:
+///
+/// no run is minted, so nothing folds as `fail` (there is no run to fail); the
+/// task's outcome carries a machine-readable refusal code; the call itself is
+/// NOT a whole-call error; and the refused task appears in NO `VerdictRollup`
+/// bucket — not passed, not failed, not inconclusive, not pending. Plus the
+/// liveness half of §Decision 3: NO in-daemon retry loop, so the call RETURNS
+/// rather than livelocking against a sole allocator.
+///
+/// ## Honesty: what this does and does not cover
+///
+/// DR-044 §Decision 3 names a WORKTREE CONFLICT (a registry double-claim) as the
+/// refusal trigger. This test forces a different allocation failure, because a
+/// registry double-claim has NO deterministic black-box seam today: worktree
+/// paths are ULID-derived, so a test cannot pre-claim the path a task will take,
+/// and two fan-out tasks can never collide with each other. What is under test
+/// here is the SEMANTICS the record fixes — refused-is-not-failed, remaining
+/// subs stand, never tallied — which are identical for any allocation refusal.
+/// The conflict-SPECIFIC obligations (exactly one `worktree.conflict`, the
+/// allocation errors rather than taking over) are already pinned at the level
+/// where a deterministic oracle DOES exist:
+/// `crates/rezidnt-adapters/git/tests/worktree_conflict.rs` and
+/// `restart_and_discovery.rs`.
+///
+/// What is genuinely uncovered, and stays uncovered until someone builds the
+/// seam: that a conflict raised INSIDE a live fan-out surfaces as this refusal
+/// shape. Making it testable needs an injectable allocation seam or a
+/// test-visible worktree path — a change to the daemon, not to this test.
+#[test]
+fn an_unallocatable_task_is_a_refused_sub_and_never_a_tallied_one() {
+    let (mut daemon, lock_path) = start_daemon_with_mcp(None);
+    let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
+    let url = lock["url"].as_str().expect("url").to_string();
+    let operator = lock["badge"].as_str().expect("badge").to_string();
+    initialize(&url);
+
+    let (project_dir, base_spec) = make_project(20);
+    let repo = project_dir.path().join("repo");
+    let harness = badge_dumping_harness(project_dir.path());
+    let spec = with_badge_dump_and_role(&base_spec, &harness);
+
+    // The lead allocates normally; only the SUBS are blocked.
+    let (workspace, lead_run, lead_badge) = open_and_capture_lead(&url, &operator, &spec);
+    block_allocations(&repo);
+
+    let started = Instant::now();
+    let result = fan_out(
+        &url,
+        18,
+        &lead_badge,
+        &workspace,
+        &["dr044-refused-a", "dr044-refused-b"],
+    );
+    let elapsed = started.elapsed();
+    unblock_allocations(&repo);
+
+    // §Decision 3 liveness — "no in-daemon retry loop against a sole-allocator
+    // registry: that is a livelock". A generous bound; the claim is that the
+    // call terminates at all, not that it is fast.
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "fan_out must RETURN on an unallocatable task — DR-044 §Decision 3 forbids an in-daemon \
+         retry loop (a livelock against a sole allocator); re-issuing the call with the same \
+         keys is the honest retry. Took {elapsed:?}"
+    );
+
+    // A per-task failure is NOT a whole-call failure.
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "an unallocatable TASK does not fail the CALL — the report is the per-task outcome \
+         vector (DR-044 §Decision 1): {result:#}"
+    );
+
+    let payload = tool_payload(&result);
+    let outcomes = payload["outcomes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("fan_out returns a per-task outcome vector: {payload:#}"));
+    assert_eq!(outcomes.len(), 2, "one outcome per task: {outcomes:#?}");
+    for outcome in outcomes {
+        // Pinned to the ALLOCATION failure specifically, not merely "some code":
+        // a task refused for an unrelated reason (an unknown agent, a bad key)
+        // would otherwise satisfy this test without exercising the criterion.
+        assert_eq!(
+            outcome["code"],
+            json!("spawn.failed"),
+            "a refused task's outcome carries a machine-readable refusal code: {outcome:#}"
+        );
+        assert!(
+            outcome["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktree"),
+            "and the refusal is the WORKTREE ALLOCATION failing, which is the DR-044 §Decision 3              trigger class under test — not some unrelated per-task refusal: {outcome:#}"
+        );
+        assert!(
+            outcome.get("run").is_none() || outcome["run"].is_null(),
+            "a refused task mints NO run — there is nothing to fail, so nothing folds as a \
+             failed sub (DR-044 §Decision 3): {outcome:#}"
+        );
+    }
+
+    // The log is the judge. Fold it and project: the refused tasks must be
+    // invisible to the orchestration graph — no sub row, and therefore no
+    // bucket in the lead's VerdictRollup.
+    let log = cold_read(&mut daemon);
+    let view = project(&log);
+
+    let lead = view.leads.iter().find(|l| l.lead_run == lead_run);
+    let (fan_out_width, rollup_total) = match lead {
+        Some(lead) => (
+            lead.fan_out,
+            lead.verdict_rollup.passed
+                + lead.verdict_rollup.failed
+                + lead.verdict_rollup.inconclusive
+                + lead.verdict_rollup.pending,
+        ),
+        // No lead row at all is the correct projection of "delegated to nobody".
+        None => (0, 0),
+    };
+    assert_eq!(
+        fan_out_width, 0,
+        "both tasks were refused, so the lead has NO subs — a refused task never inflates \
+         fan_out (DR-044 §Decision 3): {view:#?}"
+    );
+    assert_eq!(
+        rollup_total, 0,
+        "a refused task is counted in NO VerdictRollup bucket — not passed, not failed, not \
+         inconclusive, and not pending (I6, DR-044 §Consequences (e)): {view:#?}"
+    );
+
+    // And nothing folded as a failed RUN either: no agent.spawned carrying
+    // either refused key ever reached the log.
+    for key in ["dr044-refused-a", "dr044-refused-b"] {
+        assert!(
+            log.iter().all(|e| {
+                e.subject.as_str() != "agent.spawned"
+                    || e.payload()["idempotency_key"] != json!(key)
+            }),
+            "no agent.spawned was emitted for refused task {key} — a refused sub is not a \
+             spawned-then-failed sub (DR-044 §Decision 3)"
         );
     }
 }

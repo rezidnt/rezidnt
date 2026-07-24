@@ -113,6 +113,7 @@ pub async fn run_gate(
     gate_name: &str,
     refs: BTreeMap<String, String>,
     verifiers: &[ResolvedVerifier],
+    exec_cwd: Option<&Path>,
 ) -> anyhow::Result<GateOutcome> {
     let def = GateDef {
         name: gate_name.to_string(),
@@ -147,11 +148,18 @@ pub async fn run_gate(
                 r
             }
             VerifierKind::Exec(argv) => {
+                // DR-041: an exec verifier runs in the gate's exec cwd (the
+                // allocated worktree for pre_merge, so a `cargo-test` verifier
+                // sees the real tree — not just the diff-summary CAS ref) with
+                // the minimal toolchain env cargo-test needs. `exec_context`
+                // returns an EMPTY-env, no-cwd context when no cwd is supplied,
+                // preserving the §12 scrub for every other exec verifier.
+                let ctx = exec_context(exec_cwd);
                 ExecVerifier {
                     name: resolved.name.clone(),
                     argv: argv.clone(),
                 }
-                .run(&input)
+                .run_in(&input, &ctx)
                 .await
             }
         };
@@ -277,6 +285,37 @@ pub enum VerifierKind {
     Exec(Vec<String>),
 }
 
+/// Build the [`rezidnt_gate::ExecContext`] for an exec verifier run in this
+/// gate. When `cwd` is `Some` (the pre_merge worktree), the exec verifier runs
+/// THERE (so a `rezidnt verify cargo-test` verifier sees the real tree) and is
+/// granted the MINIMAL toolchain env cargo-test needs — `PATH` and `HOME`,
+/// sourced from the daemon's OWN environment (DR-041 Decision 3: cargo-test's
+/// toolchain is a host prerequisite; its wrapper gets exactly the env cargo
+/// needs and nothing more). When `cwd` is `None` (e.g. vet, which has no exec
+/// verifiers), the context is empty — the §12 full scrub, unchanged.
+fn exec_context(cwd: Option<&Path>) -> rezidnt_gate::ExecContext {
+    let Some(cwd) = cwd else {
+        return rezidnt_gate::ExecContext::default();
+    };
+    // The exec verifier's toolchain env is an EXPLICIT allowlist, never the
+    // parent's whole environment (§12): only the vars cargo/rustup need to
+    // locate and run the toolchain. Absent from the daemon's env ⇒ omitted, and
+    // a genuinely missing `cargo` surfaces as the verifier's own could-not-run
+    // verdict (DR-041 Decision 3/4) — never a silent pass.
+    let mut env = Vec::new();
+    for key in ["PATH", "HOME"] {
+        if let Some(val) = std::env::var_os(key)
+            && let Ok(val) = val.into_string()
+        {
+            env.push((key.to_string(), val));
+        }
+    }
+    rezidnt_gate::ExecContext {
+        cwd: Some(cwd.to_path_buf()),
+        env,
+    }
+}
+
 /// Resolve a gate's `[gates.<name>]` verifier specs into runnable verifiers.
 /// An entry naming an unknown native is skipped with a warning (never a
 /// silent pass — the gate simply has fewer verifiers, and vet/pre_merge each
@@ -304,9 +343,15 @@ fn resolve_one(v: &VerifierSpec) -> Option<ResolvedVerifier> {
         })
     } else if let Some(exec) = &v.exec {
         let name = v.name.clone().unwrap_or_else(|| exec.display().to_string());
+        // DR-041: `exec` is the program; `args` its subcommand tokens. The full
+        // argv is `[exec, ...args]`, so a multi-token invocation like
+        // `["rezidnt", "verify", "cargo-test"]` is expressible. An empty `args`
+        // is the back-compat single-token exec argv.
+        let mut argv = vec![exec.display().to_string()];
+        argv.extend(v.args.iter().cloned());
         Some(ResolvedVerifier {
             name,
-            kind: VerifierKind::Exec(vec![exec.display().to_string()]),
+            kind: VerifierKind::Exec(argv),
             params: v.params.clone(),
         })
     } else {

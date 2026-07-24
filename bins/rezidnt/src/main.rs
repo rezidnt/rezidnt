@@ -88,6 +88,32 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run a production verifier (DR-041) against a target directory and emit a
+    /// §8 `VerifierOutput` document on stdout. In v1 `<name>` is `cargo-test`:
+    /// it runs the project test suite in `--dir` and maps the result to the
+    /// three-valued verdict (I6, never coerced): tests pass → `pass`; a real
+    /// test failure → `fail` naming the failing test(s); a compile error or
+    /// `cargo` absent from PATH → `inconclusive` (could-not-run); a wall-clock
+    /// timeout → `inconclusive` (timeout). The cannot-run/timeout conditions are
+    /// VERDICTS on stdout, not error exits — the daemon's exec runner reads the
+    /// document back when this subcommand is named as an exec argv in
+    /// `[gates.pre_merge]`. `--json` mirrors every other verb; the document IS
+    /// the machine-readable output. Exit 0 whenever a document was emitted (the
+    /// verdict rides the output, not the code).
+    Verify {
+        /// The verifier name. v1: `cargo-test`.
+        name: String,
+        /// The target directory (the cargo project / worktree). Absent = cwd.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Emit the §8 `VerifierOutput` document on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Wall-clock budget (ms) for the run; overrun → inconclusive (timeout).
+        /// Absent = the §8 DEFAULT (120 s).
+        #[arg(long = "timeout-ms")]
+        timeout_ms: Option<u64>,
+    },
     /// Replay a run's recorded verdicts from log + CAS and report the result
     /// (the compliance sentence, doc §8). Exit 0 all-pass, 5 gate-fail, 3
     /// inconclusive or integrity-alarm (DR-004; never coerced, I6).
@@ -294,6 +320,17 @@ fn main() {
         // std::process::exit internally rather than folding into the
         // failure-class table above.
         Cmd::Vet { spec, json } => (1, vet(&spec, json)),
+        // `verify` runs a production verifier (DR-041) and OWNS its output: it
+        // ALWAYS emits a §8 document on stdout and exits 0 (even for a fail /
+        // inconclusive verdict — the verdict rides the document, not the exit
+        // code, so the daemon's exec runner reads a clean stdout). An unexpected
+        // internal fault (a stdout write error) folds into 1 via the table.
+        Cmd::Verify {
+            name,
+            dir,
+            json,
+            timeout_ms,
+        } => (1, verify(&name, dir.as_deref(), json, timeout_ms)),
         Cmd::Debrief { run, json } => (1, debrief(&run, json)),
         Cmd::Gate {
             cmd: GateCmd::Why { run, json },
@@ -1463,6 +1500,245 @@ fn vet(spec_path: &Path, as_json: bool) -> anyhow::Result<()> {
         }
     }
     emit_verdict(as_json, "pass", None, 0)
+}
+
+// ===========================================================================
+// `rezidnt verify <name>` (DR-041 production verifier pack, v1) — the real
+// exec verifiers, shipped in-binary as subcommands (I7: no external verifier
+// files to install; DR-041 Decision 3). v1 core name: `cargo-test`. Each
+// verifier emits a §8 `VerifierOutput` document on stdout — the SAME shape the
+// daemon's exec runner reads back (`rezidnt_gate::parse_verifier_output`), so
+// the wire and the log can never drift.
+// ===========================================================================
+
+/// `rezidnt verify <name> [--dir DIR] [--json] [--timeout-ms MS]` (DR-041).
+/// Runs the named production verifier against `--dir` (absent = cwd) and writes
+/// a §8 `VerifierOutput` document to stdout. The three-valued verdict is NEVER
+/// coerced (I6): the cannot-run and timeout conditions are VERDICTS carried on
+/// the document (`inconclusive`), not error exits — this function exits 0
+/// whenever a document was produced, so the daemon's exec runner (which maps a
+/// nonzero child exit to `inconclusive { nonzero_exit }`) reads the honest
+/// verdict rather than an exit-code artifact.
+fn verify(
+    name: &str,
+    dir: Option<&Path>,
+    // The §8 document is emitted on stdout REGARDLESS of `--json`: the daemon's
+    // exec runner invokes `rezidnt verify cargo-test` with NO `--json` and still
+    // reads the document back (the machine-readable output is the contract, not a
+    // flag-gated mode). `--json` is accepted for CLI symmetry with the other
+    // verbs; it does not change the output, so it is intentionally unused here.
+    _as_json: bool,
+    timeout_ms: Option<u64>,
+) -> anyhow::Result<()> {
+    let target = dir.unwrap_or_else(|| Path::new("."));
+    let timeout_ms = timeout_ms.unwrap_or(rezidnt_gate::DEFAULT_TIMEOUT_MS);
+
+    let output = match name {
+        "cargo-test" => verify_cargo_test(target, timeout_ms),
+        // An unknown verifier name is could-not-run (undecidable), never a
+        // silent pass and never a fail — the honest three-valued mapping (I6).
+        other => rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Inconclusive,
+            evidence: vec![rezidnt_gate::Evidence {
+                kind: "cannot-run".to_string(),
+                msg: format!("unknown verifier `{other}` (v1 pack: cargo-test)"),
+                cas_ref: None,
+            }],
+            cost_ms: 0,
+        },
+    };
+
+    // The §8 document IS the machine-readable output — a single JSON line, the
+    // stable contract the exec runner parses (it invokes this verb with no
+    // `--json`), so it is emitted unconditionally.
+    let doc = serde_json::to_string(&output).context("serialize §8 verifier document")?;
+    println!("{doc}");
+    Ok(())
+}
+
+/// Run the project test suite in `dir` and map the result to a §8
+/// `VerifierOutput` under the I6 verdict rules (DR-041 Decision 4, NEVER
+/// coerced):
+/// - `cargo` absent from PATH (spawn ENOENT) → `inconclusive` (could-not-run).
+/// - a wall-clock overrun of `timeout_ms` → `inconclusive` (timeout); the child
+///   is killed so the run returns in bounded time.
+/// - the crate does not COMPILE (cargo ran, no test executed) → `inconclusive`
+///   (could-not-run) — a compile error is NOT a test failure.
+/// - a real test FAILURE (the suite ran and reported a defect) → `fail`, with
+///   evidence NAMING each failing test (interrogability, I6).
+/// - every test passes → `pass`.
+///
+/// No network: the caller controls the target (a dependency-free fixture crate
+/// in the tests; a real worktree in the daemon). `cost_ms` is the recorded
+/// wall-clock — its value is not asserted (wall-clock varies).
+fn verify_cargo_test(dir: &Path, timeout_ms: u64) -> rezidnt_gate::VerifierOutput {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let inconclusive = |kind: &str, msg: String, cost_ms: u64| rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Inconclusive,
+        evidence: vec![rezidnt_gate::Evidence {
+            kind: kind.to_string(),
+            msg,
+            cas_ref: None,
+        }],
+        cost_ms,
+    };
+
+    let started = Instant::now();
+
+    // Spawn `cargo test` in the target dir. A spawn failure (ENOENT: cargo not
+    // on PATH) is could-not-run → inconclusive, NEVER a fail and never a crash
+    // (DR-041 Decision 3/4). `--no-fail-fast` so every failing test is named in
+    // the evidence (interrogability); `--color=never` keeps the output parseable.
+    let mut child = match Command::new("cargo")
+        .current_dir(dir)
+        .args(["test", "--no-fail-fast", "--color=never"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return inconclusive(
+                "cannot-run",
+                "cargo is not resolvable on PATH — the cargo-test toolchain is a host \
+                 prerequisite the static binary does not carry (DR-041 Decision 3)"
+                    .to_string(),
+                elapsed_ms(started),
+            );
+        }
+        Err(e) => {
+            return inconclusive(
+                "cannot-run",
+                format!("could not spawn cargo test: {e}"),
+                elapsed_ms(started),
+            );
+        }
+    };
+
+    // Wall-clock timeout: poll for completion, killing the child on overrun
+    // (inconclusive { timeout }, never coerced — DR-041 Decision 4). A short
+    // poll keeps the timeout tight without a reaper thread.
+    let deadline = started + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return inconclusive(
+                        "timeout",
+                        format!("cargo test exceeded the {timeout_ms} ms wall-clock budget"),
+                        elapsed_ms(started),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return inconclusive(
+                    "cannot-run",
+                    format!("waiting on cargo test failed: {e}"),
+                    elapsed_ms(started),
+                );
+            }
+        }
+    }
+
+    // Collect the child's captured stdout+stderr (the test harness prints test
+    // results on stdout; the compiler prints errors on stderr).
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let cost_ms = elapsed_ms(started);
+
+    // A compile error means cargo ran but no test EXECUTED — could-not-run, not
+    // a test failure (DR-041 Decision 4). Discriminate on whether the test
+    // harness produced its result line (`test result:`); a compile failure never
+    // reaches it. `cargo test` prints `error[E...]` / `error: could not compile`
+    // on stderr for a build break.
+    let harness_ran = stdout.contains("test result:") || stdout.contains("running ");
+    if !harness_ran {
+        let detail = compile_error_detail(&stderr);
+        return inconclusive(
+            "cannot-run",
+            format!("the crate did not compile — no test ran (could-not-run): {detail}"),
+            cost_ms,
+        );
+    }
+
+    // The harness ran. Collect the named failing tests from `test <name> ... FAILED`
+    // lines (deterministic; interrogability — `gate why` names WHICH test).
+    let failing: Vec<String> = failing_tests(&stdout);
+    if failing.is_empty() {
+        // No named failures and the harness ran → pass.
+        return rezidnt_gate::VerifierOutput {
+            verdict: rezidnt_gate::Verdict::Pass,
+            evidence: vec![],
+            cost_ms,
+        };
+    }
+
+    rezidnt_gate::VerifierOutput {
+        verdict: rezidnt_gate::Verdict::Fail,
+        evidence: vec![rezidnt_gate::Evidence {
+            kind: "test-failure".to_string(),
+            msg: format!("failing test(s): {}", failing.join(", ")),
+            cas_ref: None,
+        }],
+        cost_ms,
+    }
+}
+
+/// Milliseconds elapsed since `started`, saturating at `u64::MAX`.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The named tests that FAILED, parsed from `cargo test` stdout lines of the
+/// form `test <name> ... FAILED` (first-seen order, deduped — deterministic).
+fn failing_tests(stdout: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        // `test <name> ... FAILED`
+        if let Some(rest) = line.strip_prefix("test ")
+            && rest.ends_with("... FAILED")
+            && let Some(name) = rest.strip_suffix("... FAILED")
+        {
+            let name = name.trim().to_string();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// A short compile-error detail from cargo's stderr for the inconclusive
+/// evidence msg: the first `error`-prefixed line, else a trimmed head.
+fn compile_error_detail(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let head: String = stderr.trim().chars().take(200).collect();
+            if head.is_empty() {
+                "cargo reported a build failure".to_string()
+            } else {
+                head
+            }
+        })
 }
 
 /// Print a `{verdict, verifier?}` object (or a plain line) and exit with the

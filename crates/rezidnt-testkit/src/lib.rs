@@ -867,6 +867,124 @@ verifiers = [
     (dir, spec)
 }
 
+/// A stub harness for the DR-041 cargo-test e2e: emits the S1 stream-json lines
+/// AND appends ONE Rust `#[test]` (`added_test`) to `src/lib.rs` in its working
+/// directory (the daemon runs a harness in its allocated worktree), so the S2
+/// watcher produces a real `diff.ready` and the real `cargo-test` verifier then
+/// gates the change. The append runs EXACTLY once (unlike a brittle textual
+/// rewrite of [`stub_harness`], which would fire on every `sleep` line and
+/// duplicate the function — a compile error).
+pub fn cargo_test_gated_harness(dir: &Path, gap_ms: u64, added_test: &str) -> PathBuf {
+    let gap_s = gap_ms as f64 / 1000.0;
+    let script = dir.join("cargo-test-harness.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo '{{"type":"system","subtype":"init","session_id":"fixture-session","claude_code_version":"2.1.191","tools":[]}}'
+cat >> src/lib.rs <<'RS'
+{added_test}RS
+sleep {gap_s}
+echo '{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}]}}}}'
+sleep {gap_s}
+echo '{{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":5,"total_cost_usd":0.001,"usage":{{"input_tokens":1,"output_tokens":1}},"session_id":"fixture-session"}}'
+"#
+        ),
+    )
+    .expect("write cargo-test harness stub");
+    let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod");
+    script
+}
+
+/// A temp GATED project whose repo IS a real (tiny, dependency-free) cargo crate
+/// (DR-041 `verify-subcommand` e2e). The stub harness leaves a REAL passing
+/// (`pass = true`) or failing (`pass = false`) `#[test]` change in its worktree,
+/// and `[gates.pre_merge]` names `rezidnt verify cargo-test` as the exec
+/// verifier — the DR-041 Decision 3 multi-token invocation (`exec = <rezidnt>`,
+/// `args = ["verify", "cargo-test"]`), which the daemon runs in the allocated
+/// worktree so cargo-test sees the real tree. `cargo test` on the crate fetches
+/// / resolves NOTHING off-box (determinism + no-network, criterion 3).
+///
+/// `rezidnt_bin` is the absolute path to the `rezidnt` CLI the exec runner
+/// invokes as `argv[0]` (the caller passes [`cli_bin`]).
+pub fn make_cargo_test_gated_project(
+    pass: bool,
+    gap_ms: u64,
+    rezidnt_bin: &Path,
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir repo/src");
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "oracle@rezidnt.test"]);
+    git(&["config", "user.name", "rezidnt oracle"]);
+
+    // A dependency-free cargo crate seeded with a passing test.
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"verify_e2e_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .expect("seed Cargo.toml");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test] fn seed_adds() { assert_eq!(add(1, 1), 2); }\n",
+    )
+    .expect("seed lib.rs");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "verify-e2e cargo fixture seed"]);
+
+    // The harness leaves a real change in the worktree: a NEW test that PASSES
+    // (pass case) or FAILS (fail case). cargo-test then verifies it.
+    let added_test = if pass {
+        "#[test] fn oracle_added_passes() { assert_eq!(add(2, 2), 4); }\n"
+    } else {
+        "#[test] fn oracle_added_fails() { assert_eq!(add(2, 2), 5); }\n"
+    };
+    let harness = cargo_test_gated_harness(dir.path(), gap_ms, added_test);
+
+    let spec = format!(
+        r#"[project]
+name = "verify-e2e"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["vet", "pre_merge"]
+bare = true
+harness_version = "2.1.191"
+allowed_tools = ["Read", "Edit"]
+bin_override = "{harness}"
+
+# DR-041: the pre_merge gate names the REAL cargo-test verifier as an exec argv —
+# `rezidnt verify cargo-test`, the Decision 3 multi-token invocation. `exec` is
+# the program; `args` its subcommand tokens; the daemon runs it in the allocated
+# worktree so cargo-test sees the real tree (not just the diff-summary CAS ref).
+[gates.pre_merge]
+verifiers = [
+  {{ exec = "{rezidnt}", name = "cargo-test", args = ["verify", "cargo-test"] }},
+]
+"#,
+        repo = repo.display(),
+        harness = harness.display(),
+        rezidnt = rezidnt_bin.display(),
+    );
+    (dir, spec)
+}
+
 /// Read one reply line from a socket connection with a deadline; panics on
 /// timeout (the caller's message is the failure).
 pub fn read_reply_line(

@@ -697,6 +697,9 @@ pub async fn launch_agent(
             "vet",
             refs,
             &gates::vet_verifiers(),
+            // vet's verifiers are all native (no exec cwd needed); the §12
+            // scrub applies to any exec verifier a vet spec might name.
+            None,
         )
         .await?;
         if outcome.verdict != Verdict::Pass {
@@ -1581,6 +1584,10 @@ async fn run_pre_merge(
         "pre_merge",
         refs,
         &verifiers,
+        // DR-041: pre_merge exec verifiers run in the allocated worktree, so a
+        // `rezidnt verify cargo-test` verifier sees the real tree (not just the
+        // diff-summary CAS ref). Native verifiers ignore the cwd.
+        Some(&ctx.worktree),
     )
     .await?;
 

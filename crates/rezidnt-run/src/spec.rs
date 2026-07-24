@@ -112,6 +112,12 @@ pub struct VerifierSpec {
     /// Exec-verifier program path (any argv speaking the §8 JSON contract).
     #[serde(default)]
     pub exec: Option<PathBuf>,
+    /// Extra argv tokens appended after `exec` (DR-041): so a multi-token
+    /// invocation like `rezidnt verify cargo-test` is expressible — `exec` is
+    /// the program (`rezidnt`) and `args` its subcommand words (`["verify",
+    /// "cargo-test"]`). Absent/empty ⇒ the back-compat single-token exec argv.
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Display name for an exec verifier (recorded on the verdict fact).
     #[serde(default)]
     pub name: Option<String>,

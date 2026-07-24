@@ -1217,17 +1217,51 @@ pub struct ExecVerifier {
     pub argv: Vec<String>,
 }
 
+/// Where and with what environment an exec verifier runs — the daemon-side
+/// seam DR-041 needs for `cargo-test` (which shells out to the host toolchain
+/// and needs a working directory), kept OFF the default path so §12's scrub is
+/// unchanged for every other exec verifier.
+///
+/// - `cwd`: the working directory for the child (the allocated worktree, so
+///   `cargo test` sees the real tree — not just the diff-summary CAS ref). None
+///   ⇒ inherit the daemon's cwd (the default-scrub path).
+/// - `env`: an EXPLICIT allowlist of `(name, value)` pairs to set on the
+///   otherwise-`env_clear`ed child. Empty ⇒ a fully scrubbed environment (doc
+///   §12, the default). The daemon populates this ONLY for the cargo-test
+///   verifier with the minimal toolchain vars (`PATH`, `HOME`) — the DR-041
+///   Decision 3 honesty note made explicit: cargo-test's toolchain is a host
+///   prerequisite, so its wrapper is granted exactly the env cargo needs and
+///   nothing more (never the parent's whole environment).
+#[derive(Debug, Clone, Default)]
+pub struct ExecContext {
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+
 impl ExecVerifier {
     /// Run the argv program under the §8 contract. Infallible by design: a
     /// verifier that cannot run or cannot decide yields an `inconclusive`
     /// [`VerdictRecord`], never an error — the only honest mappings are the
     /// three verdicts (I6).
+    ///
+    /// This is the DEFAULT-scrub path: no cwd override and a fully cleared
+    /// environment (doc §12). Callers needing the DR-041 cargo-test seam use
+    /// [`ExecVerifier::run_in`].
     pub async fn run(&self, input: &VerifierInput) -> VerdictRecord {
-        let span = tracing::info_span!("adapter", kind = "exec-verifier", verifier = %self.name);
-        self.run_inner(input).instrument(span).await
+        self.run_in(input, &ExecContext::default()).await
     }
 
-    async fn run_inner(&self, input: &VerifierInput) -> VerdictRecord {
+    /// Run the argv program under the §8 contract with an explicit
+    /// [`ExecContext`] (cwd + env allowlist). The env is still `env_clear`ed
+    /// first, then ONLY `ctx.env` is applied — an empty allowlist is identical
+    /// to [`run`](Self::run)'s full scrub, so §12 holds for every verifier the
+    /// daemon does not explicitly grant toolchain env to.
+    pub async fn run_in(&self, input: &VerifierInput, ctx: &ExecContext) -> VerdictRecord {
+        let span = tracing::info_span!("adapter", kind = "exec-verifier", verifier = %self.name);
+        self.run_inner(input, ctx).instrument(span).await
+    }
+
+    async fn run_inner(&self, input: &VerifierInput, ctx: &ExecContext) -> VerdictRecord {
         use tokio::io::AsyncWriteExt;
 
         let inconclusive = |reason: InconclusiveReason| VerdictRecord {
@@ -1250,6 +1284,9 @@ impl ExecVerifier {
         };
 
         // Scrubbed environment (doc §12): no ambient secret reaches the child.
+        // The child starts from a CLEARED environment; ONLY the explicit
+        // allowlist in `ctx.env` (empty by default) is then applied — never the
+        // parent's ambient environment.
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
             .env_clear()
@@ -1257,6 +1294,12 @@ impl ExecVerifier {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        if let Some(cwd) = &ctx.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &ctx.env {
+            cmd.env(k, v);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,

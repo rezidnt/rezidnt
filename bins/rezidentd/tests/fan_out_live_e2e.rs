@@ -1,6 +1,7 @@
 //! DR-044 ORACLE (live fan-out, end-to-end) — guard (b) of DR-044
-//! §Consequences plus the §Decision 2b lead-parented-edge pin and the
-//! §Decision 1 per-task idempotency contract. Drives the REAL daemon over the
+//! §Consequences plus the lead→sub edge pin (DR-044 §Decision 2b, re-cut onto
+//! DR-046 §Decision 4/5 — see `each_sub_names_its_lead_and_no_lead_keyed_delegation_is_emitted`)
+//! and the §Decision 1 per-task idempotency contract. Drives the REAL daemon over the
 //! loopback-HTTP MCP transport, so it follows the house `#[cfg(unix)]` +
 //! `*_e2e.rs` convention and is WSL/unix-only; it is NOT part of the host
 //! clippy surface.
@@ -9,18 +10,23 @@
 //!
 //! `crates/rezidnt-state/tests/orchestration_rebuild_equivalence.rs` and
 //! `orchestration_rebuild_from_log.rs` already prove rebuild-equivalence — but
-//! over `spec/fixtures/dr042_orchestration_fanout.jsonl`, a HAND-AUTHORED log
-//! whose lead-keyed cross-run edge no shipped emitter produces (DR-044
-//! §Context). The read side is green against a shape production has never
-//! emitted. DR-044 §Consequences (b) therefore owes the same property over a
-//! log an ACTUAL fan-out produced. That distinction is this file's entire job.
+//! over `spec/fixtures/dr042_orchestration_fanout.jsonl`, a HAND-AUTHORED log.
+//! When this file was cut, that fixture's lead-keyed cross-run edge was a shape
+//! no shipped emitter produced (DR-044 §Context) — the read side was green
+//! against something production had never emitted. DR-044 §Consequences (b)
+//! therefore owes the same property over a log an ACTUAL fan-out produced, and
+//! that distinction is this file's entire job. (The fixture has since been
+//! re-cut onto `agent.spawned.lead_run` under DR-046 §Decision 5, so it now
+//! matches the emitter — which is a reason to keep this file, not to retire it:
+//! the fixture agreeing with the emitter is the thing this file independently
+//! checks.)
 //!
 //! ## RED MODE
 //!
 //! ASSERT-RED: `fan_out` is not dispatched, so the tool call returns a JSON-RPC
 //! error / unknown-tool result and the first assertion fires. Once the tool
-//! exists but the projection guard does not, the cross-run assertions fire on
-//! the self-edge instead. Both are red for the right reason.
+//! exists but the projection reads the wrong axis, the cross-run assertions fire
+//! on a fabricated self-lead instead. Both are red for the right reason.
 //!
 //! ## The lead's badge is the REAL one
 //!
@@ -35,8 +41,11 @@
 //! The spec declares `role`, so every run here — the lead AND each sub — also
 //! carries its own DR-017 role-attenuation `permit.delegated` self-edge, exactly
 //! as production emits. The graph assertions below therefore ride a log that
-//! contains BOTH kinds of edge, which is the honest live counterpart of the
-//! pure-logic guard in `crates/rezidnt-state/tests/orchestration_self_edge_guard.rs`.
+//! carries genuine attenuation facts alongside the orchestration edge, which is
+//! the honest live counterpart of the pure-logic guard in
+//! `crates/rezidnt-state/tests/orchestration_self_edge_guard.rs`. Since DR-046
+//! §Decision 4/5 the two live on different fields entirely, so the attenuations
+//! are invisible to the graph rather than filtered out of it.
 //!
 //! ## Ontology posture (DR-044 §Decision 6 — warden session now CLOSED)
 //!
@@ -384,8 +393,8 @@ fn fan_out_graph_rebuilds_from_the_real_fanned_out_log() {
         from_fold.leads.len(),
         1,
         "exactly ONE lead surfaces — the fanning-out run. Every run on this log also carries a \
-         DR-017 role self-edge, so a projection without the `sub_run != lead_run` guard reports \
-         one self-lead per run instead (DR-044 §Decision 2a): {from_fold:#?}"
+         DR-017 role attenuation, which is NOT an orchestration edge and must contribute no \
+         lead row (DR-046 §Decision 4/5): {from_fold:#?}"
     );
     let lead = &from_fold.leads[0];
     assert_eq!(
@@ -395,7 +404,7 @@ fn fan_out_graph_rebuilds_from_the_real_fanned_out_log() {
     assert_eq!(
         lead.fan_out, 2,
         "fan_out is the DERIVED count of the two cross-run subs — never a stored fact, and never \
-         inflated by the lead's own self-edge: {lead:#?}"
+         inflated by the lead's own role attenuation: {lead:#?}"
     );
     let mut folded: Vec<&str> = lead.subs.iter().map(|s| s.sub_run.as_str()).collect();
     folded.sort_unstable();
@@ -407,23 +416,38 @@ fn fan_out_graph_rebuilds_from_the_real_fanned_out_log() {
     );
     assert!(
         !lead.subs.iter().any(|s| s.sub_run == lead.lead_run),
-        "the lead is never its own sub (DR-044 §Decision 2a): {lead:#?}"
+        "the lead is never its own sub (ontology: `lead_run != run`, BINDING on the emitter): \
+         {lead:#?}"
     );
 }
 
-// --- CRITERION: Decision 2b, the lead-parented edge --------------------------
+// --- CRITERION: DR-046 §Decision 4/5, the lead→sub edge on the log -----------
 
-/// CRITERION (DR-044 §Decision 2b) — the emitted `permit.delegated` for each sub
-/// is keyed `run` = the LEAD's run, and its `child_badge_id` EQUALS that sub's
-/// folded `agent.spawned.badge_id`.
+/// CRITERION (DR-046 §Decision 4 + §Decision 5) — the two halves of the edge
+/// switch, pinned on the LOG where a graph-level assertion could not localize
+/// them:
 ///
-/// DR-044 warns that if those two diverge the graph silently reports
-/// `fan_out: 0` — a SILENT-WRONG, the exact class of defect that made the
-/// shipped read side a mirage. A graph-level assertion alone would not localize
-/// it (a missing edge and a mismatched badge look identical downstream), so the
-/// two ends are pinned directly on the log.
+/// 1. **The replacement is emitted.** Each sub's own `agent.spawned` carries
+///    `lead_run` = the LEAD's run, as a BARE ULID (not the `run:<ULID>` scheme
+///    tag `worktree.allocated.allocator` uses — that field's vocabulary is open
+///    and mixed; this one is closed to a single kind with absence as its
+///    sentinel). Because the edge's sub end is that same fact's own `run`, the
+///    DR-044 divergence silent-wrong is gone by construction — there are no two
+///    values that can disagree.
+///
+/// 2. **The withdrawal actually happened.** NO lead-keyed `permit.delegated` is
+///    on the log. That fact's ratified semantics are ATTENUATION, and a fan-out
+///    attenuates nothing — the sub's badge is a fresh mint over the SUB's own
+///    run — so `added_caveats: []` asserted an unnarrowed capability handoff that
+///    never occurred and inflated the lead's attenuation-chain depth. Asserting
+///    its ABSENCE (rather than only asserting the replacement's presence) is what
+///    makes the withdrawal provable rather than assumed.
+///
+/// The DR-017 SELF-edge is expected to still be there, keyed on each run's OWN
+/// run — that path is untouched (DR-046 §Decision 6), and distinguishing the two
+/// is exactly why leg 2 filters on the LEAD's key rather than on the subject.
 #[test]
-fn each_sub_edge_is_lead_keyed_and_its_child_badge_matches_the_sub_spawn() {
+fn each_sub_names_its_lead_and_no_lead_keyed_delegation_is_emitted() {
     let (daemon, lock_path) = start_daemon_with_mcp(None);
     let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
     let url = lock["url"].as_str().expect("url").to_string();
@@ -443,35 +467,73 @@ fn each_sub_edge_is_lead_keyed_and_its_child_badge_matches_the_sub_spawn() {
         e["subject"] == "agent.spawned" && e["payload"]["run"] == json!(sub_run)
     });
 
-    // The sub's own spawn badge — the id the graph matches on.
-    let sub_badge = events
+    let spawned = events
         .iter()
         .find(|e| e["subject"] == "agent.spawned" && e["payload"]["run"] == json!(sub_run))
-        .and_then(|e| e["payload"]["badge_id"].as_str())
-        .expect("the sub's agent.spawned carries badge_id (ontology v1 REQUIRED)")
-        .to_string();
+        .expect("the sub's agent.spawned is on the log");
 
-    // A LEAD-KEYED delegation whose child badge is exactly that id.
+    // Leg 1 — the edge rides the SUB's own spawn fact, naming the LEAD's run.
+    assert_eq!(
+        spawned["payload"]["lead_run"],
+        json!(lead_run),
+        "the fan-out edge is `agent.spawned.lead_run` = the LEAD's run ({lead_run}), recorded on \
+         the SUB's own spawn (DR-046 §Decision 5): {spawned:#}"
+    );
+    let recorded_lead = spawned["payload"]["lead_run"]
+        .as_str()
+        .expect("lead_run is a string");
+    assert_eq!(
+        recorded_lead.len(),
+        26,
+        "a BARE 26-char ULID, never scheme-tagged — this field is closed to one kind and its \
+         sentinel case is ABSENCE (ontology): got {recorded_lead:?}"
+    );
+    assert!(
+        !recorded_lead.contains(':'),
+        "no `run:` prefix on lead_run (contrast worktree.allocated.allocator, whose vocabulary \
+         is open and mixed): got {recorded_lead:?}"
+    );
+    // The edge is genuinely CROSS-RUN, and the ontology's BINDING emitter
+    // constraint holds: a run is never its own lead.
+    assert_ne!(
+        lead_run, sub_run,
+        "precondition: the lead and the sub are different runs"
+    );
+    assert_ne!(
+        spawned["payload"]["lead_run"], spawned["payload"]["run"],
+        "lead_run MUST NOT equal the fact's own run (ontology, BINDING on the emitter): {spawned:#}"
+    );
+
+    // Leg 2 — the WITHDRAWAL is real. Every `permit.delegated` keyed on the
+    // LEAD's run is inspected; the DR-017 self-edges on the SUBS' own runs are
+    // untouched by DR-046 and are deliberately outside this filter.
     let lead_keyed: Vec<&Value> = events
         .iter()
         .filter(|e| e["subject"] == "permit.delegated" && e["payload"]["run"] == json!(lead_run))
         .collect();
+
+    // 2a — the exact withdrawn fact: lead-keyed, carrying the SUB's badge as its
+    // child. This is the shape that inflated the lead's attenuation-chain depth.
     assert!(
-        lead_keyed
+        !lead_keyed
             .iter()
-            .any(|e| e["payload"]["child_badge_id"] == json!(sub_badge)),
-        "the fan-out edge MUST be keyed `run` = the LEAD ({lead_run}) with `child_badge_id` \
-         EQUAL to the sub's folded agent.spawned.badge_id ({sub_badge}). If those diverge the \
-         graph silently reports fan_out: 0 (DR-044 §Decision 2b). Lead-keyed delegations seen: \
-         {lead_keyed:#?}"
+            .any(|e| e["payload"]["child_badge_id"] == spawned["payload"]["badge_id"]),
+        "the lead-parented `permit.delegated` is WITHDRAWN (DR-046 §Decision 4): a fan-out \
+         attenuates nothing, so no fact keyed on the lead ({lead_run}) may carry the SUB's badge \
+         as its child. Lead-keyed delegations seen: {lead_keyed:#?}"
     );
 
-    // And the edge is genuinely CROSS-RUN: a delegation keyed on the SUB's own
-    // run carrying the sub's own badge is the DR-017 capability-chain fact, a
-    // different axis — it must not be what satisfies the assertion above.
-    assert_ne!(
-        lead_run, sub_run,
-        "precondition: the lead and the sub are different runs"
+    // 2b — and the general form, so a re-introduction under any other badge
+    // pairing is caught too: what survives on the lead's run is its OWN DR-017
+    // role attenuation, which by definition narrowed something. An empty
+    // `added_caveats` is the tell of an unnarrowed capability handoff — a
+    // stronger false claim than silence (DR-046 §Context Item 2).
+    assert!(
+        lead_keyed.iter().all(|e| e["payload"]["added_caveats"]
+            .as_array()
+            .is_some_and(|caveats| !caveats.is_empty())),
+        "every delegation keyed on the lead must be a REAL attenuation with non-empty \
+         added_caveats: {lead_keyed:#?}"
     );
 
     drop(daemon);

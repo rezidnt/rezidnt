@@ -807,9 +807,9 @@ impl McpCore {
     /// [`Self::check_badge`] (dual-path) and [`Self::check_operator_badge`]
     /// (operator-only), in the DR-032 shape. `fan_out` admits ONLY an agent
     /// MACAROON verified at the §12 door: fan-out is a run-scoped capability, and
-    /// an operator badge maps to NO run, so there would be no lead to key the
-    /// `permit.delegated` edge on (DR-044 §Decision 2b) and the graph would gain
-    /// an unparented sub.
+    /// an operator badge maps to NO run, so there would be no lead run to record
+    /// as the sub's `agent.spawned.lead_run` (DR-044 §Decision 2b, edge per
+    /// DR-046 §Decision 5) and the graph would gain an unparented sub.
     ///
     /// Door order (DR-045 §Decision 3), refusal BEFORE any effect:
     /// 1. no `badge` arg → `BADGE_REQUIRED`;
@@ -2099,7 +2099,7 @@ fn tools_list() -> RpcOutcome {
             },
             {
                 "name": "orchestration_graph",
-                "description": "Read the derived lead -> parallel sub-runs orchestration graph (whole-log fold, projected): one row per lead with its DERIVED fan-out and one SubRow per delegated sub (sub_run, status, gate verdicts verbatim, integrity_alarms). The lead->sub edge is derived (delegation child_badge_id == sub spawn badge_id); inconclusive verdicts surface verbatim. Optional `run` filters to one lead. Read-class, no badge (DR-042).",
+                "description": "Read the derived lead -> parallel sub-runs orchestration graph (whole-log fold, projected): one row per lead with its DERIVED fan-out and one SubRow per sub (sub_run, status, gate verdicts verbatim, integrity_alarms). The lead->sub edge is derived from each sub's own spawn fact (agent.spawned.lead_run == the lead's run); inconclusive verdicts surface verbatim. Optional `run` filters to one lead. Read-class, no badge (DR-042, edge per DR-046).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::OrchestrationViewArgs))?,
             },
             {

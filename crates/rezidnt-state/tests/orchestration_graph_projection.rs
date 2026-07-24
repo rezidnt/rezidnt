@@ -7,14 +7,17 @@
 //! That is the correct red state — mirrors the `project` / `escalations`
 //! projection oracles for `board_view` / `get_escalations`.
 //!
-//! ## The contract this pins (DR-042, derive-first; NO new subject, NO ontology
-//! change — the graph is a PURE FOLD over existing events, I3)
+//! ## The contract this pins (DR-042, derive-first; the graph is a PURE FOLD
+//! over existing events, I3)
 //!
-//! Lead→sub edge derivation (DR-042 §Decision 2, ontology line 223 + DR-018):
-//! for an agent badge `badge_id == hex(blake3(sig)[..8])`, the SAME derivation
-//! that keys `permit.delegated.child_badge_id`. So the edge is
-//! `lead.delegations[].child_badge_id == sub.agent.spawned.badge_id`. Fan-out
-//! width is DERIVED (count of subs per lead), never a stored fact.
+//! Lead→sub edge derivation, RE-CUT 2026-07-24 under DR-046 §Decision 4/5: the
+//! edge is `sub.agent.spawned.lead_run == <the lead's run>`, run-to-run, folded
+//! to `AgentRunState::lead_run`. It was previously
+//! `lead.delegations[].child_badge_id == sub.badge_id`, which read a
+//! `permit.delegated` fact — an ATTENUATION fact — as a fan-out; that emit is
+//! WITHDRAWN, so a genuine lead now folds ZERO delegations and a projection that
+//! still gated on `delegations` would report `fan_out: 0` for every real lead.
+//! Fan-out width stays DERIVED (count of subs per lead), never a stored fact.
 //!
 //! ## API SURFACE this board PINS (implementer builds to EXACTLY this)
 //! In `crates/rezidnt-state/src/lib.rs`, mirroring `project(&Graph) -> BoardView`
@@ -43,13 +46,15 @@
 //!     pub integrity_alarms: usize, // AgentRunState.integrity_alarms.len()
 //! }
 //! ```
-//! plus ONE fold the implementer adds to the `agent.spawned` reducer arm
-//! (`crates/rezidnt-state/src/lib.rs`), a spawn-time property the sub's own spawn
+//! plus the folds the implementer adds to the `agent.spawned` reducer arm
+//! (`crates/rezidnt-state/src/lib.rs`), spawn-time properties the sub's own spawn
 //! already knows, mirroring the existing `pep?` / `role?` optional folds:
-//! - `pub badge_id: Option<String>` on `AgentRunState`, folded VERBATIM from
-//!   `agent.spawned.badge_id` (ontology line 223, a REQUIRED v1 field — the id
-//!   the lead↔sub edge keys on). This is the field DR-042 names as "emitted but
-//!   not yet folded"; the edge cannot be derived until it is folded.
+//! - `pub badge_id: Option<String>`, folded VERBATIM from
+//!   `agent.spawned.badge_id` (a REQUIRED v1 field) — this run's badge
+//!   ATTRIBUTION. It keyed the edge under DR-042; since DR-046 it does not.
+//! - `pub lead_run: Option<String>`, folded VERBATIM from the optional
+//!   `agent.spawned.lead_run` (DR-046 §Decision 5) — the edge itself. Absent on
+//!   every ordinary spawn, never synthesized.
 //!
 //! NO `worktree` on `SubRow` (orchestrator scope-correction 2026-07-24, verified
 //! against the ontology + reducers): `agent.spawned` has NO `worktree` field
@@ -117,8 +122,8 @@ fn fanout_folds_to_one_lead_with_two_subs() {
     assert_eq!(
         lead.subs.len(),
         2,
-        "one SubRow per delegated sub — the lead→sub edge is \
-         lead.delegations[].child_badge_id == sub.agent.spawned.badge_id (DR-042 §Decision 2)"
+        "one SubRow per sub — the lead→sub edge is \
+         sub.agent.spawned.lead_run == lead_run (DR-046 §Decision 5)"
     );
 
     // The subs surface in deterministic order (BTreeMap key order over the run
@@ -183,22 +188,82 @@ fn fanout_folds_to_one_lead_with_two_subs() {
 }
 
 /// I3 non-vacuity — the projection carries the FOLDED edge, not an empty
-/// scaffold. A lead with NO delegations (the sub-runs alone, keyed off no lead)
-/// would not produce a LeadRow; here the two `permit.delegated` facts create the
-/// edge, so the single LeadRow's two subs are the proof the edge folded.
+/// scaffold. Sub runs whose spawns named no lead would produce no LeadRow; here
+/// each sub's `agent.spawned.lead_run` names the lead, so the single LeadRow's
+/// two subs are the proof the edge folded.
 #[test]
-fn fanout_lead_row_is_derived_from_the_delegation_edges() {
+fn fanout_lead_row_is_derived_from_the_subs_lead_run() {
     let events = load("dr042_orchestration_fanout.jsonl");
     let view = orchestration_graph(&fold(events.iter()));
     let total_subs: usize = view.leads.iter().map(|l| l.subs.len()).sum();
     assert_eq!(
         total_subs, 2,
-        "the two delegation edges fold to exactly two sub rows across the fleet (I3): {view:#?}"
+        "the two lead_run edges fold to exactly two sub rows across the fleet (I3): {view:#?}"
     );
     // A matching-but-empty view (zero leads / zero subs) would be an oracle bug,
     // not a pass — pin non-vacuity.
     assert!(
         !view.leads.is_empty(),
-        "the fixture delegates to real subs; an empty view is a bug, not a pass"
+        "the fixture's subs name a real lead; an empty view is a bug, not a pass"
+    );
+}
+
+/// DR-046 §Consequences (c), the OWED guard — the whole point of the withdrawal,
+/// asserted on both sides at once so neither can drift:
+///
+/// - the fanned-out lead folds **ZERO** attenuation records, and `BoardRow`'s
+///   `delegated` (delegation-chain DEPTH, `delegations.len()`, UNCHANGED by
+///   DR-046) reports **0** for it. Before the withdrawal it reported 2 — two
+///   attenuations that never happened, on the dossier `debrief` reads (I3).
+/// - while `orchestration_graph` STILL folds both subs. That second half is what
+///   makes this more than a deletion test: it is the exact pair of facts the
+///   projection's removed `delegations.is_empty()` early-return would have
+///   broken silently, reporting `fan_out: 0` for a genuine lead while every
+///   other assertion in this file still passed.
+#[test]
+fn a_fanned_out_lead_folds_zero_attenuations_while_its_subs_still_project() {
+    let events = load("dr042_orchestration_fanout.jsonl");
+    let graph = fold(events.iter());
+
+    // Side 1 — the attenuation chain is EMPTY. A fan-out narrows nothing.
+    let lead_state = graph
+        .agent_runs
+        .get(LEAD_RUN)
+        .unwrap_or_else(|| panic!("the lead folds: {:#?}", graph.agent_runs.keys()));
+    assert!(
+        lead_state.delegations.is_empty(),
+        "a fan-out is NOT an attenuation: the lead folds ZERO DelegationRecords \
+         (DR-046 §Decision 4). Got: {:#?}",
+        lead_state.delegations
+    );
+    let board = rezidnt_state::project(&graph);
+    let lead_row = board
+        .runs
+        .iter()
+        .find(|r| r.run == LEAD_RUN)
+        .unwrap_or_else(|| panic!("the lead has a board row: {board:#?}"));
+    assert_eq!(
+        lead_row.delegated, 0,
+        "BoardRow.delegated is delegation-chain DEPTH and stays delegations.len() — a fanned-out \
+         lead shows 0, which is it telling the TRUTH (DR-046 §Consequences (c)): {lead_row:#?}"
+    );
+
+    // Side 2 — and the graph still folds the fan-out. Zero delegations must NOT
+    // mean zero subs: that is precisely the silent-wrong this guard exists for.
+    let view = orchestration_graph(&graph);
+    let lead = view
+        .leads
+        .iter()
+        .find(|l| l.lead_run == LEAD_RUN)
+        .unwrap_or_else(|| {
+            panic!(
+                "a lead with ZERO delegations still surfaces its fan-out — an early-return on \
+                 `delegations.is_empty()` reports fan_out: 0 for every real lead while every \
+                 other test still passes (DR-046 §Decision 5): {view:#?}"
+            )
+        });
+    assert_eq!(
+        lead.fan_out, 2,
+        "fan-out width rides lead_run, a different axis from the attenuation chain: {lead:#?}"
     );
 }

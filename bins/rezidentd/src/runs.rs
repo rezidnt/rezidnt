@@ -660,21 +660,26 @@ async fn try_materialize_open(
     }
 }
 
-/// DR-044 §Decision 2b/3 — the delegating LEAD behind a fan-out sub spawn.
-/// Present ONLY on the `fan_out` path ([`crate::mcp::McpBridge::fan_out`]);
-/// `None` on every ordinary spawn, which is what keeps "the daemon allocated
-/// this on its own initiative" expressible on the log.
+/// DR-044 §Decision 3 / DR-046 §Decision 5 — the delegating LEAD behind a
+/// fan-out sub spawn. Present ONLY on the `fan_out` path
+/// ([`crate::mcp::McpBridge::fan_out`]); `None` on every ordinary spawn, which
+/// is what keeps "the daemon allocated this on its own initiative" expressible
+/// on the log.
 ///
-/// Carries the two things a sub spawn needs from its lead and nothing else: the
-/// lead's RUN (the key the delegation edge is emitted on, and the ULID inside
-/// the scheme-tagged `run:<ULID>` allocator principal) and the lead's VERIFIED
-/// §12 badge id (the parent end of the edge — never the token, I2/§12).
+/// Carries the ONE thing a sub spawn needs from its lead: the lead's RUN — the
+/// ULID inside the scheme-tagged `run:<ULID>` allocator principal on
+/// `worktree.allocated`, and the bare ULID recorded as `agent.spawned.lead_run`.
+///
+/// The lead's BADGE id used to ride here too, as the parent end of the withdrawn
+/// lead-parented `permit.delegated` edge. DR-046 §Decision 4 withdrew that emit
+/// and §Decision 5 made the replacement edge run-to-run, so no badge id appears
+/// on it at all: `fan_out` already refuses any badge that does not fold to a
+/// spawned run's `agent.spawned.badge_id`, which makes the lead's badge id
+/// exactly `agent_runs[lead_run].badge_id` — one hop off derived state, and
+/// carrying it again would be a stored derivation on the fabric.
 pub struct LeadDelegation {
     /// The lead's RunId — the run that CALLED `fan_out`.
     pub lead_run: RunId,
-    /// The lead's badge id as the §12 door verified it (`hex(blake3(sig)[..8])`,
-    /// DR-018 §Decision (a)). Never the badge token.
-    pub lead_badge_id: String,
 }
 
 /// Allocate a worktree and spawn one agent under capture; returns the minted
@@ -685,10 +690,10 @@ pub struct LeadDelegation {
 /// v1 additive field, ratified 2026-07-17) — `None` for keyless paths (socket
 /// `open` chain), never synthesized.
 ///
-/// `lead` (DR-044 §Decision 2b/3) marks this spawn as a fan-out SUB: it changes
-/// the recorded allocator principal and adds ONE lead-parented
-/// `permit.delegated` edge. `None` — the overwhelmingly common case — leaves
-/// every emitted fact byte-identical to the pre-DR-044 path.
+/// `lead` (DR-044 §Decision 3, DR-046 §Decision 5) marks this spawn as a fan-out
+/// SUB: it changes the recorded allocator principal on `worktree.allocated` and
+/// records `lead_run` on `agent.spawned`. `None` — the overwhelmingly common
+/// case — leaves every emitted fact byte-identical to the pre-DR-044 path.
 #[allow(clippy::too_many_arguments)]
 pub async fn launch_agent(
     daemon: &Arc<Daemon>,
@@ -1018,6 +1023,35 @@ pub async fn launch_agent(
     if let (Some(role), Some(obj)) = (&agent.role, spawned_payload.as_object_mut()) {
         obj.insert("role".to_string(), json!(role));
     }
+    // DR-046 §Decision 5 / ontology `agent.spawned.lead_run?`: the lead→sub
+    // ORCHESTRATION EDGE, recorded on the sub's OWN spawn fact. Present iff this
+    // spawn came through `fan_out`; ABSENT on every ordinary spawn, which keeps
+    // every pre-DR-046 `agent.spawned` payload byte-identical (DR-012
+    // declared-vs-absent — a leadless run is not a run led by itself).
+    //
+    // A BARE ULID, deliberately NOT scheme-tagged: unlike the `worktree.allocated`
+    // allocator principal above (`run:<ULID>`, whose vocabulary is open and mixed
+    // with sentinels), this field is closed to exactly one kind and its sentinel
+    // case IS absence.
+    //
+    // This REPLACES the withdrawn lead-parented `permit.delegated` emit (DR-046
+    // §Decision 4): a fan-out attenuates nothing — the sub's badge is a fresh
+    // mint over the SUB's own run scope above, not an offline attenuation of the
+    // lead's macaroon — so `added_caveats: []` was asserting an unnarrowed
+    // capability handoff that never happened, and contaminating the lead's
+    // `delegations` / `BoardRow.delegated` attenuation-chain depth (I3). The
+    // DR-017 self-edge above is a REAL attenuation and is untouched.
+    //
+    // The edge's sub end is this fact's own `run`, so the two ends cannot diverge
+    // (DR-046 §Decision 5) — the `fan_out: 0` silent-wrong DR-044 warned about is
+    // gone by construction, not by a test. `lead_run != run` holds trivially:
+    // `lead.lead_run` is the run that CALLED `fan_out`, folded from its badge.
+    if let (Some(lead), Some(obj)) = (lead, spawned_payload.as_object_mut()) {
+        obj.insert(
+            "lead_run".to_string(),
+            json!(lead.lead_run.ulid().to_string()),
+        );
+    }
 
     // SP4b (DR-017 §Decision 2): the capability-chain fact. When the injected
     // badge is a role-NARROWED child of the run's base (lead) badge, record the
@@ -1051,49 +1085,12 @@ pub async fn launch_agent(
         .await?;
     }
 
-    // DR-044 §Decision 2b: the genuinely LEAD-PARENTED delegation edge, emitted
-    // ONLY on the `fan_out` path. Keyed `run` = the LEAD's run (NOT this sub's),
-    // so the reducer folds it onto the LEAD's dossier and `orchestration_graph`
-    // reads a CROSS-RUN sub. `parent_badge_id` = the lead's VERIFIED §12 badge id
-    // (never the token — I2/§12). `child_badge_id` = `injected_badge.badge_id()`,
-    // which is the SAME binding `agent.spawned.badge_id` is read from a few lines
-    // below — the identity is structural here, not reconstructed, because DR-044
-    // warns that if the two ever diverge the graph silently reports `fan_out: 0`.
-    //
-    // A DIFFERENT AXIS from the DR-017 self-edge above, which stays exactly as
-    // it is: that one is a capability-chain record (ONE run, a parent→child
-    // caveat hop when the spec declares a role); this one records a delegation of
-    // authority from one run to ANOTHER. They share the subject deliberately —
-    // DR-044 §Decision 2b mints no discriminator field, because "a lead-keyed
-    // edge whose child badge belongs to a different run" IS the discriminator,
-    // and the projection's `sub_run != lead_run` guard is what reads it.
-    //
-    // `added_caveats` is `[]` and means it: this hop appends NO caveat to the
-    // parent badge. The sub's badge is a fresh mint over the SUB's own run scope
-    // (above), not an offline attenuation of the lead's macaroon, so there is no
-    // appended predicate to record — and the ontology's `added_caveats` is a
-    // REQUIRED field, making the empty list the only truthful value available.
-    // The record fixes the three id fields and says nothing about this one.
-    if let Some(lead) = lead {
-        publish(
-            &daemon.fabric,
-            Event::new(
-                SourceId::new("rezidnt-run"),
-                Some(workspace),
-                Subject::new("permit.delegated"),
-                correlation,
-                Some(allocated_id),
-                1,
-                json!({
-                    "run": lead.lead_run,
-                    "parent_badge_id": lead.lead_badge_id,
-                    "child_badge_id": injected_badge.badge_id(),
-                    "added_caveats": [],
-                }),
-            )?,
-        )
-        .await?;
-    }
+    // NOTE (DR-046 §Decision 4, WITHDRAWN): a lead-parented `permit.delegated`
+    // was emitted here for each fan-out sub. It is gone — a fan-out is not an
+    // attenuation, and that subject cannot express one without asserting a
+    // narrowing that did not occur. Its replacement is `agent.spawned.lead_run`,
+    // set on the payload above in the SAME commit as this withdrawal (DR-046
+    // §Decision 4's sequencing ruling: the graph is never left silent).
 
     // Register BEFORE the fact hits the fabric: a client that sees
     // agent.spawned must be able to attach without racing the registry.

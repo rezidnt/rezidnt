@@ -428,19 +428,45 @@ pub struct AgentRunState {
     /// unedited (I3 rebuild-stability), exactly as `pep` does.
     #[serde(default)]
     pub role: Option<String>,
-    /// DR-042 §Decision 2: this sub-run's spawn-time badge id, folded VERBATIM
-    /// from `agent.spawned.badge_id` (ontology line 223, a REQUIRED v1 field:
+    /// DR-042 §Decision 2: this run's spawn-time badge id, folded VERBATIM from
+    /// `agent.spawned.badge_id` (ontology, a REQUIRED v1 field:
     /// `hex(blake3(sig)[..8])`, the loggable id — NEVER the token, I2). This is
-    /// the id the lead→sub orchestration edge keys on: a lead's
-    /// [`DelegationRecord::child_badge_id`] matches the sub whose spawn folded
-    /// the same `badge_id` ([`orchestration_graph`]). `None` = a spawn that
-    /// carried no badge (a pre-DR-042 fixture, or a run the log minted without a
-    /// spawn) — ABSENT, never synthesized (DR-012 declared-vs-absent). Folded
-    /// exactly as `pep` / `role` are (an optional string off the spawn payload).
+    /// the run's badge ATTRIBUTION — which badge it ran under — and the id the
+    /// daemon's `fan_out` door folds a lead's run back from
+    /// (`bins/rezidentd/src/mcp.rs::badge_run`). `None` = a spawn that carried
+    /// no badge (a pre-DR-042 fixture, or a run the log minted without a spawn)
+    /// — ABSENT, never synthesized (DR-012 declared-vs-absent). Folded exactly
+    /// as `pep` / `role` are (an optional string off the spawn payload).
     /// `#[serde(default)]` keeps every pre-DR-042 golden fixture parsing (and
     /// comparing equal) unedited — I3 rebuild-stability.
+    ///
+    /// **NOT the orchestration edge key any more (DR-046 §Decision 4/5).** The
+    /// lead→sub edge used to be `lead.delegations[].child_badge_id == sub.badge_id`;
+    /// that read a `permit.delegated` fact — an ATTENUATION fact — as a fan-out,
+    /// which it is not. The edge now rides [`Self::lead_run`], run-to-run.
     #[serde(default)]
     pub badge_id: Option<String>,
+    /// DR-046 §Decision 5 / ontology `agent.spawned.lead_run?`: the delegating
+    /// LEAD's RunId, folded VERBATIM from this run's own spawn fact — the
+    /// lead→sub orchestration edge ([`orchestration_graph`] groups on it). A
+    /// **bare ULID**, not scheme-tagged (the field is closed to exactly one kind
+    /// and the sentinel case IS absence — contrast `worktree.allocated.allocator`,
+    /// whose vocabulary is open and mixed). `Some(lead)` iff this run was
+    /// spawned through `fan_out`; `None` = an ordinary spawn with no delegating
+    /// lead — ABSENT, never synthesized to the run's own id and never to a
+    /// sentinel (DR-012 declared-vs-absent, the `pep` / `role` discipline).
+    ///
+    /// It asserts NOTHING about capability: the sub's badge is a fresh mint over
+    /// the SUB's own run and stands in no derivation relation to the lead's, so
+    /// this edge is deliberately run-to-run and carries no badge id at all. The
+    /// reducer folds the value verbatim and re-interprets nothing — the
+    /// `lead_run != run` emitter constraint is BINDING on the EMITTER (ontology),
+    /// with a belt-and-braces guard in the projection, not here (I3).
+    ///
+    /// `#[serde(default)]` keeps every pre-DR-046 golden fixture parsing (and
+    /// comparing equal) unedited — I3 rebuild-stability.
+    #[serde(default)]
+    pub lead_run: Option<String>,
     /// DR-017 §Decision 2 (SP4b): this run's capability-delegation chain, folded
     /// from `permit.delegated` facts (ontology). Each attenuation-and-handoff at
     /// a sub-agent spawn earns one [`DelegationRecord`], in append (log) order so
@@ -448,6 +474,11 @@ pub struct AgentRunState {
     /// pre-DR-017 golden fixture parsing (and comparing equal) unedited — the
     /// exact rebuild-stability discipline `integrity_alarms` / `permit_ledger` /
     /// `intent` / `role` already use.
+    ///
+    /// **Attenuations ONLY (DR-046 §Decision 4).** A fan-out is not an
+    /// attenuation and no longer lands here: a lead that fanned out to five subs
+    /// folds ZERO delegations. What remains is the DR-017 self-edge — a run
+    /// narrowing its own badge when its spec declares a role.
     #[serde(default)]
     pub delegations: Vec<DelegationRecord>,
     /// DR-029 §Decision 6: this run's current composed egress/sandbox posture,
@@ -719,12 +750,25 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 }
                 // DR-042 §Decision 2: fold the spawn badge id VERBATIM when
                 // present; ABSENT stays `None` — never synthesized (DR-012; the
-                // honest "no badge on this spawn"). This is the id the lead→sub
-                // orchestration edge keys on (`lead.delegations[].child_badge_id
-                // == sub.badge_id`, [`orchestration_graph`]). Folded exactly as
+                // honest "no badge on this spawn"). Badge ATTRIBUTION for this
+                // run (the door folds a lead's run back from it); since DR-046
+                // it is NOT the orchestration edge key. Folded exactly as
                 // `pep`/`role`, keeping rebuild stable (I3).
                 if let Some(badge_id) = event.payload()["badge_id"].as_str() {
                     state.badge_id = Some(badge_id.to_string());
+                }
+                // DR-046 §Decision 5 / ontology `agent.spawned.lead_run?`: fold
+                // the delegating LEAD's run VERBATIM when present — the lead→sub
+                // orchestration edge, run-to-run, inside the EXISTING spawn arm
+                // (no new match arm, no new subject). ABSENT stays `None`: an
+                // ordinary spawn has no lead, and absence is the honest
+                // representation — never synthesized to this run's own id, never
+                // to a sentinel (DR-012, the `pep`/`role`/`badge_id` discipline).
+                // The `lead_run != run` constraint is BINDING on the EMITTER; the
+                // reducer re-interprets nothing (I3) and [`orchestration_graph`]
+                // carries the defensive guard.
+                if let Some(lead_run) = event.payload()["lead_run"].as_str() {
+                    state.lead_run = Some(lead_run.to_string());
                 }
             }
         }
@@ -1395,7 +1439,11 @@ pub struct RunRow {
     /// `None`. Honest zero when the ledger is empty.
     pub permit_pending: usize,
     /// Delegation-chain depth for this run, from
-    /// [`AgentRunState::delegations`] length.
+    /// [`AgentRunState::delegations`] length. UNCHANGED by DR-046 — and thereby
+    /// telling the truth: a lead that fanned out to N subs shows **0**, because
+    /// a fan-out is not an attenuation and no longer folds a
+    /// [`DelegationRecord`] (DR-046 §Decision 4 / §Consequences (c)). Fan-out
+    /// width lives on [`LeadRow::fan_out`], a different axis entirely.
     pub delegated: usize,
 }
 
@@ -1592,18 +1640,17 @@ pub struct VerdictRollup {
     pub pending: usize,
 }
 
-/// DR-042: one lead run's fan-out over its delegated sub-runs. The lead→sub edge
-/// is DERIVED purely (I3): a [`DelegationRecord::child_badge_id`] on the lead
-/// matches the sub whose spawn folded the same [`AgentRunState::badge_id`]
-/// (`lead.delegations[].child_badge_id == sub.badge_id`, DR-042 §Decision 2).
-/// `fan_out` is the DERIVED count of matched subs — never a stored fact.
+/// DR-042: one lead run's fan-out over its sub-runs. The lead→sub edge is
+/// DERIVED purely (I3): a sub names its lead on its OWN spawn fact, folded to
+/// [`AgentRunState::lead_run`] (DR-046 §Decision 5). `fan_out` is the DERIVED
+/// count of matched subs — never a stored fact.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LeadRow {
     /// The lead's run ULID key (graph `agent_runs` key).
     pub lead_run: String,
-    /// The DERIVED count of subs this lead delegated to (== `subs.len()`).
+    /// The DERIVED count of subs spawned on this lead's behalf (== `subs.len()`).
     pub fan_out: usize,
-    /// One row per matched delegated sub, in deterministic (sub run ULID) key
+    /// One row per sub naming this lead, in deterministic (sub run ULID) key
     /// order.
     pub subs: Vec<SubRow>,
     /// DR-042 §Decision 2/§Invariant I6: the folded verdict tally across this
@@ -1617,108 +1664,118 @@ pub struct LeadRow {
 /// DR-042: the fleet's lead → parallel sub-runs orchestration graph.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrchestrationView {
-    /// One row per lead that has delegated to at least one folded sub, in
-    /// deterministic (lead run ULID) key order.
+    /// One row per lead that at least one folded sub names, in deterministic
+    /// (lead run ULID) key order.
     pub leads: Vec<LeadRow>,
 }
 
 /// PURE projection: `&Graph` -> [`OrchestrationView`]. No IO, no clocks, no
 /// randomness — a read of already-folded state (I3): the lead→sub edge is
-/// DERIVED (`lead.delegations[].child_badge_id == sub.badge_id`, DR-042
-/// §Decision 2), never a stored fact, and every sub field is carried VERBATIM
-/// from the sub's [`AgentRunState`] — the projection re-interprets nothing. An
-/// `inconclusive` gate verdict surfaces VERBATIM, NEVER coerced (I6).
-/// Deterministic in `BTreeMap` key order (`agent_runs`, twice) — same
-/// content-hashed log yields the same view (I3 rebuild-stability). A lead with
-/// no delegation that matches a folded sub produces NO row; `fan_out` is the
-/// derived count of matched subs.
+/// DERIVED by grouping the folded runs on [`AgentRunState::lead_run`], which
+/// each sub carries from its OWN spawn fact (`agent.spawned.lead_run?`, DR-046
+/// §Decision 5); it is never a stored graph edge. Every sub field is carried
+/// VERBATIM from the sub's [`AgentRunState`] — the projection re-interprets
+/// nothing. An `inconclusive` gate verdict surfaces VERBATIM, NEVER coerced
+/// (I6). Deterministic in `BTreeMap` key order (`agent_runs`, and the grouping
+/// map keyed on the lead's run text) — same content-hashed log yields the same
+/// view (I3 rebuild-stability). A lead no sub names produces NO row; `fan_out`
+/// is the derived count of its subs, never stored.
 ///
-/// DR-044 §Decision 2(a) — the `sub_run != lead_run` guard. A SAME-RUN
-/// delegation is a legitimate fact this projection deliberately does NOT read:
-/// it is the DR-017 capability-chain record (a parent→child caveat hop WITHIN
-/// one run — a run attenuating its own badge when it declares a role,
-/// `bins/rezidentd/src/runs.rs:1032-1052`), minted for replayable authority, not
-/// for orchestration. It shares the `permit.delegated` subject with the genuine
-/// lead→sub edge but lives on a different axis, and the spawning run's own
-/// `agent.spawned.badge_id` is that same attenuated badge (`:976`) — so a
-/// badge-only match reads every role-declaring run as a lead of ITSELF with
-/// `fan_out: 1`. Guarding on the SUB side (not by skipping self-delegating
-/// leads) is what keeps a real lead reporting its genuine cross-run subs and a
-/// correct derived `fan_out`. That distinction bites whenever the lead's OWN
-/// spec declares a role, since the self-edge is emitted ONLY then
-/// (`bins/rezidentd/src/runs.rs:813` — a roleless run emits no SELF-edge, so
-/// for a roleless lead the two placements coincide). The role-declaring case is
-/// where the whole argument lives. Note the premise is about the self-edge
-/// specifically, NOT about `permit.delegated` as a whole: a roleless LEAD does
-/// emit that fact for each sub it fans out to (DR-044 §Decision 2b).
-/// No discriminator field is minted on the fact:
-/// with this guard, "lead-keyed edge whose child badge belongs to a DIFFERENT
-/// run" IS the discriminator, derivable from existing fields (DR-044
-/// §Decision 2b). The guard is depth-agnostic; nested fan-out is out of slice
-/// (DR-044 §Consequences, deferred (b)).
+/// ## Why the edge is run-to-run and not badge-to-badge (DR-046 §Decision 4/5)
+///
+/// It used to be `lead.delegations[].child_badge_id == sub.badge_id`. That read
+/// a `permit.delegated` fact as a fan-out, but that subject's ratified semantics
+/// are ATTENUATION, and a fan-out attenuates nothing — the sub's badge is a
+/// fresh mint over the SUB's own run (`bins/rezidentd/src/runs.rs:802`). The
+/// lead-parented emit was WITHDRAWN (DR-046 §Decision 4) and replaced by a field
+/// on the sub's own spawn fact, so this projection no longer reads
+/// `delegations` at all. Two structural consequences worth stating:
+/// - **A genuine lead now folds ZERO delegations.** Any surviving
+///   `delegations.is_empty()` early-return here would report `fan_out: 0` for
+///   every real lead while still compiling — the silent-wrong DR-046 §Decision 5
+///   names by name. There is none, deliberately.
+/// - **The sub end cannot diverge.** The edge's sub end is the sub's own `run`
+///   on the very fact that mints it — there are no two values to disagree, so
+///   DR-044's badge-divergence silent-wrong is discharged by construction.
+///
+/// ## The `lead_run != sub_run` guard, and what it now is
+///
+/// DEFENSIVE ONLY, and that is a change from lane 1. Under the badge match this
+/// guard was LOAD-BEARING: the DR-017 self-edge (a run attenuating its own badge
+/// when its spec declares a role, `bins/rezidentd/src/runs.rs:1032-1052`) put
+/// the run's own attenuated badge on both ends, so a badge-only match read every
+/// role-declaring run as a lead of ITSELF with `fan_out: 1`. On the `lead_run`
+/// axis that class CANNOT ARISE: the DR-017 self-edge is a `permit.delegated`
+/// fact and never touches this field, and the ontology makes `lead_run != run` a
+/// BINDING constraint on the emitter. The guard is kept as belt-and-braces so a
+/// MALFORMED log can never produce a self-lead row — it now protects against a
+/// bad emitter, not against a legitimate fact on another axis. The DR-017
+/// self-edge is simply invisible here, with no filtering required.
+///
+/// Depth-agnostic; nested fan-out is out of slice (DR-044 §Consequences,
+/// deferred (b)) — a sub that is itself a lead surfaces as its own row.
 pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
-    let leads = graph
-        .agent_runs
-        .iter()
-        .filter_map(|(lead_run, lead)| {
-            // The set of child badge ids this lead delegated to (DR-042 edge).
-            // A running lead with no delegations produces no LeadRow.
-            if lead.delegations.is_empty() {
-                return None;
-            }
-            // Match each candidate sub (in deterministic run-key order) whose
-            // folded `badge_id` equals one of this lead's delegated child badge
-            // ids. Iterating `agent_runs` (a BTreeMap) dedupes by sub run and
-            // pins the order — a repeated delegation of the same child badge
-            // still yields one sub (I3 idempotent fold).
-            let subs: Vec<SubRow> = graph
-                .agent_runs
+    // ONE pass over the folded runs, grouping each sub under the lead IT names
+    // (DR-046 §Decision 5) — replacing the badge match's nested scan. A
+    // `BTreeMap` keyed on the lead's run text pins the lead order; pushing in
+    // `agent_runs` (BTreeMap) iteration order pins the sub order within each
+    // group. Both are content-determined, so the view is rebuild-stable (I3).
+    let mut subs_by_lead: BTreeMap<&str, Vec<SubRow>> = BTreeMap::new();
+    for (sub_run, sub) in &graph.agent_runs {
+        let Some(lead_run) = sub.lead_run.as_deref() else {
+            // No lead: an ordinary spawn. Absence is honest — it is not a sub.
+            continue;
+        };
+        // Belt-and-braces (see the doc comment): a run is never its own lead,
+        // and no emitter can produce that today. A malformed log gets dropped
+        // here rather than fabricating a self-lead row.
+        if lead_run == sub_run.as_str() {
+            continue;
+        }
+        subs_by_lead.entry(lead_run).or_default().push(SubRow {
+            sub_run: sub_run.clone(),
+            // Status carried verbatim from the sub's folded state (I3).
+            status: sub.status.clone(),
+            // Verdicts carried verbatim in gate-key order — an inconclusive
+            // verdict surfaces verbatim, never coerced (I6).
+            verdicts: sub
+                .gates
                 .iter()
-                // DR-044 §Decision 2(a): the sub-side `sub_run != lead_run`
-                // guard. A same-run delegation is the DR-017 capability-chain
-                // hop, not an orchestration edge, so it contributes no sub and
-                // no `fan_out`. Guarding HERE (not on the lead) leaves a real
-                // lead's cross-run subs intact even when it also carries its
-                // own self-edge — which it does whenever it declares a role.
-                .filter(|(sub_run, _)| *sub_run != lead_run)
-                .filter(|(_, sub)| match &sub.badge_id {
-                    Some(badge) => lead.delegations.iter().any(|d| &d.child_badge_id == badge),
-                    None => false,
-                })
-                .map(|(sub_run, sub)| SubRow {
-                    sub_run: sub_run.clone(),
-                    // Status carried verbatim from the sub's folded state (I3).
-                    status: sub.status.clone(),
-                    // Verdicts carried verbatim in gate-key order — an
-                    // inconclusive verdict surfaces verbatim, never coerced (I6).
-                    verdicts: sub
-                        .gates
-                        .iter()
-                        .map(|(gate, state)| (gate.clone(), state.verdict.clone()))
-                        .collect(),
-                    integrity_alarms: sub.integrity_alarms.len(),
-                    // Recorded cost + operator-kill attribution, carried VERBATIM
-                    // from EXISTING folds (`agent.completed` / `agent.signaled`) —
-                    // no new subject, honest absence stays `None` (I3, DR-042).
-                    cost_usd: sub.total_usd,
-                    killed_by: sub.killed_by.clone(),
-                })
-                .collect();
-            if subs.is_empty() {
-                return None;
-            }
-            // DR-042 §Decision 2/I6: fold the verdict tally across the subs — a
-            // PURE derivation over their already-folded `verdicts` (no new fold).
-            let verdict_rollup = roll_up_verdicts(&subs);
-            Some(LeadRow {
-                lead_run: lead_run.clone(),
-                // fan_out is the DERIVED count of matched subs (DR-042).
-                fan_out: subs.len(),
-                subs,
-                verdict_rollup,
-            })
-        })
-        .collect();
+                .map(|(gate, state)| (gate.clone(), state.verdict.clone()))
+                .collect(),
+            integrity_alarms: sub.integrity_alarms.len(),
+            // Recorded cost + operator-kill attribution, carried VERBATIM from
+            // EXISTING folds (`agent.completed` / `agent.signaled`) — no new
+            // subject, honest absence stays `None` (I3, DR-042).
+            cost_usd: sub.total_usd,
+            killed_by: sub.killed_by.clone(),
+        });
+    }
+
+    // One row per FOLDED lead that at least one sub names. Iterating the graph's
+    // runs (not the grouping map) keeps a `LeadRow` tied to a run the log
+    // actually minted — the same posture the badge match had, where a lead had
+    // to be in `agent_runs` to carry any delegation at all. A sub naming a lead
+    // this log never spawned therefore surfaces no row; the daemon's `fan_out`
+    // door already refuses a badge that folds to no spawned run
+    // (`bins/rezidentd/src/mcp.rs:307`), so that shape is malformed-log-only.
+    let mut leads = Vec::new();
+    for lead_run in graph.agent_runs.keys() {
+        // Groups are non-empty by construction, so a present group IS a fan-out.
+        let Some(subs) = subs_by_lead.remove(lead_run.as_str()) else {
+            continue;
+        };
+        // DR-042 §Decision 2/I6: fold the verdict tally across the subs — a PURE
+        // derivation over their already-folded `verdicts` (no new fold).
+        let verdict_rollup = roll_up_verdicts(&subs);
+        leads.push(LeadRow {
+            lead_run: lead_run.clone(),
+            // fan_out is the DERIVED count of this lead's subs (DR-042/DR-046).
+            fan_out: subs.len(),
+            subs,
+            verdict_rollup,
+        });
+    }
     OrchestrationView { leads }
 }
 

@@ -102,8 +102,8 @@ mod props {
     }
 
     proptest! {
-        /// For an ARBITRARY subset+interleaving of the lead's delegations and the
-        /// subs' spawns, the projection over the incrementally-materialized graph
+        /// For an ARBITRARY subset+interleaving of the subs' spawns (each naming
+        /// the lead), the projection over the incrementally-materialized graph
         /// equals the projection over the fold-from-zero graph (the release-
         /// blocking `fold(log) == snapshot` / rebuild family — a divergence is a
         /// reducer bug, I3). The orchestration view holds NO state of its own; it
@@ -118,28 +118,20 @@ mod props {
                 "agent.spawned",
                 json!({"run": LEAD, "agent": "lead", "harness": "claude-code", "badge_id": LEAD_BADGE}),
             )];
-            // For each pick (deduped by sub index), delegate the edge and spawn the
-            // sub. Distinct picks → distinct subs; a repeated pick re-emits the same
-            // facts (idempotent fold — the log is truth, I3). `agent.spawned` carries
-            // only ontology-conformant fields (run/agent/harness/badge_id) — no
+            // For each pick (deduped by sub index), spawn the sub naming its LEAD on
+            // its own spawn fact — the DR-046 §Decision 5 edge. Distinct picks →
+            // distinct subs; a repeated pick re-emits the same facts (idempotent
+            // fold — the log is truth, I3). `agent.spawned` carries only
+            // ontology-conformant fields (run/agent/harness/badge_id/lead_run?) — no
             // `worktree` field exists on this subject (see the projection oracle).
             let mut seen = std::collections::BTreeSet::new();
             for &i in &picks {
                 let (sub_run, sub_badge) = SUBS[i];
                 events.push(ev(
-                    "permit.delegated",
-                    json!({
-                        "run": LEAD,
-                        "parent_badge_id": LEAD_BADGE,
-                        "child_badge_id": sub_badge,
-                        "added_caveats": [],
-                    }),
-                ));
-                events.push(ev(
                     "agent.spawned",
                     json!({
                         "run": sub_run, "agent": "sub", "harness": "claude-code",
-                        "badge_id": sub_badge,
+                        "badge_id": sub_badge, "lead_run": LEAD,
                     }),
                 ));
                 seen.insert(i);
@@ -166,11 +158,11 @@ mod props {
                 .leads
                 .iter()
                 .find(|l| l.lead_run == LEAD)
-                .expect("the lead surfaces once it has delegated");
+                .expect("the lead surfaces once a sub names it");
             prop_assert_eq!(
                 lead.fan_out,
                 seen.len(),
-                "fan_out is the DERIVED count of distinct delegated subs"
+                "fan_out is the DERIVED count of distinct subs naming this lead"
             );
         }
     }

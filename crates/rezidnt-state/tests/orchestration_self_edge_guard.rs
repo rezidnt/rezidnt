@@ -1,50 +1,53 @@
-//! DR-044 ORACLE (self-edge regression + I6 rollup honesty) — the guards named
-//! in DR-044 §Consequences "Test/criterion honesty" (c) and the projection half
-//! of (e). Pure logic over `rezidnt-state`: no daemon, no IO, no clock, so this
-//! file is HOST-LINTABLE and runs in the host `/vet` gauntlet.
+//! DR-044 §Consequences (c)/(e) + DR-046 §Decision 4/5 — the self-lead guards
+//! and the I6 rollup honesty legs of `orchestration_graph`. Pure logic over
+//! `rezidnt-state`: no daemon, no IO, no clock, so this file is HOST-LINTABLE
+//! and runs in the host `/vet` gauntlet.
 //!
-//! ## The defect this pins (DR-044 §Context, and it is RED right now)
+//! ## What this file guarded, and what it guards now (RE-CUT 2026-07-24)
 //!
-//! `bins/rezidentd/src/runs.rs:985-1005` emits `permit.delegated` keyed
-//! `run` = the run BEING SPAWNED, with `parent_badge_id` = that run's base badge
-//! and `child_badge_id` = its role-attenuated badge (`:998`/`:999`).
-//! `bins/rezidentd/src/runs.rs:929` then puts that SAME attenuated badge on
-//! `agent.spawned.badge_id`. The reducer keys the delegation on payload `run`
-//! (`crates/rezidnt-state/src/lib.rs:1055`), and `orchestration_graph` matches a
-//! sub purely by `lead.delegations[].child_badge_id == sub.badge_id`
-//! (`:1634-1640`) with NO `sub_run != lead_run` guard. So today a run that merely
-//! DECLARED A ROLE and never fanned out projects as a lead of ITSELF with
-//! `fan_out: 1`.
+//! **Lane 1 (DR-044 §Decision 2a).** The lead→sub edge was
+//! `lead.delegations[].child_badge_id == sub.badge_id`. A role-declaring spawn
+//! emits a DR-017 `permit.delegated` keyed on the run BEING SPAWNED, whose
+//! `child_badge_id` is the same attenuated badge that run's own
+//! `agent.spawned.badge_id` carries — so a badge-only match read every
+//! role-declaring run as a lead of ITSELF with `fan_out: 1`. The fix was a
+//! `sub_run != lead_run` guard, and that guard was LOAD-BEARING: it was the only
+//! thing separating a legitimate capability-chain fact from an orchestration
+//! edge, on an axis where the two genuinely collided.
 //!
-//! DR-042's shipped read-side tests never caught this: they fold a hand-authored
-//! fixture of three DISTINCT runs, a shape no shipped emitter produces.
+//! **Now (DR-046 §Decision 4/5).** The lead-parented `permit.delegated` emit is
+//! WITHDRAWN — a fan-out attenuates nothing, so that subject could not carry the
+//! edge without asserting a narrowing that never happened — and the edge moved
+//! to `agent.spawned.lead_run?` on the SUB's own spawn fact. The DR-017 self-edge
+//! never touches that field, so **the self-lead class cannot arise on this axis
+//! at all**. The guard survives as BELT-AND-BRACES against a malformed log (the
+//! ontology makes `lead_run != run` BINDING on the emitter), and the assertions
+//! below are re-pointed accordingly:
 //!
-//! ## The contract (DR-044 §Decision 2a)
-//!
-//! `orchestration_graph` gains a `sub_run != lead_run` guard. A same-run
-//! delegation is a DR-017 capability-chain fact on a different axis (a
-//! parent to child caveat hop within one run), not an orchestration edge, and it
-//! yields no lead row and no sub row. The guard is depth-agnostic and must NOT
-//! suppress genuine cross-run fan-out, including when a real lead ALSO carries
-//! its own role self-edge (which production emits for every role-declaring run).
+//! - the role-declaring run still produces no lead row — but now because nothing
+//!   names it, not because a guard filtered a colliding fact. Its `delegations`
+//!   is NON-EMPTY, which is what makes it a live regression test against any
+//!   return to a `delegations`-driven projection;
+//! - the malformed self-lead (`lead_run == run`, which NO emitter produces) is
+//!   asserted directly, since that is what the surviving guard is now for;
+//! - a ROLELESS lead — zero delegations, real subs — pins DR-046 §Decision 5's
+//!   named trap: an early-return on `delegations.is_empty()` reports `fan_out: 0`
+//!   for every genuine lead while every other test still compiles and passes.
 //!
 //! ## The I6 legs (DR-044 §Consequences (e), projection half)
 //!
 //! A worktree-conflicted task mints NO run (DR-044 §Decision 3), so it folds as
 //! nothing: it is never a passed, failed, OR inconclusive sub, and it never
 //! inflates `fan_out`. A genuinely inconclusive sub folds back `inconclusive`,
-//! never coerced (`roll_up_verdicts`, `crates/rezidnt-state/src/lib.rs:1691`).
-//! Both are asserted against a graph that ALSO carries the lead's own self-edge,
-//! which is what makes them fail today rather than pass vacuously.
+//! never coerced (`roll_up_verdicts`).
 //!
 //! ## Ontology posture
 //!
 //! Every event here is built in code from ALREADY-RATIFIED v1 subjects
-//! (`agent.spawned`, `permit.delegated`, `gate.passed`, `gate.inconclusive`).
+//! (`agent.spawned`, `permit.delegated`, `gate.passed`, `gate.inconclusive`) and
+//! ratified v1 fields, including the `agent.spawned.lead_run?` this arc minted.
 //! This file emits NO `worktree.allocated` and therefore has ZERO dependence on
-//! the `worktree.allocated.allocator` value vocabulary the parallel warden
-//! `/subject` session is widening (DR-044 §Decision 6). The warden's outcome
-//! cannot invalidate anything in this file.
+//! the `worktree.allocated.allocator` value vocabulary.
 
 use rezidnt_state::{OrchestrationView, fold, orchestration_graph};
 use rezidnt_types::{Event, SourceId, Subject};
@@ -59,6 +62,13 @@ const SELF_RUN: &str = "01DR044SE1F00000000000RN01";
 const LEAD_RUN: &str = "01DR0441EAD00000000000RN01";
 const SUB_A_RUN: &str = "01DR044SBA000000000000RN01";
 const SUB_B_RUN: &str = "01DR044SBB000000000000RN01";
+/// A ROLELESS lead: it folds ZERO delegations, the shape every fanned-out lead
+/// now has (DR-046 §Decision 4).
+const BARE_LEAD_RUN: &str = "01DR046BAR000000000000RN01";
+/// A run whose spawn fact names ITSELF as its lead. NO emitter can produce this
+/// (the ontology's `lead_run != run` constraint is BINDING on the emitter); it
+/// exists only to exercise the projection's belt-and-braces guard.
+const MALFORMED_RUN: &str = "01DR046MAL000000000000RN01";
 
 // --- badge ids (`hex(blake3(sig)[..8])`, 16 lowercase hex — DR-018 §(a)) ------
 
@@ -66,20 +76,18 @@ const SUB_B_RUN: &str = "01DR044SBB000000000000RN01";
 const SELF_BASE_BADGE: &str = "5e1fba5e00000001";
 /// The self-edge run's ROLE-ATTENUATED badge. Production puts this on BOTH
 /// `permit.delegated.child_badge_id` AND that same run's `agent.spawned.badge_id`
-/// — the collision that fabricates the self-lead.
+/// — the collision that fabricated the self-lead under the badge-keyed edge.
 const SELF_CHILD_BADGE: &str = "5e1fc41d00000001";
 
-/// The lead's base badge and its own role-attenuated child badge. A real lead is
-/// itself a role-declaring run, so production emits a self-edge for it TOO,
-/// alongside the genuine lead-parented fan-out edges (DR-044 §Decision 2b).
+/// The lead's base badge and its own role-attenuated child badge. A
+/// role-declaring lead still emits its DR-017 self-edge (that path is untouched
+/// by DR-046 §Decision 6), so a real lead can carry a non-empty `delegations`.
 const LEAD_BASE_BADGE: &str = "1eadba5e00000001";
 const LEAD_CHILD_BADGE: &str = "1eadc41d00000001";
 
+const BARE_LEAD_BADGE: &str = "1eadbare00000001";
 const SUB_A_BADGE: &str = "5ba00000000000a1";
 const SUB_B_BADGE: &str = "5bb00000000000b1";
-/// The badge a worktree-CONFLICTED task would have run under. No
-/// `agent.spawned` ever folds it, because no run was minted (DR-044 §Decision 3).
-const CONFLICTED_BADGE: &str = "c0bf1c7ed0000001";
 
 fn ev(subject: &str, payload: Value) -> Event {
     Event::new(
@@ -96,8 +104,9 @@ fn ev(subject: &str, payload: Value) -> Event {
 
 /// The two facts a ROLE-DECLARING spawn emits, in the order production emits
 /// them: the DR-017 capability-chain `permit.delegated` (keyed on the spawning
-/// run itself, `runs.rs:997`) then `agent.spawned` carrying the SAME attenuated
-/// badge (`runs.rs:929`).
+/// run itself, `bins/rezidentd/src/runs.rs:1032-1052`) then `agent.spawned`
+/// carrying the SAME attenuated badge. This path is UNTOUCHED by DR-046 — it is
+/// a real attenuation and remains correct.
 fn role_declaring_spawn(run: &str, base_badge: &str, child_badge: &str) -> Vec<Event> {
     vec![
         ev(
@@ -122,23 +131,9 @@ fn role_declaring_spawn(run: &str, base_badge: &str, child_badge: &str) -> Vec<E
     ]
 }
 
-/// A genuine LEAD-PARENTED fan-out edge (DR-044 §Decision 2b): keyed `run` = the
-/// LEAD's run, `child_badge_id` = the badge the SUB actually runs under, which
-/// equals the sub's own `agent.spawned.badge_id`.
-fn lead_parented_edge(lead_run: &str, lead_badge: &str, sub_badge: &str) -> Event {
-    ev(
-        "permit.delegated",
-        json!({
-            "run": lead_run,
-            "parent_badge_id": lead_badge,
-            "child_badge_id": sub_badge,
-            "added_caveats": [],
-        }),
-    )
-}
-
-/// A sub run's spawn, folding the badge the lead delegated to.
-fn sub_spawn(run: &str, badge: &str) -> Event {
+/// A fan-out SUB's spawn: it names its LEAD on its own fact — the DR-046
+/// §Decision 5 edge. Bare ULID, not scheme-tagged.
+fn sub_spawn(run: &str, badge: &str, lead_run: &str) -> Event {
     ev(
         "agent.spawned",
         json!({
@@ -146,7 +141,16 @@ fn sub_spawn(run: &str, badge: &str) -> Event {
             "agent": "sub",
             "harness": "claude-code",
             "badge_id": badge,
+            "lead_run": lead_run,
         }),
+    )
+}
+
+/// An ORDINARY spawn: no lead, and absence is the honest representation.
+fn plain_spawn(run: &str, badge: &str) -> Event {
+    ev(
+        "agent.spawned",
+        json!({"run": run, "agent": "lead", "harness": "claude-code", "badge_id": badge}),
     )
 }
 
@@ -158,64 +162,122 @@ fn project(events: &[Event]) -> OrchestrationView {
     orchestration_graph(&fold(events.iter()))
 }
 
-/// CRITERION (c), DR-044 §Consequences — THE headline regression. A run that
-/// declared a role and NEVER fanned out produces ZERO lead rows. Its
-/// `permit.delegated` is a DR-017 capability-chain fact (same run, parent to
-/// child caveat hop), not an orchestration edge; reading it as one makes the
+/// CRITERION (c), DR-044 §Consequences — the headline regression, re-pointed by
+/// DR-046. A run that declared a role and NEVER fanned out produces ZERO lead
+/// rows. Its `permit.delegated` is a DR-017 capability-chain fact (same run,
+/// parent→child caveat hop); reading it as orchestration is what made the
 /// projection report a lead of itself.
 ///
-/// RED TODAY: `orchestration_graph` has no `sub_run != lead_run` guard
-/// (`crates/rezidnt-state/src/lib.rs:1634-1640`), so this folds to exactly one
-/// `LeadRow { lead_run: SELF_RUN, fan_out: 1, subs: [SELF_RUN] }`.
+/// This run's `delegations` is NON-EMPTY and its `lead_run` is absent — the exact
+/// inverse of a genuine lead after DR-046 — so it stays a live regression test
+/// against any return to a `delegations`-driven projection.
 #[test]
 fn role_declaring_run_that_never_fanned_out_produces_no_lead_row() {
     let events = role_declaring_spawn(SELF_RUN, SELF_BASE_BADGE, SELF_CHILD_BADGE);
-    let view = project(&events);
 
+    // Precondition, asserted rather than assumed: the attenuation DID fold.
+    let graph = fold(events.iter());
+    let state = graph.agent_runs.get(SELF_RUN).expect("the run folds");
+    assert_eq!(
+        state.delegations.len(),
+        1,
+        "precondition: the DR-017 attenuation folds onto this run — it is a REAL narrowing and \
+         DR-046 leaves it in place: {state:#?}"
+    );
+    assert_eq!(
+        state.lead_run, None,
+        "precondition: a role attenuation names NO lead — the two axes never touch"
+    );
+
+    let view = orchestration_graph(&graph);
     assert!(
         view.leads.is_empty(),
         "a role-declaring run that never fanned out is NOT a lead — its permit.delegated is a \
-         DR-017 capability-chain fact on the SAME run (parent->child caveat hop), and the \
-         projection must guard `sub_run != lead_run` (DR-044 §Decision 2a). Got: {view:#?}"
+         DR-017 attenuation on the SAME run, invisible to an edge keyed on \
+         agent.spawned.lead_run (DR-046 §Decision 5). Got: {view:#?}"
     );
 }
 
 /// CRITERION (c), sharpened — no lead may EVER carry itself as one of its own
-/// subs. Stated separately from the emptiness assertion above so the failure
-/// output names the exact defect rather than just a count mismatch, and so the
-/// invariant survives any future change to which leads surface at all.
-///
-/// RED TODAY: the single fabricated row has `lead_run == subs[0].sub_run`.
+/// subs, INCLUDING when a malformed log asserts exactly that. `lead_run == run`
+/// is forbidden to emitters by the ontology (BINDING) and no shipped emitter can
+/// produce it, so this is the projection's belt-and-braces guard under test:
+/// a bad fact is DROPPED, never rendered as a self-lead row.
 #[test]
 fn no_lead_is_ever_its_own_sub() {
-    let events = role_declaring_spawn(SELF_RUN, SELF_BASE_BADGE, SELF_CHILD_BADGE);
-    let view = project(&events);
+    // Leg 1: the DR-017 role case (cannot collide on this axis at all).
+    let role_case = role_declaring_spawn(SELF_RUN, SELF_BASE_BADGE, SELF_CHILD_BADGE);
+    // Leg 2: a MALFORMED spawn naming itself as its own lead.
+    let malformed = vec![sub_spawn(MALFORMED_RUN, SUB_A_BADGE, MALFORMED_RUN)];
 
-    for lead in &view.leads {
-        assert!(
-            !lead.subs.iter().any(|s| s.sub_run == lead.lead_run),
-            "lead {} lists ITSELF as a sub — a same-run delegation is a capability-chain fact, \
-             never an orchestration edge (DR-044 §Decision 2a): {lead:#?}",
-            lead.lead_run
-        );
+    for events in [role_case, malformed] {
+        let view = project(&events);
+        for lead in &view.leads {
+            assert!(
+                !lead.subs.iter().any(|s| s.sub_run == lead.lead_run),
+                "lead {} lists ITSELF as a sub — a run is never its own lead (ontology, BINDING \
+                 on the emitter; the projection guards it anyway): {lead:#?}",
+                lead.lead_run
+            );
+        }
     }
+
+    // And the malformed fact yields no row at all, rather than a zero-wide one.
+    let view = project(&[sub_spawn(MALFORMED_RUN, SUB_A_BADGE, MALFORMED_RUN)]);
+    assert!(
+        view.leads.is_empty(),
+        "a self-lead fact is DROPPED, not rendered: {view:#?}"
+    );
+}
+
+/// DR-046 §Decision 5's NAMED TRAP — a ROLELESS lead. It declares no role, so it
+/// emits no DR-017 self-edge and folds ZERO delegations; this is the shape every
+/// fanned-out lead now has after the §Decision 4 withdrawal. A projection that
+/// kept its `if lead.delegations.is_empty() { return None }` early-return reports
+/// `fan_out: 0` here — for EVERY real lead — while still compiling and while
+/// every badge-era assertion still passes. That is why this leg exists.
+#[test]
+fn a_roleless_lead_with_zero_delegations_still_projects_its_fan_out() {
+    let events = [
+        plain_spawn(BARE_LEAD_RUN, BARE_LEAD_BADGE),
+        sub_spawn(SUB_A_RUN, SUB_A_BADGE, BARE_LEAD_RUN),
+        sub_spawn(SUB_B_RUN, SUB_B_BADGE, BARE_LEAD_RUN),
+    ];
+
+    // Precondition, asserted: the lead really does fold ZERO attenuations.
+    let graph = fold(events.iter());
+    let state = graph.agent_runs.get(BARE_LEAD_RUN).expect("the lead folds");
+    assert!(
+        state.delegations.is_empty(),
+        "precondition: a fan-out is not an attenuation, so a roleless lead folds ZERO \
+         DelegationRecords (DR-046 §Decision 4): {state:#?}"
+    );
+
+    let view = orchestration_graph(&graph);
+    let lead = view
+        .leads
+        .iter()
+        .find(|l| l.lead_run == BARE_LEAD_RUN)
+        .unwrap_or_else(|| {
+            panic!(
+                "a lead with ZERO delegations MUST still surface its fan-out — gating the \
+                 projection on `delegations` reports fan_out: 0 for every genuine lead \
+                 (DR-046 §Decision 5, the named trap): {view:#?}"
+            )
+        });
+    assert_eq!(lead.fan_out, 2, "both subs name this lead: {lead:#?}");
 }
 
 /// CRITERION (c), the guard must not over-fire — a GENUINE lead that ALSO
-/// carries its own role self-edge (which production emits for every
-/// role-declaring run, so every real lead has one) still projects its real
-/// cross-run fan-out, and ONLY that. This is the test that distinguishes "add
-/// the guard" from "delete the projection".
-///
-/// RED TODAY: the self-edge is counted, so `fan_out` folds to 3 (two real subs
-/// plus the lead itself) and `subs` contains `LEAD_RUN`.
+/// declares a role (so it carries its own DR-017 attenuation and a non-empty
+/// `delegations`) still projects its real cross-run fan-out, and ONLY that. This
+/// is the test that distinguishes "read the right axis" from "delete the
+/// projection": the attenuation must contribute NOTHING, in either direction.
 #[test]
 fn a_real_lead_with_its_own_self_edge_counts_only_its_cross_run_subs() {
     let mut events = role_declaring_spawn(LEAD_RUN, LEAD_BASE_BADGE, LEAD_CHILD_BADGE);
-    events.push(lead_parented_edge(LEAD_RUN, LEAD_CHILD_BADGE, SUB_A_BADGE));
-    events.push(lead_parented_edge(LEAD_RUN, LEAD_CHILD_BADGE, SUB_B_BADGE));
-    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE));
-    events.push(sub_spawn(SUB_B_RUN, SUB_B_BADGE));
+    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE, LEAD_RUN));
+    events.push(sub_spawn(SUB_B_RUN, SUB_B_BADGE, LEAD_RUN));
 
     let view = project(&events);
 
@@ -231,39 +293,30 @@ fn a_real_lead_with_its_own_self_edge_counts_only_its_cross_run_subs() {
     );
     assert_eq!(
         lead.fan_out, 2,
-        "fan_out counts the two CROSS-RUN subs only — the lead's own role self-edge is a \
-         capability-chain fact and contributes nothing (DR-044 §Decision 2a): {lead:#?}"
+        "fan_out counts the two subs that NAME this lead — its own role attenuation is a \
+         capability-chain fact and contributes nothing (DR-046 §Decision 4/5): {lead:#?}"
     );
     let subs: Vec<&str> = lead.subs.iter().map(|s| s.sub_run.as_str()).collect();
     assert_eq!(
         subs,
         vec![SUB_A_RUN, SUB_B_RUN],
-        "the subs are exactly the two delegated runs, in deterministic key order: {lead:#?}"
+        "the subs are exactly the two runs naming this lead, in deterministic key order: {lead:#?}"
     );
 }
 
 /// CRITERION (e), projection half — a worktree-CONFLICTED task is never counted.
 /// DR-044 §Decision 3: a double-claim returns an error and mints NO run, so
-/// nothing folds; the task is not a passed sub, not a failed sub, and not an
-/// inconclusive sub. The remaining subs stand. The lead's own self-edge is
-/// present too, which is what makes this fail today instead of passing
-/// vacuously.
-///
-/// RED TODAY: `fan_out` folds to 2 (the surviving sub plus the lead itself) and
-/// the rollup gains a spurious `pending` bucket for the lead.
+/// NOTHING folds for it — no spawn, therefore no `lead_run`, therefore no edge.
+/// The task is not a passed sub, not a failed sub, and not an inconclusive sub.
+/// The remaining subs stand. The lead's own role attenuation is present too, so
+/// this cannot pass vacuously through an empty graph.
 #[test]
 fn a_conflicted_task_is_never_counted_as_passed_failed_or_inconclusive() {
     let mut events = role_declaring_spawn(LEAD_RUN, LEAD_BASE_BADGE, LEAD_CHILD_BADGE);
-    // Two tasks were delegated; only one could allocate a worktree.
-    events.push(lead_parented_edge(LEAD_RUN, LEAD_CHILD_BADGE, SUB_A_BADGE));
-    events.push(lead_parented_edge(
-        LEAD_RUN,
-        LEAD_CHILD_BADGE,
-        CONFLICTED_BADGE,
-    ));
-    // The surviving sub spawned and passed its gate. The conflicted task has NO
-    // agent.spawned at all — there is no run to fold (DR-044 §Decision 3).
-    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE));
+    // Two tasks were delegated; only one could allocate a worktree. The surviving
+    // sub spawned and passed its gate. The conflicted task has NO agent.spawned
+    // at all — there is no run to fold, and so no fact naming the lead.
+    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE, LEAD_RUN));
     events.push(gate("gate.passed", SUB_A_RUN, "vet"));
 
     let view = project(&events);
@@ -299,19 +352,14 @@ fn a_conflicted_task_is_never_counted_as_passed_failed_or_inconclusive() {
 
 /// CRITERION (e), non-coercion half — a genuinely INCONCLUSIVE sub folds back
 /// `inconclusive`, in its own bucket, never coerced to pass or fail
-/// (`roll_up_verdicts`, `crates/rezidnt-state/src/lib.rs:1691`). Asserted over a
-/// graph that also carries the lead's self-edge so the bucket arithmetic is
-/// checked against the CORRECTED `fan_out`.
-///
-/// RED TODAY: the self-edge adds a third sub and a spurious `pending`, so the
-/// tuple folds to `(1, 0, 1, 1)` with `fan_out == 3`.
+/// (`roll_up_verdicts`). Asserted over a graph that also carries the lead's own
+/// role attenuation so the bucket arithmetic is checked against a `fan_out` that
+/// the attenuation must not have touched.
 #[test]
 fn an_inconclusive_sub_folds_back_inconclusive_and_is_never_coerced() {
     let mut events = role_declaring_spawn(LEAD_RUN, LEAD_BASE_BADGE, LEAD_CHILD_BADGE);
-    events.push(lead_parented_edge(LEAD_RUN, LEAD_CHILD_BADGE, SUB_A_BADGE));
-    events.push(lead_parented_edge(LEAD_RUN, LEAD_CHILD_BADGE, SUB_B_BADGE));
-    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE));
-    events.push(sub_spawn(SUB_B_RUN, SUB_B_BADGE));
+    events.push(sub_spawn(SUB_A_RUN, SUB_A_BADGE, LEAD_RUN));
+    events.push(sub_spawn(SUB_B_RUN, SUB_B_BADGE, LEAD_RUN));
     events.push(gate("gate.passed", SUB_A_RUN, "vet"));
     events.push(gate("gate.inconclusive", SUB_B_RUN, "pre_merge"));
 

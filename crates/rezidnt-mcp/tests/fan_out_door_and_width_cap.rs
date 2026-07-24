@@ -574,8 +574,8 @@ async fn the_fan_out_response_carries_no_sub_content() {
 /// the refusal is a POLICY refusal on badge KIND, not a verification failure —
 /// the same shape as DR-032's operator-only `kill_run`, inverted. Fan-out is a
 /// run-scoped capability: an operator badge maps to no run, so there would be no
-/// lead to key `permit.delegated` on (DR-044 §Decision 2b) and the graph would
-/// gain an unparented sub.
+/// lead run to record as the sub's `agent.spawned.lead_run` (DR-044 §Decision
+/// 2b, edge per DR-046 §Decision 5) and the graph would gain an unparented sub.
 ///
 /// NON-VACUITY (named by DR-045 §Consequences): the SAME core, the SAME
 /// substrate, the SAME task list, presented with a real lead MACAROON, is

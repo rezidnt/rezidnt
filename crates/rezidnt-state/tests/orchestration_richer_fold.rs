@@ -29,6 +29,12 @@
 //! fold. The one field the graph genuinely CANNOT fold without a new subject —
 //! a sub's worktree linkage — stays DEFERRED to a warden `/subject` (the
 //! projection oracle already recorded this; DR-042 §Decision 6).
+//!
+//! RE-CUT 2026-07-24 (DR-046 §Decision 4/5): the synthetic logs below built the
+//! lead→sub edge as a lead-keyed `permit.delegated` fact. That emit is WITHDRAWN
+//! — a fan-out attenuates nothing — so the edge is now `agent.spawned.lead_run`
+//! on each SUB's own spawn. Every assertion in this file is unchanged; only the
+//! shape of the log that produces the edge moved.
 
 use std::path::PathBuf;
 
@@ -180,16 +186,14 @@ fn rollup_covers_pass_fail_inconclusive_pending_from_existing_subjects() {
         json!({"run": LEAD, "agent": "lead", "harness": "claude-code", "badge_id": LEAD_BADGE}),
     )];
     for (sub_run, sub_badge, kind) in subs {
-        events.push(ev(
-            "permit.delegated",
-            json!({
-                "run": LEAD, "parent_badge_id": LEAD_BADGE,
-                "child_badge_id": sub_badge, "added_caveats": [],
-            }),
-        ));
+        // The lead→sub edge: the SUB's own spawn names its lead (DR-046
+        // §Decision 5). No `permit.delegated` — a fan-out attenuates nothing.
         events.push(ev(
             "agent.spawned",
-            json!({"run": sub_run, "agent": "sub", "harness": "claude-code", "badge_id": sub_badge}),
+            json!({
+                "run": sub_run, "agent": "sub", "harness": "claude-code",
+                "badge_id": sub_badge, "lead_run": LEAD,
+            }),
         ));
         // Terminal gate verdict per kind — all EXISTING subjects (gate.*).
         match kind {
@@ -218,9 +222,9 @@ fn rollup_covers_pass_fail_inconclusive_pending_from_existing_subjects() {
         .leads
         .iter()
         .find(|l| l.lead_run == LEAD)
-        .expect("the lead surfaces once it has delegated");
+        .expect("the lead surfaces once a sub names it");
 
-    assert_eq!(lead.fan_out, 4, "four delegated subs: {lead:#?}");
+    assert_eq!(lead.fan_out, 4, "four subs name this lead: {lead:#?}");
     let r = &lead.verdict_rollup;
     assert_eq!(r.passed, 1, "one all-pass sub: {r:#?}");
     assert_eq!(r.failed, 1, "one failed sub: {r:#?}");
@@ -250,23 +254,16 @@ fn rollup_fail_and_inconclusive_dominate_a_partial_pass() {
     let badge_f = "5ubmixfail000001";
     let badge_i = "5ubmixinco000001";
 
-    let events = vec![
+    let events = [
         ev(
             "agent.spawned",
             json!({"run": LEAD, "agent": "lead", "harness": "claude-code", "badge_id": LEAD_BADGE}),
         ),
-        ev(
-            "permit.delegated",
-            json!({"run": LEAD, "parent_badge_id": LEAD_BADGE, "child_badge_id": badge_f, "added_caveats": []}),
-        ),
-        ev(
-            "permit.delegated",
-            json!({"run": LEAD, "parent_badge_id": LEAD_BADGE, "child_badge_id": badge_i, "added_caveats": []}),
-        ),
-        // Sub with a PASS then a FAIL gate → failed dominates.
+        // Sub with a PASS then a FAIL gate → failed dominates. Each sub names its
+        // lead on its OWN spawn (DR-046 §Decision 5).
         ev(
             "agent.spawned",
-            json!({"run": mixed_fail, "agent": "sub", "harness": "claude-code", "badge_id": badge_f}),
+            json!({"run": mixed_fail, "agent": "sub", "harness": "claude-code", "badge_id": badge_f, "lead_run": LEAD}),
         ),
         ev(
             "gate.passed",
@@ -279,7 +276,7 @@ fn rollup_fail_and_inconclusive_dominate_a_partial_pass() {
         // Sub with a PASS then an INCONCLUSIVE gate (no fail) → inconclusive.
         ev(
             "agent.spawned",
-            json!({"run": mixed_inco, "agent": "sub", "harness": "claude-code", "badge_id": badge_i}),
+            json!({"run": mixed_inco, "agent": "sub", "harness": "claude-code", "badge_id": badge_i, "lead_run": LEAD}),
         ),
         ev(
             "gate.passed",

@@ -246,13 +246,13 @@ impl McpSubstrate for McpBridge {
         })
     }
 
-    /// DR-044 §Decision 1/2b/3: the live lead→sub fan-out. Drives the EXISTING
-    /// rails and adds no substrate (I4): the same `launch_agent` path
-    /// `spawn_agent` uses, the same per-workspace `spawn_keys` dedup map, the
-    /// same worktree allocation. What is new is the recorded PRINCIPAL
-    /// (`allocator: "run:<lead ULID>"`) and the lead-parented `permit.delegated`
-    /// edge, both emitted inside `launch_agent` where the sub's injected badge is
-    /// in scope.
+    /// DR-044 §Decision 1/3 (as amended by DR-046 §Decision 4/5): the live
+    /// lead→sub fan-out. Drives the EXISTING rails and adds no substrate (I4):
+    /// the same `launch_agent` path `spawn_agent` uses, the same per-workspace
+    /// `spawn_keys` dedup map, the same worktree allocation. What is new is the
+    /// recorded PRINCIPAL (`allocator: "run:<lead ULID>"` on
+    /// `worktree.allocated`) and the lead→sub edge `agent.spawned.lead_run`,
+    /// both emitted inside `launch_agent`.
     ///
     /// The core has already run the DR-045 door and the DR-044 §Decision 4 width
     /// cap, so a refused call never reaches here (no allocation, no spawn, no
@@ -309,8 +309,9 @@ impl McpSubstrate for McpBridge {
                     codes::RUN_UNKNOWN,
                     format!(
                         "no run on this log was spawned under badge {lead_badge_id}; fan_out is \
-                         lead-only and the lead must be a run this daemon spawned (DR-044 \
-                         §Decision 2b, DR-045 §Decision 1)"
+                         lead-only and the lead must be a run this daemon spawned (DR-045 \
+                         §Decision 1; the lead's run is what each sub records as \
+                         agent.spawned.lead_run, DR-046 §Decision 5)"
                     ),
                 )
             })?;
@@ -330,10 +331,11 @@ impl McpSubstrate for McpBridge {
             // (design §5). Mirrors the open chain, whose spawns already share the
             // open's correlation.
             let correlation = Ulid::new();
-            let lead = LeadDelegation {
-                lead_run,
-                lead_badge_id,
-            };
+            // The lead's badge id is NOT carried forward: DR-046 §Decision 5
+            // makes the lead→sub edge run-to-run, and the verified badge id is
+            // already `agent_runs[lead_run].badge_id` off derived state. Its one
+            // job here was folding the run above.
+            let lead = LeadDelegation { lead_run };
 
             let mut outcomes = Vec::with_capacity(tasks.len());
             for task in tasks {
@@ -413,8 +415,8 @@ impl McpSubstrate for McpBridge {
                     &egress_spec,
                     Some(&idempotency_key),
                     // The delegating lead: this is what makes the allocation
-                    // record `run:<lead ULID>` and mints the lead-keyed
-                    // `permit.delegated` edge (DR-044 §Decision 2b/3).
+                    // record `run:<lead ULID>` and puts `lead_run` on the sub's
+                    // `agent.spawned` (DR-044 §Decision 3, DR-046 §Decision 5).
                     Some(&lead),
                 )
                 .await

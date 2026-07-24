@@ -1637,16 +1637,16 @@ pub struct OrchestrationView {
 /// delegation is a legitimate fact this projection deliberately does NOT read:
 /// it is the DR-017 capability-chain record (a parent→child caveat hop WITHIN
 /// one run — a run attenuating its own badge when it declares a role,
-/// `bins/rezidentd/src/runs.rs:985-1005`), minted for replayable authority, not
+/// `bins/rezidentd/src/runs.rs:1032-1052`), minted for replayable authority, not
 /// for orchestration. It shares the `permit.delegated` subject with the genuine
 /// lead→sub edge but lives on a different axis, and the spawning run's own
-/// `agent.spawned.badge_id` is that same attenuated badge (`:929`) — so a
+/// `agent.spawned.badge_id` is that same attenuated badge (`:976`) — so a
 /// badge-only match reads every role-declaring run as a lead of ITSELF with
 /// `fan_out: 1`. Guarding on the SUB side (not by skipping self-delegating
 /// leads) is what keeps a real lead reporting its genuine cross-run subs and a
 /// correct derived `fan_out`. That distinction bites whenever the lead's OWN
 /// spec declares a role, since the self-edge is emitted ONLY then
-/// (`bins/rezidentd/src/runs.rs:766` — a roleless run emits no SELF-edge, so
+/// (`bins/rezidentd/src/runs.rs:813` — a roleless run emits no SELF-edge, so
 /// for a roleless lead the two placements coincide). The role-declaring case is
 /// where the whole argument lives. Note the premise is about the self-edge
 /// specifically, NOT about `permit.delegated` as a whole: a roleless LEAD does

@@ -73,6 +73,17 @@ pub mod codes {
     pub const AGENT_UNKNOWN: &str = "agent.unknown";
     /// The spawn itself failed after all checks passed.
     pub const SPAWN_FAILED: &str = "spawn.failed";
+    /// DR-046 §Decision 9 — a task whose worktree could not be claimed because
+    /// the sole-allocator registry already holds that canonicalized path
+    /// (DR-001). Deliberately NOT [`SPAWN_FAILED`]: a caller must be able to
+    /// tell "the tree was contended, retry with the same keys" from "this spawn
+    /// is broken", and collapsing them tells the caller something false about
+    /// what to do next (I6). The record declined to mint it early because it
+    /// would have been a code no path can emit; the adapter's structural
+    /// `GitError::Conflict` is what makes it emittable. Additive code — older
+    /// peers tolerate an unknown refusal code (the `scope.requires_ttl`
+    /// precedent, I5).
+    pub const WORKTREE_CONFLICT: &str = "worktree.conflict";
     /// DR-035 §Decision 3 — `resolve_permit` was called with a broad scope
     /// (`scope="run_tool"`) but no `ttl_ms`. Broad OR permanent, never both: a
     /// broad grant MUST be time-boxed so the dangerous quadrant (broad AND

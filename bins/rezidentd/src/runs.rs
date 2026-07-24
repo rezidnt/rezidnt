@@ -36,6 +36,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Instrument;
 use ulid::Ulid;
 
+/// Registry-convergence oracle (DR-046 §Decision 8/9). Test-only; the module
+/// header explains why these two guards cannot live outside the daemon and
+/// therefore cannot be seen by host `/vet`.
+#[cfg(test)]
+mod registry_convergence_tests;
+
 /// Byte-broadcast ring per run (chunks, not bytes): a lagging attach client
 /// skips ahead rather than back-pressuring the run task; the authoritative
 /// stream copy is the ring + the CAS chunk manifest, never this channel.

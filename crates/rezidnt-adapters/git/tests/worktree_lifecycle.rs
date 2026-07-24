@@ -20,6 +20,7 @@ fn branch_req(name: &str, branch: &str) -> WorktreeReq {
         name: name.to_string(),
         branch: Some(branch.to_string()),
         detach: false,
+        ..WorktreeReq::default()
     }
 }
 
@@ -127,6 +128,7 @@ async fn detach_alloc_creates_detached_head_worktree_at_repo_head() {
             name: "detached".to_string(),
             branch: None,
             detach: true,
+            ..WorktreeReq::default()
         })
         .await
         .unwrap();

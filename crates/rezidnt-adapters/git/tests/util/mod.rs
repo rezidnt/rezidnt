@@ -52,6 +52,24 @@ pub fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|e| panic!("canonicalize {}: {e}", p.display()))
 }
 
+/// A non-extended-length spelling of a canonicalized path — what the `git` CLI
+/// reliably accepts on Windows (`\\?\D:\x` → `D:\x`); identity on Unix. Used
+/// where a test must hand git the path of a tree the adapter reported. It
+/// RE-SPELLS the path it is given rather than rebuilding one from an assumed
+/// worktree layout, so it survives a layout change (the previous
+/// `tmp.join(wt.file_name())` idiom did not: it silently depended on allocated
+/// trees being direct children of the tempdir).
+pub fn plain_spelling(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// Receive events until one matches `subject` (others are passed over), or
 /// panic when `deadline` elapses. The deadline is the OUTER tolerance; timing
 /// criteria are asserted by the caller on wall-clock elapsed, not here.

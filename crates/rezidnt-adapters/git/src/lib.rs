@@ -11,9 +11,11 @@
 //!   crash-free path (the dedup mark persists after the emit), but the emit
 //!   precedes the mark-persist, so a crash between them can re-emit on restart.
 //!   Never silent double-tracking, never a duplicate registry entry.
-//! - **Registry format (DEFAULT):** JSON Lines at `<repo>/.rezidnt/worktrees`,
+//! - **Registry format (DEFAULT):** JSON Lines at
+//!   `<repo>/.rezidnt/registry.jsonl` ([`REGISTRY_PATH`], moved off a collision
+//!   with the daemon's worktree directory — see the constant),
 //!   one live entry per line: `{"path": <canonicalized>, "allocator":
-//!   "rezidnt"|"human", "branch"?: <string>, "id"?: <ULID>,
+//!   "rezidnt"|"run:<ULID>"|"human", "branch"?: <string>, "id"?: <ULID>,
 //!   "allocated_event"?: <ULID>, "conflicted"?: <bool>}`. The last three are
 //!   the S2-remediation additions that make allocation identity and the
 //!   exactly-once marks durable across restarts. The format evolves
@@ -53,9 +55,21 @@
 //!   resurface a fact. Because the emit precedes the mark-persist, the fact is
 //!   at-least-once — a crash in that window can resurface it on restart.
 //! - **Facts** ride the envelope with `source` = [`SOURCE_ID`], `v = 1`, and
-//!   payloads per `spec/ontology.md`. All facts of one adapter instance share
-//!   a correlation ULID minted at [`GitAdapter::open`] (DEFAULT); `diff.ready`
-//!   and `worktree.released` carry the allocation fact's id as `causation`.
+//!   payloads per `spec/ontology.md`. `workspace`, `correlation` and
+//!   `causation` ride the ALLOCATION REQUEST ([`WorktreeReq`]) and are carried
+//!   forward onto that worktree's later facts; a request naming no correlation
+//!   falls back to a per-instance ULID minted at [`GitAdapter::open`]
+//!   (DEFAULT). `diff.ready` and `worktree.released` carry the allocation
+//!   fact's id as `causation`.
+//! - **Fact delivery (DR-046 §Decision 8, I3):** facts always ride the
+//!   broadcast. When the daemon injects a [`FactSink`] via
+//!   [`GitAdapter::with_sink`], each fact ALSO goes through it first, and a
+//!   sink refusal fails the operation that minted the fact — a broadcast is a
+//!   fan-out to live subscribers, not an append, and only an append is a
+//!   commit point. The on-open reconciliation scan runs inside
+//!   [`GitAdapter::open`], before any sink can be injected, so its facts reach
+//!   the sink only via [`GitAdapter::startup_facts`] — the seam that already
+//!   exists for exactly that reason.
 
 mod summary;
 
@@ -65,7 +79,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rezidnt_cas::Cas;
-use rezidnt_types::{Event, SourceId, Subject, refs::CasRef};
+use rezidnt_types::{Event, SourceId, Subject, WorkspaceId, refs::CasRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -81,7 +95,25 @@ pub const DEBOUNCE_MS: u64 = 250;
 pub const SOURCE_ID: &str = "git-adapter";
 
 /// Sole-allocator worktree registry file, relative to the repo root (DR-001).
-pub const REGISTRY_PATH: &str = ".rezidnt/worktrees";
+///
+/// **Moved 2026-07-24 (registry-convergence slice; DEFAULT, note in lieu of a
+/// `/dr`).** This was `.rezidnt/worktrees`, which collided head-on with the
+/// daemon's own worktree base directory of the identical spelling
+/// (`bins/rezidentd/src/runs.rs`, `repo.join(".rezidnt").join("worktrees")` +
+/// `create_dir_all`). One is a JSONL file, the other a directory; they cannot
+/// coexist, and [`GitAdapter::open`] would have tried to `read_to_string` a
+/// directory the moment the daemon and the adapter met. The registry moves off
+/// the collision rather than the daemon's shipped v0.0.1 layout moving.
+///
+/// **No migration code exists, deliberately.** No crate depends on
+/// `rezidnt-adapter-git` today, so no production registry file has ever been
+/// written at the old path. Migrating a file that cannot exist would be
+/// ceremony asserting a history the tree does not have.
+pub const REGISTRY_PATH: &str = ".rezidnt/registry.jsonl";
+
+/// Directory hosting allocated worktrees, relative to the repo root (DEFAULT).
+/// See [`GitAdapter::derive_worktree_path`] for why the layout is in-repo.
+const WORKTREE_BASE: &str = ".rezidnt/worktrees";
 
 /// Identity-marker filename inside a worktree's PRIVATE gitdir
 /// (`<repo>/.git/worktrees/<name>/`), carrying the persisted [`WorktreeId`]
@@ -120,8 +152,47 @@ impl WorktreeId {
     }
 }
 
+/// The allocating PRINCIPAL — the ratified `worktree.allocated.allocator` v1
+/// vocabulary (`spec/ontology.md`), which is CLOSED and SCHEME-TAGGED:
+/// `"rezidnt"` (the daemon on its own initiative) or `"run:<ULID>"` (a
+/// delegating lead run, DR-044 §Decision 3). A bare ULID is explicitly not
+/// legal on that field, and `"human"` is RESERVED for out-of-band observation
+/// (`worktree.observed`) and is never emitted by rezidnt on an allocation.
+///
+/// An enum rather than a `String` so the illegal spellings are
+/// UNCONSTRUCTIBLE, not merely untested — the same structural discipline
+/// DR-046 applied to the source guard. This matters beyond tidiness: the
+/// reconciliation scan reads `allocator == "human"` as "already observed,
+/// never news", so an allocation able to claim the sentinel would hide its own
+/// tree from the scan.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Allocator {
+    /// The daemon allocated this on its own initiative. The DEFAULT, so
+    /// threading a principal changes nothing about an ordinary allocation.
+    #[default]
+    Rezidnt,
+    /// A lead run delegated this allocation (DR-044 §Decision 3).
+    Run(Ulid),
+}
+
+impl Allocator {
+    /// The verbatim value rendered onto the fact AND the registry entry. The
+    /// two must never disagree about who allocated a tree.
+    pub fn as_value(&self) -> String {
+        match self {
+            Self::Rezidnt => "rezidnt".to_string(),
+            Self::Run(run) => format!("run:{run}"),
+        }
+    }
+}
+
 /// Allocation request (doc §7 `WorktreeReq`; fields DEFAULT).
-#[derive(Debug, Clone)]
+///
+/// The principal and envelope fields ride the REQUEST, never the adapter
+/// instance (DR-046 §Decision 8): the registry is per-repo, so one adapter
+/// serves every workspace over that repo, and an adapter-level `workspace`
+/// would be wrong by construction. Construct with `..WorktreeReq::default()`.
+#[derive(Debug, Clone, Default)]
 pub struct WorktreeReq {
     /// Human-stable name; the adapter derives the on-disk location.
     pub name: String,
@@ -129,6 +200,17 @@ pub struct WorktreeReq {
     pub branch: Option<String>,
     /// `git worktree add --detach`: check out the current HEAD, no branch.
     pub detach: bool,
+    /// Who is allocating. Defaults to [`Allocator::Rezidnt`].
+    pub principal: Allocator,
+    /// Workspace this allocation belongs to. `None` folds into no workspace's
+    /// graph, so the daemon always supplies it.
+    pub workspace: Option<WorkspaceId>,
+    /// The caller's causal chain. `None` falls back to the adapter's own
+    /// per-instance correlation (the pre-DR-046 behavior).
+    pub correlation: Option<Ulid>,
+    /// The direct trigger — e.g. the vet verdict id, so "this tree was
+    /// allocated BECAUSE vet passed" is answerable from the log alone.
+    pub causation: Option<Ulid>,
 }
 
 /// A live allocated worktree.
@@ -147,6 +229,14 @@ pub enum GitError {
     Git(String),
     #[error("worktree registry: {0}")]
     Registry(String),
+    /// The sole-allocator double-claim (DR-001): the canonicalized `path` is
+    /// already registered to `holder`. STRUCTURAL on purpose — a caller
+    /// decides "contended, retry with the same keys" versus "this spawn is
+    /// broken" by MATCHING this variant, never by substring-searching a
+    /// message that renames itself the next time somebody improves the
+    /// wording (DR-046 §Decision 9).
+    #[error("worktree {path} is already claimed by {holder}")]
+    Conflict { path: String, holder: String },
     #[error("unknown worktree {0:?}")]
     UnknownWorktree(WorktreeId),
     #[error("cas: {0}")]
@@ -157,6 +247,29 @@ pub enum GitError {
     Watch(#[from] notify::Error),
     #[error("envelope: {0}")]
     Event(#[from] rezidnt_types::EventError),
+}
+
+/// Where an adapter fact goes when the daemon wants it on the FABRIC
+/// (DR-046 §Decision 8, I3).
+///
+/// INJECTED, never called directly: `rezidnt-adapter-git` depends on
+/// `rezidnt-types` only and must not grow a `rezidnt-fabric` dependency —
+/// substrates stay behind traits (I4). The daemon's implementation appends to
+/// the event log; the adapter only knows that the append either happened or
+/// did not.
+///
+/// The error type is [`GitError`] rather than a sink-owned associated type or
+/// a boxed dyn error. Justification: the sink's failure is observed on exactly
+/// one path — inside [`RepoSubstrate::alloc_worktree`], whose signature already
+/// returns `GitError` — so any other choice would be converted to `GitError` at
+/// its single call site and buy nothing but a generic parameter on a trait that
+/// must stay dyn-safe. `GitError::Registry` is the honest arm for "the durable
+/// record refused this fact".
+pub trait FactSink: Send + Sync {
+    /// Append one fact. An `Err` FAILS the operation that minted it: the
+    /// append is the commit point (I3), and an allocation whose fact never
+    /// reached the log is a tree on disk the log does not know about.
+    fn emit(&self, event: &Event) -> Result<(), GitError>;
 }
 
 /// The repo substrate seam (doc §7; shape BINDING, signatures DEFAULT).
@@ -212,6 +325,9 @@ struct LiveWorktree {
     /// The canonical spelling the allocated fact minted (registry key).
     path_str: String,
     branch: Option<String>,
+    /// The requesting envelope, carried forward onto this worktree's later
+    /// facts. Defaulted for an allocation reloaded by the on-open scan.
+    ctx: FactCtx,
     /// `worktree.allocated` event id — causation for later facts. `None` for
     /// an allocation reloaded from a legacy registry line (migration default).
     allocated: Option<Ulid>,
@@ -231,14 +347,43 @@ struct State {
     live: BTreeMap<WorktreeId, LiveWorktree>,
 }
 
+/// The envelope context one allocation's facts ride (DR-046 §Decision 8).
+/// Supplied per REQUEST — an adapter serves every workspace over its repo, so
+/// these cannot be adapter-level state — and carried forward onto that
+/// worktree's later facts for the lifetime of the allocation.
+///
+/// Restart degradation, stated rather than hidden: a reloaded allocation's
+/// later facts (`diff.ready`, `worktree.released`) fall back to the default
+/// context, exactly as `allocated_event` already degrades on a legacy line.
+/// The registry persists no envelope fields; nothing in this slice pins that,
+/// and inventing an unpinned format change is not this stage's work.
+#[derive(Debug, Clone, Copy, Default)]
+struct FactCtx {
+    workspace: Option<WorkspaceId>,
+    correlation: Option<Ulid>,
+}
+
+impl FactCtx {
+    fn of(req: &WorktreeReq) -> Self {
+        Self {
+            workspace: req.workspace,
+            correlation: req.correlation,
+        }
+    }
+}
+
 struct Inner {
     /// Canonicalized repo root.
     repo_root: PathBuf,
     registry_file: PathBuf,
     cas: Arc<Cas>,
     tx: broadcast::Sender<Event>,
-    /// One correlation per adapter instance (DEFAULT): every fact this
-    /// adapter emits belongs to the same causal chain.
+    /// The durable append seam, when the daemon injected one
+    /// ([`GitAdapter::with_sink`]). Absent → broadcast only, the pre-DR-046
+    /// standalone behavior every existing suite exercises.
+    sink: OnceLock<Arc<dyn FactSink>>,
+    /// One correlation per adapter instance (DEFAULT): the fallback for a
+    /// request that names none, so every fact still belongs to some chain.
     correlation: Ulid,
     /// Facts minted by the on-open reconciliation scan, set exactly once at
     /// the end of [`GitAdapter::open`] (the scan predates every subscriber,
@@ -249,24 +394,36 @@ struct Inner {
 }
 
 impl Inner {
-    /// Mint and publish one fact (`v = 1`, `source` = [`SOURCE_ID`]).
-    /// Returns the fact so callers can causally chain later facts (`.id`) or
-    /// pin it (the startup scan collects its facts for [`GitAdapter::startup_facts`]).
+    /// Mint and publish one fact (`v = 1`, `source` = [`SOURCE_ID`]) under the
+    /// supplied envelope context. Returns the fact so callers can causally
+    /// chain later facts (`.id`) or pin it (the startup scan collects its facts
+    /// for [`GitAdapter::startup_facts`]).
+    ///
+    /// The INJECTED SINK GOES FIRST and its error propagates: the append is
+    /// the commit point (I3), so a fact that could not be appended never
+    /// happened and must not be broadcast as though it had. The broadcast that
+    /// follows is a live-subscriber convenience, and its `send` failure stays
+    /// tolerated — "no live subscribers" is not a failure for a fan-out, but it
+    /// is one for an append.
     fn emit(
         &self,
         subject: &str,
+        ctx: &FactCtx,
         causation: Option<Ulid>,
         payload: Value,
     ) -> Result<Event, GitError> {
         let event = Event::new(
             SourceId::new(SOURCE_ID),
-            None,
+            ctx.workspace,
             Subject::new(subject),
-            self.correlation,
+            ctx.correlation.unwrap_or(self.correlation),
             causation,
             1,
             payload,
         )?;
+        if let Some(sink) = self.sink.get() {
+            sink.emit(&event)?;
+        }
         let fact = event.clone();
         if self.tx.send(event).is_err() {
             // No live subscribers: not a failure for a broadcast fan-out.
@@ -333,6 +490,7 @@ impl GitAdapter {
                     registry_file,
                     cas: Arc::new(cas),
                     tx,
+                    sink: OnceLock::new(),
                     correlation: Ulid::new(),
                     startup: OnceLock::new(),
                     state: Mutex::new(State {
@@ -351,6 +509,20 @@ impl GitAdapter {
         }
         .instrument(span)
         .await
+    }
+
+    /// Inject the durable append seam (DR-046 §Decision 8, I3/I4). Every fact
+    /// this adapter mints from here on goes through `sink` BEFORE it is
+    /// broadcast, and a sink refusal fails the operation that minted it.
+    ///
+    /// Injected once, at construction. A second injection is refused and said
+    /// so out loud rather than silently discarded — two sinks would mean two
+    /// answers to "was this appended".
+    pub fn with_sink(self, sink: Arc<dyn FactSink>) -> Self {
+        if self.inner.sink.set(sink).is_err() {
+            tracing::warn!("fact sink already injected; the first sink stands");
+        }
+        self
     }
 
     /// Subscribe to the adapter's fact stream (fabric delivery rules apply:
@@ -457,14 +629,21 @@ impl GitAdapter {
                         );
                         continue;
                     };
-                    let watcher =
-                        self.spawn_watcher(tree.path.clone(), key.clone(), entry.allocated_event)?;
+                    // A reloaded allocation has no request to inherit an
+                    // envelope from (see [`FactCtx`] on restart degradation).
+                    let watcher = self.spawn_watcher(
+                        tree.path.clone(),
+                        key.clone(),
+                        FactCtx::default(),
+                        entry.allocated_event,
+                    )?;
                     state.live.insert(
                         id,
                         LiveWorktree {
                             path: tree.path.clone(),
                             path_str: key.clone(),
                             branch: entry.branch.clone(),
+                            ctx: FactCtx::default(),
                             allocated: entry.allocated_event,
                             _watcher: watcher,
                         },
@@ -474,6 +653,7 @@ impl GitAdapter {
                     // tree occupies the path. One collision, one fact.
                     let fact = self.inner.emit(
                         "worktree.conflict",
+                        &FactCtx::default(),
                         None,
                         serde_json::json!({ "path": entry.path, "holder": entry.allocator }),
                     )?;
@@ -507,9 +687,12 @@ impl GitAdapter {
                         conflicted: false,
                     },
                 );
-                let fact = self
-                    .inner
-                    .emit("worktree.observed", None, Value::Object(payload))?;
+                let fact = self.inner.emit(
+                    "worktree.observed",
+                    &FactCtx::default(),
+                    None,
+                    Value::Object(payload),
+                )?;
                 facts.push(fact);
                 dirty = true;
             }
@@ -591,8 +774,12 @@ impl GitAdapter {
                     payload.insert("claimed_path".into(), Value::String(claimed_str));
                 }
                 payload.insert("holder".into(), Value::String(holder));
-                self.inner
-                    .emit("worktree.conflict", None, Value::Object(payload))?;
+                self.inner.emit(
+                    "worktree.conflict",
+                    &FactCtx::default(),
+                    None,
+                    Value::Object(payload),
+                )?;
                 self.inner.persist_registry(&state).await?;
                 return Ok(());
             }
@@ -623,8 +810,12 @@ impl GitAdapter {
                 },
             );
             self.inner.persist_registry(&state).await?;
-            self.inner
-                .emit("worktree.observed", None, Value::Object(payload))?;
+            self.inner.emit(
+                "worktree.observed",
+                &FactCtx::default(),
+                None,
+                Value::Object(payload),
+            )?;
             Ok(())
         }
         .instrument(span)
@@ -632,18 +823,20 @@ impl GitAdapter {
     }
 
     /// Derive the on-disk location for a named allocation (DEFAULT):
-    /// `<repo-parent>/<repo-name>-wt-<name>` — a sibling of the repo root so
-    /// allocated trees never pollute the primary working tree.
+    /// `<repo>/.rezidnt/worktrees/<name>`.
+    ///
+    /// **Moved 2026-07-24 (registry-convergence slice; DEFAULT, note in lieu of
+    /// a `/dr`).** This was the sibling layout `<repo-parent>/<repo>-wt-<name>`,
+    /// designed so allocated trees never polluted the primary working tree.
+    /// That concern is already answered elsewhere: the repo `.gitignore`
+    /// designates `.rezidnt/` as the home for "worktrees, captures materialized
+    /// by `rezidnt open`", so an in-repo tree is ignored, not pollution.
+    /// Converging on the daemon's in-repo layout instead preserves shipped
+    /// v0.0.1 on-disk behavior and the two test levers built against it
+    /// (`bins/rezidentd/tests/spec_init_open_e2e.rs`'s tempdir-confinement
+    /// guard, and `fan_out_live_e2e.rs`'s `block_allocations`), which a move in
+    /// the other direction would have broken.
     fn derive_worktree_path(&self, name: &str) -> Result<PathBuf, GitError> {
-        let parent = self.inner.repo_root.parent().ok_or_else(|| {
-            GitError::Git("repo root has no parent directory to host worktrees".into())
-        })?;
-        let repo_name = self
-            .inner
-            .repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo");
         let safe: String = name
             .chars()
             .map(|c| {
@@ -654,7 +847,7 @@ impl GitAdapter {
                 }
             })
             .collect();
-        Ok(parent.join(format!("{repo_name}-wt-{safe}")))
+        Ok(self.inner.repo_root.join(WORKTREE_BASE).join(safe))
     }
 
     /// Run `git -C <repo_root> <args>` via tokio::process; nonzero exit maps
@@ -724,6 +917,7 @@ impl GitAdapter {
         &self,
         path: PathBuf,
         path_str: String,
+        ctx: FactCtx,
         causation: Option<Ulid>,
     ) -> Result<notify::RecommendedWatcher, GitError> {
         use notify::Watcher as _;
@@ -742,7 +936,7 @@ impl GitAdapter {
 
         let inner = Arc::clone(&self.inner);
         let span = tracing::info_span!("adapter", kind = "git-watch", worktree = %path_str);
-        tokio::spawn(debounce_loop(inner, path, path_str, causation, rx).instrument(span));
+        tokio::spawn(debounce_loop(inner, path, path_str, ctx, causation, rx).instrument(span));
         Ok(watcher)
     }
 }
@@ -752,7 +946,14 @@ impl RepoSubstrate for GitAdapter {
         let span =
             tracing::info_span!("adapter", kind = "git", op = "alloc_worktree", name = %req.name);
         async move {
+            let ctx = FactCtx::of(&req);
+            let principal = req.principal.as_value();
             let target = self.derive_worktree_path(&req.name)?;
+            // `git worktree add` creates the leaf; the in-repo base above it
+            // is the adapter's to provide.
+            if let Some(base) = target.parent() {
+                tokio::fs::create_dir_all(base).await?;
+            }
             let target_cli = cli_path(&target);
             match (&req.branch, req.detach) {
                 (Some(branch), false) => {
@@ -785,14 +986,19 @@ impl RepoSubstrate for GitAdapter {
                 if emit_conflict {
                     self.inner.emit(
                         "worktree.conflict",
+                        &ctx,
                         None,
                         serde_json::json!({ "path": canonical_str, "holder": holder }),
                     )?;
                     self.inner.persist_registry(&state).await?;
                 }
-                return Err(GitError::Registry(format!(
-                    "path already registered: {canonical_str}"
-                )));
+                // STRUCTURAL, not a message: the daemon maps this variant to a
+                // distinct refusal code, and must never have to parse prose to
+                // do it (DR-046 §Decision 9).
+                return Err(GitError::Conflict {
+                    path: canonical_str,
+                    holder,
+                });
             }
 
             // Mint the identity and stamp it into the tree's private gitdir
@@ -806,11 +1012,33 @@ impl RepoSubstrate for GitAdapter {
             if let Some(branch) = &req.branch {
                 payload.insert("branch".into(), Value::String(branch.clone()));
             }
-            payload.insert("allocator".into(), Value::String("rezidnt".into()));
-            let allocated = self
-                .inner
-                .emit("worktree.allocated", None, Value::Object(payload))?
-                .id;
+            payload.insert("allocator".into(), Value::String(principal.clone()));
+            // The append is the COMMIT POINT (I3). If the fact cannot be
+            // recorded, the allocation did not happen: nothing is registered,
+            // nothing is tracked live, and the tree just created is taken back
+            // out so the disk does not hold a worktree the log never heard of.
+            let allocated = match self.inner.emit(
+                "worktree.allocated",
+                &ctx,
+                req.causation,
+                Value::Object(payload),
+            ) {
+                Ok(fact) => fact.id,
+                Err(e) => {
+                    if let Err(cleanup) = self
+                        .run_git(&["worktree", "remove", "--force", &cli_path(&canonical)])
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %canonical_str,
+                            error = %cleanup,
+                            "allocation fact could not be recorded and the tree could not be \
+                             removed; an unregistered worktree remains on disk"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
 
             // The registry entry carries the allocation identity and the
             // allocated event id (S2 remediation) — minted just above so one
@@ -820,7 +1048,9 @@ impl RepoSubstrate for GitAdapter {
                 canonical_str.clone(),
                 RegistryEntry {
                     path: canonical_str.clone(),
-                    allocator: "rezidnt".into(),
+                    // The same principal the fact recorded — the registry and
+                    // the log must not disagree about who allocated a tree.
+                    allocator: principal,
                     branch: req.branch.clone(),
                     id: Some(id),
                     allocated_event: Some(allocated),
@@ -832,14 +1062,19 @@ impl RepoSubstrate for GitAdapter {
             // Watch starts after the allocated fact is minted so its id can
             // causally chain the diff.ready stream; callers only write after
             // alloc returns, so no event can precede the watch.
-            let watcher =
-                self.spawn_watcher(canonical.clone(), canonical_str.clone(), Some(allocated))?;
+            let watcher = self.spawn_watcher(
+                canonical.clone(),
+                canonical_str.clone(),
+                ctx,
+                Some(allocated),
+            )?;
             state.live.insert(
                 id,
                 LiveWorktree {
                     path: canonical.clone(),
                     path_str: canonical_str,
                     branch: req.branch.clone(),
+                    ctx,
                     allocated: Some(allocated),
                     _watcher: watcher,
                 },
@@ -883,6 +1118,7 @@ impl RepoSubstrate for GitAdapter {
                 path,
                 path_str,
                 branch,
+                ctx,
                 allocated,
                 _watcher,
             } = live;
@@ -902,7 +1138,7 @@ impl RepoSubstrate for GitAdapter {
                 payload.insert("branch".into(), Value::String(branch));
             }
             self.inner
-                .emit("worktree.released", allocated, Value::Object(payload))?;
+                .emit("worktree.released", &ctx, allocated, Value::Object(payload))?;
             Ok(())
         }
         .instrument(span)
@@ -919,6 +1155,7 @@ async fn debounce_loop(
     inner: Arc<Inner>,
     path: PathBuf,
     path_str: String,
+    ctx: FactCtx,
     causation: Option<Ulid>,
     mut rx: mpsc::Receiver<()>,
 ) {
@@ -938,7 +1175,7 @@ async fn debounce_loop(
                 }
                 last_hash = Some(r.hash.clone());
                 let payload = serde_json::json!({ "worktree": path_str, "diff": r });
-                if let Err(e) = inner.emit("diff.ready", causation, payload) {
+                if let Err(e) = inner.emit("diff.ready", &ctx, causation, payload) {
                     tracing::warn!(error = %e, "diff.ready emission failed");
                 }
             }

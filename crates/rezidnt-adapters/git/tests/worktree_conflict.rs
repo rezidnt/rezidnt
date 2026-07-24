@@ -31,6 +31,7 @@ fn branch_req(name: &str, branch: &str) -> WorktreeReq {
         name: name.to_string(),
         branch: Some(branch.to_string()),
         detach: false,
+        ..WorktreeReq::default()
     }
 }
 

@@ -46,6 +46,7 @@ fn branch_req(name: &str, branch: &str) -> WorktreeReq {
         name: name.to_string(),
         branch: Some(branch.to_string()),
         detach: false,
+        ..WorktreeReq::default()
     }
 }
 
@@ -347,7 +348,7 @@ async fn open_surfaces_startup_collision_exactly_once_across_restarts() {
     // The human takeover, out-of-band: rezidnt's tree is removed and a
     // DIFFERENT (detached) human tree is created at the very same path. The
     // plain spelling canonicalizes to the registered key.
-    let plain = tmp.path().join(wt_path.file_name().unwrap());
+    let plain = util::plain_spelling(&wt_path);
     util::git(
         &repo,
         &["worktree", "remove", "--force", plain.to_str().unwrap()],

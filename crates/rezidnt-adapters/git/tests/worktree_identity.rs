@@ -46,6 +46,7 @@ fn branch_req(name: &str, branch: &str) -> WorktreeReq {
         name: name.to_string(),
         branch: Some(branch.to_string()),
         detach: false,
+        ..WorktreeReq::default()
     }
 }
 
@@ -136,7 +137,7 @@ async fn foreign_readd_on_registered_branch_is_detected_exactly_once() {
 
     // The takeover, wearing the registered identity: remove rezidnt's tree,
     // re-add a foreign one at the SAME path checking out the SAME branch.
-    let plain = tmp.path().join(wt_path.file_name().unwrap());
+    let plain = util::plain_spelling(&wt_path);
     util::git(
         &repo,
         &["worktree", "remove", "--force", plain.to_str().unwrap()],

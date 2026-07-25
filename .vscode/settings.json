@@ -1,0 +1,37 @@
+{
+  // rust-analyzer, aligned to the /vet gate. See .claude/hooks/vet.sh.
+
+  // Give rust-analyzer its OWN target dir (target/rust-analyzer). Without this it
+  // shares D:\github\rezidnt\target with cargo, and a background `cargo check` from
+  // the editor takes the target lock out from under a running gauntlet. This repo
+  // has a documented flake from exactly that class of contention.
+  "rust-analyzer.cargo.targetDir": true,
+
+  // Match the gate's lint set exactly: vet.sh runs
+  //   cargo clippy --workspace --all-targets -- -D warnings
+  // so the editor should surface the same failures rather than a weaker subset.
+  // If the red is too loud day-to-day, drop the extraArgs line — you keep clippy,
+  // you just stop promoting warnings to errors in the editor only.
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.check.extraArgs": ["--", "-Dwarnings"],
+
+  // Lane worktrees are full checkouts of this same repo. Indexing them means 3x
+  // the CPU/RAM and duplicate symbols on every goto-definition.
+  "rust-analyzer.files.excludeDirs": [
+    ".claude/worktrees",
+    "target",
+    "target-wsl",
+    "docs/site"
+  ],
+  "files.watcherExclude": {
+    "**/.claude/worktrees/**": true,
+    "**/target/**": true,
+    "**/target-wsl/**": true
+  },
+
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  }
+}

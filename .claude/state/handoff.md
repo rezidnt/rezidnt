@@ -1,75 +1,59 @@
-# Handoff — 2026-07-24 (session 26: registry-convergence SHIPPED · DR-047 accepted)
+# Handoff — 2026-07-25 (session 28)
 
-## State of play
-`current-slice` = **`registry-convergence`** (DR-046 §Decision 8), and it is **DONE**: host `/vet` **pass** (638/0),
-`/debrief` **PASS** on the fourth gate, WSL workspace **806/0**. Pushed and synced to `origin/main` at `8e1ef5c`
-(+ the DR-047 commit). Tree clean except the pre-existing untracked `.playwright-mcp/` and `docs/site/` (leave them).
-Nothing mid-flight, no agent running. High autonomy ON ([[autonomy-high-trust]]).
+## Slice
+`current-slice` = **`worktree-release-lifecycle`** (DR-049). **14 of 16 criteria green.** Both reds are the same
+assertion — `outcome = failed` — blocked on one ontology decision (below). Main clean+pushed at **`67547f5`**.
+High autonomy ON. Nothing running. Both worktrees clean.
 
-**Shipped:** `rezidentd` takes its first `rezidnt-adapter-git` dependency; **both** allocation paths (ordinary spawn and
-fan-out) now allocate through `RepoSubstrate::alloc_worktree` on one `GitAdapter` per **canonicalized repo root**
-(`Daemon::repo_adapter`); adapter facts **append** to the fabric through an injected `FactSink` whose `Err` fails the
-allocation (the adapter still has **no** `rezidnt-fabric` dep — I4); exactly one `worktree.allocated` per allocation;
-`codes::WORKTREE_CONFLICT` minted, so **DR-044 §Decision 3's refused-sub rule is REACHED for the first time** — a
-contended task is refused alone and its siblings still spawn.
+## Main this session
+`a0e74a2` DR-050 (PROPOSED) + §20 row · `cc8c869` toolchain pinned to 1.97.1 (owner-authorized) + `board_rich.rs:323`
+clippy fix — **main's own `/vet` was red on `--all-targets`**, independent of either lane; memory had it filed as a
+WSL wart, it was a host gate failure · `4d44c3e`/`67547f5` handoffs.
 
-## Records
-- **DR-047** (ACCEPTED, ratified under the standing autonomy grant — overturn knowingly if you disagree). Discharges
-  DR-046 §Decision 8 in full and records that its brief, marked "all verified against the tree", was not: **one** stated
-  premise false, **five** conditions unnamed, one a hard blocker. Ratifies the two DEFAULT layout rulings, rules
-  `diff.ready`'s two emitters deliberate, records the post-merge clobber, and names the next slice.
-- Ontology corrected by the warden (prose only; no subject, no field, vocabulary byte-identical, `v` stays 1).
-  `:218-219` had been corrected that *morning* to say the registry was unreached — this slice falsified it the same
-  afternoon. Recorded as **superseding**, not overwriting, since the failure it guards against runs in both directions.
+## Lane 2 — DR-048 Trials slice A · `agent-ab4e17a54fbbdb421` · `4ceccb7`
+**CODE-COMPLETE. Owes only a re-`/debrief`** (last verdict was `a559623`; `51b515d`+`4ceccb7` un-audited).
+`AgentSubstrate` is a real dyn-safe trait, two live impls, `model` threaded through; the `turn.failed` arm maps.
+145 crate tests green, clippy `-D warnings` clean, `check --workspace` clean. Boundary (`crates/rezidnt-run` only,
+DR-048 §D6) held all session — verified by `git diff --stat`, not by report.
 
-## Open findings (all non-blocking; `/debrief` PASSED with these named)
-- **C8 (canaries) is `inconclusive` on the `/debrief` side, four passes running, and correctly so.** It is a claim about
-  executed outcomes no read-only checker can discharge; it belongs to `/vet`, which executes and reported pass. Do not
-  read it as a defect and do not try to "fix" it.
-- **`is_change_event` is NARROWED, not closed.** Host `/vet` judges the predicate; it never judges the watch loop's
-  *use* of it. Say narrowed.
-- **A whole class of watcher behavior is WSL-only** — `ReadDirectoryChangesW` produces no read events (Windows 0, WSL 1),
-  so the Decision-5 defect and any successor are structurally invisible to host `/vet`.
-- **Two guards are test-after-implementation**, disclosed in-file: the `startup_facts` drain and the C7 sibling leg's
-  plumbing.
-- **OWED, outside this slice's diff:** `crates/rezidnt-mcp/tests/gate_explain.rs:10-15` claims no ratified v1 baseline
-  for the gate subjects. False. The correction to write is **"all FIVE `gate.*` subjects are ratified — four in the S3
-  set, `gate.passed` in the S4 set"**. The S3 note defers `gate.passed`; the S4 set then ratifies it outright. Reading
-  only the S3 deferral is how an earlier draft of this bullet seeded a false caveat *inside* a correction.
-- **Three prose residues** the closing `/debrief` named, one line each next time those comments are touched: "refs" in
-  the private-gitdir sentence (only HEAD/bisect/worktree/rewritten are per-worktree); "only WSL boards go red"
-  understates host coverage (a `dead_code` lint trips); and one bullet above rules a two-clause caveat "confirmed false"
-  while substantiating one clause.
-- **`crates/rezidnt-tui/examples/board_rich.rs:323`** still fails WSL clippy (`unnecessary_sort_by`), pre-existing,
-  invisible to host clippy. Same class as [[golden-txt-crlf-host-vet]].
+## Lane 1 — DR-049 release lifecycle · `agent-a01bfc6c4807a2b3b` · `a63e580`
+Released-at-merge, the `lifecycle`/`outcome` split, and the explicit MCP release all work on a real daemon under
+WSL. **Only failure attribution is missing.** The implementer stopped rather than guess, correctly:
+`gate.failed` carries no worktree, and the correlation join is **verified unsound** — `runs.rs:687` and
+`mcp.rs:361` each mint ONE correlation per *spec*, so it spans N runs and N trees; joining on it would attribute
+one sub's failure to all its siblings. Reachable today.
 
-## Decisions still needing a /dr
-None outstanding. DR-047 §Decision 6 already **fixes the brief** for the next slice — but read the arc's lesson before
-building to it: a fixed brief is a hypothesis.
+## ► NEXT ACTION — one `/subject` session, four items, batched
+1. **`gate.failed.worktree?`** — additive optional, present iff the gate ran against an allocated tree.
+   `run_gate` already has the value as its `cwd` (DR-041). **This unblocks lane 1's last two tests.**
+2. **`agent.completed.error.message?`** — lane 2's new arm emits it; the ontology doesn't describe it.
+3. **`spec/ontology.md:94` and `:349`** — both still assert the reducer folds `status = "merged"`. False post-DR-049.
+4. **DR-047 §D4's queued pass** — `diff.ready` emitter cell + `source` attribution.
 
-## What's next (owner's steer — nothing forced)
-**DR-047 §Decision 6 — the worktree RELEASE lifecycle slice.** `release_worktree` has **no production caller**, so
-DR-007's ratified allocate→use→release never completes: every allocation leaks a `notify` watcher plus a debounce task
-for the daemon's lifetime, trees stay on disk, registry entries are never closed. It is genuinely **undecided**, not
-merely unbuilt — releasing at merge emits `worktree.released`, which would fold `status = "released"` over `"merged"`,
-trading one derived-state regression for another. That slice must settle: is a merged worktree retained? what does
-`worktree.released` do to a `"merged"` fold? does a failed run's tree survive for triage? and it owes the `WorktreeId`
-threading `RunTaskContext` lacks. Also queued: **one warden `/subject`** (DR-047 §Decision 4) for the `diff.ready`
-emitter cell and the `source: "rezidnt-adapter-git"` attribution the daemon's own fact carries — wire-visible and in
-golden fixtures, so it moves *with* the ontology, never ahead of it.
-Alternative arc: the **owned terminal substrate**, the other Phase-3 line and the actual herdr-removal endgame.
+Then: `/debrief` lane 2 on `4ceccb7` → lane 1 to 16/16 → `/gauntlet` → **`/vet` ONE LANE AT A TIME**
+([[vet-concurrency-flake]]) → merge lane 2 first (crates-only, independent; §D6 holds Trials daemon wiring until
+lane 1 lands).
 
-## Environment (essentials)
-`/gauntlet` is the done gate now (vet ∥ debrief, concurrent). Host `/vet` = `bash .claude/hooks/vet.sh`; `--fast` for
-inner loops. `bins/rezidentd/src/main.rs` gates `mod runs|mcp|gates` on `#[cfg(unix)]`, so **no daemon unit or e2e test
-is ever visible to host `/vet`** — run WSL too, always **sequentially** ([[vet-concurrency-flake]]; it reproduced
-host-vs-host this session, not just host-vs-WSL). **Check a record's premises against the tree before building to it** —
-this arc has produced **eleven** defects of that one class, and **three of the eleven were introduced by remediation
-commits**, including one inside the sentence its author reported catching ([[fanout-silent-wrong-pattern]]).
+## Open `/debrief` findings
+- Lane 1 self-flagged: it **added a defaulted method to the MCP-internal `McpSubstrate` trait** though DR-049's
+  banner says "NO trait method" (argues that seam isn't one of the four §7 traits I4 binds). **Adjudicate.**
+- `Daemon::allocations` is process-lifetime — a tree allocated pre-restart isn't MCP-releasable. Refuses loudly
+  (`worktree.unknown`), never silently. Disclosed.
+- `registry_convergence_e2e.rs` kills the daemon on `agent.completed`, now racing a merge+release that deletes the
+  tree its `exists()` assertions read. Wide margin, WSL-green, but a NEW way to lose that race.
+- `crates/rezidnt-tui/tests/dr049_board_split_render_note.rs` **does not exist** despite being cited in a board header.
 
----
-**NEXT ACTION → `registry-convergence` COMPLETE and closed. DR-046 §Decision 8 discharged in full; DR-047 ACCEPTED;
-DR-044 §Decision 3 reached for the first time. Host /vet 638/0 pass + /debrief PASS + WSL 806/0, pushed at `8e1ef5c`.
-NO forced next — owner's steer; strongest candidate is the DR-047 §Decision 6 worktree-release-lifecycle slice, which
-is genuinely UNDECIDED (releasing at merge trades one derived-state regression for another), plus one queued warden
-/subject. High autonomy ON.**
+## Needs a `/dr`
+- **DR-050 is PROPOSED and now amendable.** The owner's "record as failing" call settled its contested item by
+  evidence: a failing codex turn emits **`turn.failed`, never `turn.completed`** — the mapping is sound and the
+  auditor's mismapped-failure branch is refuted for 0.145.x. Amend: flip Decision 3 to resolved-by-recording,
+  strike risk item 5, correct the "residual" claim (the daemon fallback fires but **discards the failure reason**).
+  Then ACCEPT. Bonus the recording forced: `turn.failed` carries **no `usage`** — a failed candidate's cost is
+  *absent*, not zero, and it folds to `None` end-to-end (verified in the reducer), or slice C scores a failed run
+  as free.
+- DR-050's three `runs.rs` traps are slice-B **entry criteria**, not backlog (memory: `pep-stamp-decoupled-from-interception`).
+
+## Also open
+No spawn in the tree is version-gated — `version_gate` has zero non-test callers; dormant until codex is wired ·
+`.claude/worktrees/` is **not gitignored**; a `git add -A` on main would swallow both worktrees · owner question
+unanswered: "what happens when I'm out of fable?"

@@ -320,7 +320,7 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     ))];
     let mut sorted = view.counts_by_subject.clone();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.1));
     for (subject, count) in sorted.iter().take(3) {
         subjects.push(Line::from(vec![
             Span::styled(format!("{count:>5}  "), Style::default().fg(ACCENT)),

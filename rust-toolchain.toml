@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so host (windows-msvc) and WSL (linux-gnu) cannot drift apart.
+# Host `cargo clippy -- -D warnings` is the definition-of-done gate, so a stale
+# host silently weakens the gate: lints added after the host's version can never
+# fire. Bump this deliberately, then run the full gauntlet.
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "rust-src"]

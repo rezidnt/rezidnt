@@ -9,7 +9,7 @@ description: >-
   user: "/intel how does Omnigent surface policy violations to the user?"
   assistant: "Using the analyst agent to run a scoped DR-002 read and file a memo in intel/."
   <commentary>Competitor questions route through the analyst so influence stays traceable.</commentary></example>
-model: inherit
+model: sonnet
 color: magenta
 skills: ["prior-art-protocol", "rezidnt-constitution"]
 ---

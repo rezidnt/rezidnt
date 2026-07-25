@@ -9,7 +9,7 @@ description: >-
   user: "/dr add WASM as a third verifier kind"
   assistant: "Using the scribe agent to draft DR-003 with context, decision, amendments, and risk deltas."
   <commentary>BINDING changes exist only when a DR exists.</commentary></example>
-model: inherit
+model: opus
 color: blue
 tools: ["Read", "Grep", "Glob"]
 skills: ["rezidnt-constitution"]

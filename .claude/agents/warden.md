@@ -9,7 +9,7 @@ description: >-
   user: "/subject session.resized"
   assistant: "Invoking the warden agent to run the subject checklist and apply the change inside an ontology session."
   <commentary>All taxonomy changes route through the warden.</commentary></example>
-model: inherit
+model: opus
 color: yellow
 skills: ["event-fabric", "rezidnt-constitution"]
 ---

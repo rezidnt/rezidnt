@@ -13,7 +13,7 @@ description: >-
   user: "Fix the payload-size violation the auditor found"
   assistant: "Routing to the implementer agent to move the blob into the CAS and carry a ref."
   <commentary>Remediation of audit findings is implementation work.</commentary></example>
-model: inherit
+model: fable
 color: green
 skills: ["rezidnt-constitution", "event-fabric", "rust-conventions", "slice-discipline"]
 ---

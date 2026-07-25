@@ -9,7 +9,7 @@ description: >-
   user: "/oracle fabric"
   assistant: "Using the oracle agent to encode S0's acceptance criteria as failing tests: fold(log)==snapshot, kill -9 rebuild equality, chain verification."
   <commentary>Criteria-to-failing-tests is this agent's single job.</commentary></example>
-model: inherit
+model: fable
 color: cyan
 skills: ["testing-oracles", "event-fabric", "slice-discipline", "rezidnt-constitution"]
 ---

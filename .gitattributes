@@ -1,6 +1,8 @@
 # The daemon and exit demos run in WSL2; the vet gauntlet runs host-side.
-# Shell scripts and golden fixtures must check out byte-identical everywhere.
-* text=auto
+# Everything checks out LF everywhere: host tests compare goldens byte-for-byte,
+# and agent tooling writes LF — a CRLF working tree only produces churn warnings
+# and latent byte-identity traps. No .bat/.cmd files exist to need CRLF.
+* text=auto eol=lf
 *.sh text eol=lf
 *.jsonl text eol=lf
 *.expected.json text eol=lf

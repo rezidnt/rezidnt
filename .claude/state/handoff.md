@@ -72,6 +72,30 @@ binary. One residual, recorded so it is not rediscovered: drain-to-EOF turns a p
 socket from a silent pass into a **hang**, and `run_proxy` has no timeout, so that class would wedge `/vet`
 rather than return a verdict.
 
+## ⚠ CI's ubuntu lane has been RED since CI landed — diagnosed, NOT fixed (needs a ruling)
+`gauntlet (windows-latest)` **passes** on this arc. `gauntlet (ubuntu-latest)` **fails**, and it also failed on
+`bcd0db9` before this session touched anything — **pre-existing, not caused by this arc** (host vet pass, WSL
+`cargo test --workspace` exit 0). A gate that is always red teaches everyone to ignore it, so this needs
+closing early.
+
+**Cause, from the runner log:** the four `crates/rezidnt-run/tests/egress_mediation_c3bc.rs` tests
+(`allowlisted_host_is_reached_through_the_proxy`, `credential_injected_upstream_agent_never_sees_it`,
+`direct_egress_attempts_reach_nothing_but_the_proxy`, `egress_backend_present_reports_available_and_mediates`)
+die in netns/pasta setup with `Couldn't write to /proc/self/uid_map: Operation not permitted` and
+`clone: Operation not permitted`. That is **GitHub's ubuntu-24.04 runner restricting unprivileged user
+namespaces** (`kernel.apparmor_restrict_unprivileged_userns=1`), not a defect in the code. WSL permits it,
+which is why the same tests are green locally.
+
+**The ruling owed — this is an I6 question, which is why I did not just pick one:**
+- **(a) Grant the capability in CI**: one step, `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+  before the gauntlet. Keeps the tests real and the lane meaningful. Cheapest, and my recommendation.
+- **(b) Make a missing sandbox capability INCONCLUSIVE, not FAIL.** The tests currently `expect()` on a
+  capability the environment may not provide, so an absent sandbox renders as a failed assertion. The ontology
+  already ratifies `could_not_run` as an *inconclusive* reason for exactly this shape — "the verifier could not
+  be executed, nothing ran" — and I6 says never coerce. There is a real argument that these tests should
+  detect the capability and report inconclusive rather than fail.
+- (a) and (b) are not exclusive; (b) is the more principled fix and (a) is the one that restores signal today.
+
 ## Named, not closed by this record
 - **`spec/ontology.md` was truth-passed via `/subject`** — the emitter's "NOT wired this session" prose was
   false of the tree. Prose only; nothing minted, renamed, or re-versioned; `SUBJECTS_V0` stays 49. The

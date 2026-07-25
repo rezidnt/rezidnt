@@ -2269,15 +2269,35 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
         .map(|r| &r.gates)
         .cloned()
         .unwrap_or_default();
+    // Every accounting field on the fold is an `Option`, and each key is
+    // emitted ONLY when its own `Option` is `Some` — per-key, not
+    // all-or-nothing. A `null` key would be a present claim of an absent
+    // value: it asserts "we looked and there is nothing" where the truth is
+    // "no value was ever folded" (a run that spawned but never completed
+    // folds none of these). A `0` substitute is the same defect wearing a
+    // different mask — it would let an unaccounted run read as a free one.
+    // This mirrors `Completion::into_fact`'s convention at the emitting end
+    // and the ontology's ratified "absent, not zero" clause at this
+    // reporting end (DR-051 §Decision 5). The unknown-run case below stays
+    // `{}` for the same reason: no run, no claims.
     let cost = graph
         .agent_runs
         .get(run)
         .map(|r| {
-            serde_json::json!({
-                "total_usd": r.total_usd,
-                "input_tokens": r.input_tokens,
-                "output_tokens": r.output_tokens,
-            })
+            let mut cost = serde_json::Map::new();
+            if let Some(total_usd) = r.total_usd {
+                cost.insert("total_usd".to_string(), serde_json::json!(total_usd));
+            }
+            if let Some(input_tokens) = r.input_tokens {
+                cost.insert("input_tokens".to_string(), serde_json::json!(input_tokens));
+            }
+            if let Some(output_tokens) = r.output_tokens {
+                cost.insert(
+                    "output_tokens".to_string(),
+                    serde_json::json!(output_tokens),
+                );
+            }
+            serde_json::Value::Object(cost)
         })
         .unwrap_or_else(|| serde_json::json!({}));
 

@@ -1,0 +1,7 @@
+# Deliberately-red two-crate workspace. Its only job is to make real cargo/libtest emit a real
+# failure roster across more than one crate, so vet-selftest.sh can check vet.sh's parser
+# against the actual instrument instead of a model of it. NOT a member of the repo workspace
+# (root Cargo.toml lists members explicitly), so `cargo test --workspace` never sees it.
+[workspace]
+members = ["alpha", "beta"]
+resolver = "2"

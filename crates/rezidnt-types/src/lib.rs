@@ -4,8 +4,17 @@
 //! additive evolution only). This crate owns all serde derives so a binary
 //! re-encoding is a later drop-in (doc §5).
 //!
-//! S0 oracle note: constructors and wire codecs are `todo!()` stubs. The
-//! failing tests in `tests/envelope.rs` are the implementer's work order.
+//! What the crate carries: the [`Event`] envelope with its constructors
+//! ([`Event::new`], [`Event::from_parts`]) and its JSON Lines wire codec
+//! ([`Event::to_json_line`], [`Event::from_json_line`]); the id newtypes
+//! ([`SourceId`], [`WorkspaceId`], [`Subject`]); the taxonomy v0 subject list
+//! ([`taxonomy`]); content-addressed reference shapes ([`refs`]); and the
+//! schemars-derived MCP tool-argument types ([`mcp`]).
+//!
+//! The I2 payload cap ([`MAX_PAYLOAD_BYTES`]) is structural, not an
+//! entry-point convention: `payload` is a private field and every
+//! deserialization path funnels through the private wire shape, so plain
+//! serde enforces the cap too. Behavior is pinned by the tests in `tests/`.
 
 pub mod mcp;
 pub mod refs;

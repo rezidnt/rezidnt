@@ -35,9 +35,10 @@ Either way you end up with two binaries: `rezidnt` (the CLI you drive) and `rezi
 
 ## 2. Start the daemon
 
-`rezidnt init` will point the daemon at your repo, but it does not start the daemon for you. Bring it up first, in its own terminal, and leave it running:
+`rezidnt init` will point the daemon at your repo, but it does not start the daemon for you. Bring it up first, in its own terminal, and leave it running — starting it **from the root of the repository you want rezidnt to work on**, because the spec `init` generates carries `repo = "."` and the daemon resolves that relative path against its own working directory:
 
 ```bash
+cd /path/to/your-repo
 rezidentd
 ```
 

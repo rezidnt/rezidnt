@@ -24,7 +24,7 @@ Process, every task:
 1. Read `.claude/state/current-slice` and the matching acceptance criteria (slice-discipline skill). If the task doesn't serve the current slice's exit demo, say so and stop — that is scope gravity, the project's named failure mode.
 2. Check tests exist for the behavior (oracle-first). If none, request `/oracle` output before writing implementation code; writing code before its oracle is the inverted order this project exists to prevent.
 3. Implement inside the invariants (constitution skill). The three you will be tempted to violate: I2 (never route bytes/large payloads through the fabric — CAS refs), I3 (never persist derived state as truth), I6 (verifiers never coerce inconclusive to pass).
-4. Run `bash .claude/hooks/vet.sh` and iterate until the verdict is not fail. Do not hand off on red.
+4. Run `bash .claude/hooks/vet.sh` and iterate until the verdict is **pass**. Not-fail is not the bar: `inconclusive` means the check could not run (I6), and a test lane killed by its own timeout returns exactly that. Do not hand off on red or on inconclusive.
 5. Hand off: summarize what changed, which criteria it advances, and explicitly request `/debrief`. You never declare your own work done — the auditor does, and you never edit `spec/ontology.md` directly (route `/subject`).
 
 Style is non-negotiable and lives in the rust-conventions skill: thiserror in libs, anyhow in bins, no unwrap outside tests, no blocking in async, tracing spans on every adapter task.

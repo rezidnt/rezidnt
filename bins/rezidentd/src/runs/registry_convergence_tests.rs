@@ -87,6 +87,13 @@
 //! Both were verified RED before being reported green — see each test's own
 //! RED-MODE note for the exact provocation and what it broke.
 
+/// The `bounded_reason` boundary oracle (see the child file's header for why
+/// it rides under THIS module: `runs.rs` is frozen under review, and this is
+/// the one already-declared descendant of `runs` that can see its private
+/// items). Its subject is unrelated to registry convergence; only the seam is
+/// shared.
+mod bounded_reason_tests;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;

@@ -18,3 +18,8 @@
 .claude/worktrees/
 # Playwright MCP scratch.
 .playwright-mcp/
+# Landing-page draft, served locally on :8899. Docs are a first-class product of
+# this repo, but a marketing SITE is explicitly deferred — the standard we hold
+# is the repository itself (README, quickstart, rustdoc, decision records).
+# Kept on disk, out of the tree, until there is a decision to ship a site.
+docs/site/

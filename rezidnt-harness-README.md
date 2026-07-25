@@ -10,7 +10,7 @@ across sessions instead of living in your head.
 ## Install (Claude Code)
 Drop the `.claude/` directory and `CLAUDE.md` at the root of the rezidnt repo. Also copy
 `docs/rezidnt-architecture.md` into `docs/` — the skills reference it as canonical. Then in Claude Code:
-`/slice` should print the current slice (S0) and its acceptance criteria.
+`/slice` should print the current slice and its acceptance criteria.
 
 ## The team (agents)
 | Agent | Role | Access | Why it exists |
@@ -29,7 +29,10 @@ Drop the `.claude/` directory and `CLAUDE.md` at the root of the rezidnt repo. A
    (implementer builds to green, inside I1–I8)
 /vet                   # fmt + clippy -D + tests + fixture replay → pass|fail|inconclusive
 /debrief               # auditor renders a verdict on the diff
+/gauntlet              # the done gate: /vet ∥ /debrief, run concurrently
    (fix findings, or advance the slice)
+/lanes                 # parallel-lane build across disjoint work items
+/pickup                # resume from the last session's handoff
 /subject <name>        # warden-gated ontology change
 /intel <question>      # analyst files a competitor memo (DR-002)
 /dr <decision>         # scribe drafts a decision record for any BINDING change
@@ -51,9 +54,10 @@ confirmed to block what must block and pass what must pass.
 `prior-art-protocol` (DR-002 mechanics) · `slice-discipline` (roadmap + per-slice acceptance criteria).
 
 ## First session
-1. Clear the one thing the harness can't do for you: register the name across crates.io/npm/domains
-   (`rezident` is the fallback string).
-2. `/slice` → `/oracle fabric` → build S0 to green → `/vet` → `/debrief`.
+1. Nothing to clear first — the name is settled and in use: the `v0.0.1` pre-release ships `rezidnt` +
+   `rezidentd` through the checksum-gated installer (DR-037). Registry and domain claims (crates.io, npm,
+   the `rezidnt.dev` vanity URL) are still open, but none of them block a session.
+2. `/slice` → `/oracle <component>` → build that slice to green → `/vet` → `/debrief`.
 3. `/handoff` before you stop.
 
 ## Maintenance

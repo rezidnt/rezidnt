@@ -90,7 +90,7 @@ rezidnt/
   install.sh               checksum-gated curl | sh installer (DR-037)
   bins/
     rezidentd/             the daemon — fabric, log, gate + permit engines, socket
-    rezidnt/               the CLI (auto-spawns the daemon on first use)
+    rezidnt/               the CLI — a socket client; start `rezidentd` yourself
   crates/
     rezidnt-types/         event envelope, subjects, id newtypes
     rezidnt-fabric/        append-only SQLite log, blake3 chain, broadcast, replay
@@ -110,7 +110,7 @@ rezidnt/
     fixtures/              golden event-log replay fixtures
   docs/
     rezidnt-architecture.md   canonical design plan (§20 indexes the decisions)
-    decisions/                one file per decision record (DR-001..046)
+    decisions/                one file per decision record (indexed by §20)
     design/                   design sketches that precede the larger decisions
     quickstart.md             cold machine to first gated run
     s3-demo-runsheet.md       Phase-1 exit demo run-sheet
@@ -165,8 +165,20 @@ Linux and WSL2, `x86_64`. The script verifies the published sha256 before it ins
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rezidnt/rezidnt/main/install.sh | sh
-rezidnt init                 # doctor → spec → first gated run
+export PATH="$HOME/.local/bin:$PATH"   # the installer's default dir; it only warns if unset
+cd /path/to/your-repo                  # the DAEMON resolves the spec's repo = "." against its own cwd
+rezidentd &                            # so start it from the repo root, and leave it running
+rezidnt init                           # doctor → spec → first gated run
 ```
+
+The installer places two binaries: `rezidentd` (the daemon) and `rezidnt` (the CLI), in `~/.local/bin`
+unless you set `REZIDNT_INSTALL_DIR`. The CLI is only a client of the daemon's socket and never starts
+it, so a missing daemon is what `rezidnt init` reports, exiting `4` (daemon-unreachable). Of the
+preflight checks, only `git` missing from `PATH` stops `init` outright on a default machine (exit `3`);
+the harness and socket-path checks report `inconclusive` there, as does the WSL check unless you are
+on a WSL2 kernel, and `init` prints those as warnings and proceeds past — never coerced to a pass (I6). `rezidnt doctor` treats *any* non-pass as
+exit `3`, so it can exit non-zero on a perfectly healthy machine. `init` also prompts for the spec
+fields on stdin unless you pass `--defaults`.
 
 Walkthrough: [docs/quickstart.md](docs/quickstart.md). macOS and native-Windows artifacts are deferred (DR-037) — build from source there.
 
@@ -213,7 +225,7 @@ Sequencing law: **fabric → gates → terminal.** Any pressure to reorder gets 
 ## Documentation
 
 - **[docs/rezidnt-architecture.md](docs/rezidnt-architecture.md)** — the canonical design plan: invariants, topology, the fabric and gate engine, the phased roadmap, and (§20) the index to the decision records. Everything else is its distillation.
-- **[docs/decisions/](docs/decisions/)** — the decision records (DR-001..046), one per file: the dated, append-only amendments to the plan. A plan section marked "amended by DR-0NN" defers to its record. Each carries its strongest counterargument verbatim.
+- **[docs/decisions/](docs/decisions/)** — the decision records, one per file, indexed by [architecture §20](docs/rezidnt-architecture.md): the dated, append-only amendments to the plan. A plan section marked "amended by DR-0NN" defers to its record. Each carries its strongest counterargument verbatim.
 - **[spec/ontology.md](spec/ontology.md)** — the subject taxonomy; treated as the crown-jewel IP and versioned like code.
 - **[docs/quickstart.md](docs/quickstart.md)** — cold machine to first gated run.
 - **[docs/s3-demo-runsheet.md](docs/s3-demo-runsheet.md)** — the Phase-1 exit demo run-sheet (one-take recorded golden-path walkthrough).

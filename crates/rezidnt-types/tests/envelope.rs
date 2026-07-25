@@ -1,8 +1,9 @@
 //! S0 oracle — envelope criteria (doc §5, I2).
 //!
-//! Every test here MUST fail until the S0 implementation lands (the
-//! constructors and wire codec are `todo!()` stubs). A test that passes
-//! before implementation exists tests nothing.
+//! Written as failing tests before the constructors and wire codec existed —
+//! a test that passes before its implementation tests nothing. S0 has since
+//! landed, so these are green and now serve as the envelope's regression
+//! guard: the criteria they encode are unchanged.
 
 use std::path::PathBuf;
 

@@ -2,19 +2,27 @@
 //! entity graph (CQRS-lite, doc §6). I3: the log is truth, this is derived —
 //! the whole crate can be deleted and rebuilt from the log.
 //!
-//! ## S0 graph scope (deliberate)
+//! ## Graph scope
 //!
-//! S0 materializes only what the *envelope itself* provides plus the
-//! `workspace.*` lifecycle; payload-schema-driven entities (worktrees, agent
-//! runs, dossiers) arrive with their slices (S1/S2) as additive fields. The
-//! S0 reducer semantics pinned by the oracle tests and golden fixtures:
+//! Every event advances the envelope-level counters (`events_folded`,
+//! `last_event`, `counts_by_subject`). On top of that, [`apply`] folds the
+//! `workspace.*`, `worktree.*`, `agent.*`, `diff.*`, `gate.*`, `permit.*`,
+//! `egress.*`, `credential.*`, `integrity.alarm`, `run.intent.declared` and
+//! `action.metered` subjects into the three keyed maps [`Graph::workspaces`],
+//! [`Graph::worktrees`] and [`Graph::agent_runs`]. Dossier-level accounting —
+//! gate verdicts, the permit ledger, delegation edges, egress posture, spend
+//! and risk — hangs off [`AgentRunState`] rather than a separate entity. Each
+//! reducer arm documents its own semantics on the type it folds into; the
+//! oracle tests and golden fixtures in `tests/` and `spec/fixtures/` pin them.
 //!
-//! - every event: `events_folded += 1`, `last_event = Some(event.id)`,
-//!   `counts_by_subject[subject] += 1`;
-//! - `workspace.opened` with an envelope workspace id: status → `Open`;
-//! - `workspace.closed` with an envelope workspace id: status → `Closed`
-//!   (inserted even if never opened — the log is truth);
-//! - every other subject: counters only.
+//! Still out of scope, deliberately: the doc §6 `Project` and `Session`
+//! entities and the `GateDef` / `VerifierDef` / `Artifact` / `AdapterHealth`
+//! classes have no reducer here — they arrive as additive fields when a slice
+//! needs them. A subject with no arm, or a payload missing the key an arm
+//! reads, folds as counters only: reducers never choke and never guess (I3).
+//!
+//! Read-only projections over the folded graph live beside the reducer:
+//! [`project`] (the board view), [`escalations`] and [`orchestration_graph`].
 
 use std::collections::BTreeMap;
 
@@ -29,9 +37,7 @@ pub enum WorkspaceStatus {
     Closed,
 }
 
-/// One gate's recorded verdict state on a run (S4 — the ORACLE SCAFFOLD:
-/// fields exist so the board is assert-red; the reducer arm is implementer
-/// work).
+/// One gate's recorded verdict state on a run (S4).
 ///
 /// S4 reducer semantics (pinned by `tests/s4_gates.rs` and the
 /// `s4_verified_run` / `s4_vet_refusal` golden fixtures; keyed under
@@ -63,18 +69,15 @@ pub struct GateState {
     pub reason: Option<String>,
 }
 
-/// One replay-divergence alarm folded onto a run's dossier (DR-006 — the
-/// ORACLE SCAFFOLD: the type + field exist so `tests/dr006_integrity_alarms.rs`
-/// is assert-red, mirroring the S4 `GateState` scaffold; the reducer arm for
-/// `integrity.alarm` is implementer work).
+/// One replay-divergence alarm folded onto a run's dossier (DR-006).
 ///
 /// DR-006 reducer semantics (pinned by `tests/dr006_integrity_alarms.rs`):
 /// `integrity.alarm` `{run, gate, verifier, recorded, replayed}` folds onto
 /// `AgentRunState::integrity_alarms`, DEDUPED by (gate, verifier) — the log is
 /// append-only and debrief is re-runnable, so duplicate facts collapse to one
 /// queryable record. Deterministic order (by (gate, verifier)) keeps
-/// whole-graph equality stable. Payload shape is an ORACLE PROPOSAL pending
-/// the warden `/subject` for `integrity.alarm` (flagged in the work order);
+/// whole-graph equality stable. The subject is ratified in `spec/ontology.md`
+/// and minted at `v = 1`;
 /// verdicts stay payload-strings (never an enum gate) for the same I3 reason
 /// as gate verdicts — reducers fold every live payload version.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -142,8 +145,8 @@ pub struct EgressPostureState {
 pub struct EgressDenial {
     /// The denied (off-allowlist) destination host.
     pub dest: String,
-    /// The deciding egress policy's CAS hash (`policy_ref.hash`), so
-    /// `gate_explain` can answer WHY denied (I6). `None` if the fact omitted it.
+    /// The deciding egress policy's CAS hash (`policy_ref.hash`). `None` if the
+    /// fact omitted it.
     pub policy_ref: Option<String>,
 }
 
@@ -173,10 +176,9 @@ pub struct CredentialDrop {
 }
 
 /// One entry in a run's permit ledger: an authorization request and, once a
-/// decision lands, its outcome (DR-008/DR-009 — the pre-hoc "may" axis). SP5
-/// REDUCER SCAFFOLD: the type + fields exist so the permit subjects have a
-/// folding consumer (no consumer-less subjects — DR-006 precedent); the
-/// contextual C1/C7 permit-verifiers that *read* this ledger are SP0–SP4.
+/// decision lands, its outcome (DR-008/DR-009 — the pre-hoc "may" axis). This
+/// is the permit subjects' folding consumer (no consumer-less subjects —
+/// DR-006 precedent).
 ///
 /// Reducer semantics (keyed under [`AgentRunState::permit_ledger`] by the
 /// payload `request_id`, so request and decision fold onto the same entry):
@@ -206,8 +208,7 @@ pub struct PermitLedgerEntry {
     /// The decision, once one lands: `"granted" | "denied" | "escalated"`.
     /// `None` while the request is pending (requested but not yet decided).
     pub decision: Option<String>,
-    /// The deciding policy's CAS hash (`policy_ref.hash`), recorded so
-    /// `gate why` / `gate_explain` can resolve the deciding policy (I6). Set
+    /// The deciding policy's CAS hash (`policy_ref.hash`). Set
     /// on the decision fact; `None` while pending.
     pub policy_ref: Option<String>,
     /// Denial / escalation reason, recorded verbatim (`permit.denied.reason`
@@ -281,35 +282,36 @@ pub struct PermitResolution {
     /// `None` = exact request-scoped match (DR-033 behavior). Folded VERBATIM from
     /// the fact; `#[serde(default)]` so a pre-DR-035-grant-all fixture (no `scope`)
     /// parses unchanged and matches exactly as before (additive, rebuild-stable,
-    /// I3). The broadening of `resolution_for`'s match predicate that CONSUMES
-    /// this is implementer scope (NOT folded-into behavior yet): today the field is
-    /// carried inert. COUPLING (DR-035 §Decision 3): a `Some("run_tool")` obligates
+    /// I3). CONSUMED, and it BROADENS matching: `action_matches` treats
+    /// `Some("run_tool")` as matching ANY action, so a grant-all resolution
+    /// widens what `resolution_for` and `expired_resolution_for` return. Any
+    /// other value — and absence — matches the recorded `action` exactly.
+    /// COUPLING (DR-035 §Decision 3): a `Some("run_tool")` obligates
     /// a `Some(ttl_ms)` — but that is enforced at the `resolve_permit` tool
     /// boundary, so a broad-and-permanent resolution can never reach this fold.
     #[serde(default)]
     pub scope: Option<String>,
 }
 
-/// A run's per-session permit accumulators: the running state the *contextual*
-/// (stateful) permit-verifiers read to make C6/C7 decisions — a pure fold over
-/// the log (I3), not held imperatively as Omnigent does (intel memo 001 C6).
-/// SP5 REDUCER SCAFFOLD: fields exist so the accumulator inputs on the permit
-/// decision payloads have a folding consumer; the verifiers that read these
-/// are SP0–SP4.
+/// A run's per-session permit accumulators — a pure fold over the log (I3),
+/// not held imperatively as Omnigent does (intel memo 001 C6). These are the
+/// accumulator inputs the C1 `spend-cap` and C6 `risk-cap` natives read
+/// (`crates/rezidnt-gate/src/lib.rs:888`, `:1031`).
 ///
-/// Reducer semantics: every `permit.granted`/`.denied`/`.escalated` fold adds
-/// the payload's optional `spend_delta_usd` / `risk_delta` (when present) to
-/// the running totals and increments the decision counters. Sized per the
-/// intel-memo C6/C7 note so the payload supports contextual decisions without
-/// a `v+1`.
+/// Reducer semantics: `permit.granted` adds the payload's optional `risk_delta`
+/// and increments `granted`; `permit.denied` / `.escalated` increment their own
+/// counters and nothing else (DR-024 Q3 — only an action that actually ran
+/// contributes running risk). No permit decision folds spend at all:
+/// `spend_delta_usd` was retired from this path by DR-021 B2, and
+/// `cumulative_spend_usd` folds solely from `action.metered`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PermitAccumulators {
-    /// Running cumulative spend charged to this run's granted/denied actions
-    /// (`sum(spend_delta_usd)`); read by the C1 spend-cap verifiers.
+    /// Running cumulative spend for this run:
+    /// `sum(action.metered.spend_delta_usd)`.
     #[serde(default)]
     pub cumulative_spend_usd: f64,
-    /// Running per-session risk score (`sum(risk_delta)`); read by the C6
-    /// contextual policy.
+    /// Running per-session risk score: `sum(risk_delta)` over GRANTED
+    /// decisions only (DR-024 Q3).
     #[serde(default)]
     pub risk_score: f64,
     /// Count of decisions folded, by outcome — cheap contextual signal
@@ -324,10 +326,10 @@ pub struct PermitAccumulators {
 
 /// A run's declared intent — the initiating task + the intent-scoped tool set
 /// the `intent-lock` permit-verifier enforces (DR-010; the run-intent axis).
-/// SP-intent REDUCER SCAFFOLD: the type + field exist so `run.intent.declared`
-/// has a folding consumer (no consumer-less subjects — DR-006 precedent); the
-/// `intent-lock` verifier that *reads* this pinned state is the NEXT slice
-/// (SP-intent, oracle-first — NOT built here).
+/// The folding consumer for `run.intent.declared` (no consumer-less subjects
+/// — DR-006 precedent). The `intent-lock` verifier that *reads* this pinned
+/// state is built (DR-010 C7; `rezidnt-gate`, pinned by
+/// `crates/rezidnt-gate/tests/intent_lock_native.rs`).
 ///
 /// Reducer semantics (folded onto [`AgentRunState::intent`], keyed by the
 /// payload `run`, last write wins):
@@ -347,14 +349,14 @@ pub struct IntentState {
     pub allowed_tools: Vec<String>,
     /// blake3 hex of the initiating task/prompt text persisted to the CAS
     /// (`intent_ref.hash`) — a ref, never inline bytes (I2). The interrogable
-    /// "what was this run for" `gate_explain` names alongside the off-task tool.
+    /// "what was this run for" record.
     pub intent_ref: Option<String>,
 }
 
 /// One agent run's derived state (S1: the dossier's accounting seed).
 ///
 /// S1 reducer semantics (pinned by `tests/s1_agent_runs.rs` and the
-/// `s1_agent_run` golden fixture; payload schemas pending warden ratification):
+/// `s1_agent_run` golden fixture; payload schemas ratified in `spec/ontology.md`):
 /// - `agent.spawned` `{run, ...}` → insert with `status = "spawning"`;
 /// - `agent.status.changed` `{run, from, to}` → `status = to`;
 /// - `agent.completed` `{run, status, cost{total_usd,input_tokens,
@@ -378,48 +380,47 @@ pub struct AgentRunState {
     #[serde(default)]
     pub gates: BTreeMap<String, GateState>,
     /// DR-006: replay-divergence alarms on this run (see
-    /// [`IntegrityAlarmRecord`]). ORACLE SCAFFOLD — field present so the
-    /// DR-006 board is assert-red; the `integrity.alarm` reducer arm is
-    /// implementer work. `#[serde(default)]` keeps every pre-DR-006 golden
+    /// [`IntegrityAlarmRecord`]). `#[serde(default)]` keeps every pre-DR-006 golden
     /// fixture parsing (and comparing equal) unedited. Deduped by
     /// (gate, verifier), deterministic order.
     #[serde(default)]
     pub integrity_alarms: Vec<IntegrityAlarmRecord>,
     /// DR-008/DR-009: this run's permit ledger, keyed by `request_id`
-    /// (request→decision folds onto one entry). SP5 REDUCER SCAFFOLD — the
-    /// permit subjects' folding consumer (no consumer-less subjects, DR-006
+    /// (request→decision folds onto one entry) — the permit subjects' folding
+    /// consumer (no consumer-less subjects, DR-006
     /// precedent). `#[serde(default)]` keeps every pre-permit golden fixture
     /// parsing (and comparing equal) unedited. `BTreeMap` for deterministic
     /// whole-graph equality.
     #[serde(default)]
     pub permit_ledger: BTreeMap<String, PermitLedgerEntry>,
     /// DR-008/DR-009: this run's per-session permit accumulators (running
-    /// spend / risk / decision counts) — the state the contextual C1/C7
-    /// permit-verifiers read, folded purely from the log (I3). SP5 REDUCER
-    /// SCAFFOLD. `#[serde(default)]` keeps every pre-permit golden fixture
+    /// spend / risk / decision counts) — the state the contextual C1/C6
+    /// permit-verifiers read, folded purely from the log
+    /// (I3). `#[serde(default)]` keeps every pre-permit golden fixture
     /// unedited.
     #[serde(default)]
     pub permit_accumulators: PermitAccumulators,
     /// DR-010: this run's declared intent (see [`IntentState`]) — the pinned
-    /// state the future `intent-lock` permit-verifier reads. SP-intent REDUCER
-    /// SCAFFOLD. `None` until a `run.intent.declared` fact folds. `#[serde(default)]`
+    /// state the `intent-lock` permit-verifier reads.
+    /// `None` until a `run.intent.declared` fact folds. `#[serde(default)]`
     /// keeps every pre-DR-010 golden fixture parsing (and comparing equal)
     /// unedited.
     #[serde(default)]
     pub intent: Option<IntentState>,
     /// DR-014 §Decision 5: this run's PEP enforcement mode, folded from
-    /// `agent.spawned.pep?`. `Some("enforced")` iff the spawn wired the permit
-    /// PEP (the spec declared a `[gates.permit]` gate); `None` = edge-gated-only
+    /// `agent.spawned.pep?`. `Some("enforced")` iff the spawn plan actually
+    /// carried a permit hook config; `None` = edge-gated-only
     /// (no mid-run interception). The value is recorded VERBATIM as a string
     /// (never a bool) so a future degraded/partial mode arrives additively; the
     /// ABSENT case is never synthesized to a truthy value (DR-012 declared-vs-
     /// absent; the honest "no PEP wired"). `#[serde(default)]` keeps every
     /// pre-DR-014 golden fixture parsing (and comparing equal) unedited (I3
-    /// rebuild-stability). Read through [`AgentRunState::pep_enforced`].
+    /// rebuild-stability).
     #[serde(default)]
     pub pep: Option<String>,
     /// DR-016 §Decision 2 (SP4a): this run's RBAC role, folded from
-    /// `agent.spawned.role?` (ontology line 195). `Some(role)` iff the spawn
+    /// `agent.spawned.role?` (the `role?: string` field declaration under
+    /// `agent.spawned` in `spec/ontology.md`). `Some(role)` iff the spawn
     /// carried a role — taken VERBATIM (an opaque string the policy interprets;
     /// rezidnt mints no role vocabulary). `None` = no role declared: ABSENT,
     /// never synthesized to a default like `"contributor"` (DR-012 declared-vs-
@@ -515,8 +516,8 @@ pub struct AgentRunState {
     /// TERM→KILL stop carries no `operator_badge_id`, so this stays `None` —
     /// ABSENCE is the honest representation, NEVER synthesized to a sentinel
     /// (DR-012 declared-vs-absent). This is the interrogable "a human killed this
-    /// run" record `debrief` / `gate_explain` reads, DISTINCT from a
-    /// daemon-timeout stop (I6). `#[serde(default)]` keeps every pre-DR-032 golden
+    /// run" record, DISTINCT from a daemon-timeout stop
+    /// (I6). `#[serde(default)]` keeps every pre-DR-032 golden
     /// fixture parsing (and comparing equal) unedited — I3 rebuild-stability.
     #[serde(default)]
     pub killed_by: Option<String>,
@@ -561,7 +562,7 @@ impl AgentRunState {
     /// Whether this run was mid-run-PEP-enforced — `true` iff the spawn folded
     /// `pep == "enforced"` (DR-014 §Decision 5). ABSENCE folds `false`: a run
     /// with no `pep` on its spawn is edge-gated-only, NEVER synthesized to
-    /// enforced (the honesty the `gate_explain` distinction rests on, I4).
+    /// enforced.
     pub fn pep_enforced(&self) -> bool {
         self.pep.as_deref() == Some("enforced")
     }
@@ -687,8 +688,7 @@ impl AgentRunState {
 ///   on the entry keyed by `worktree`.
 ///
 /// S4 addition (pinned by `tests/s4_gates.rs` and the `s4_verified_run`
-/// fixture; payload shape PENDING warden ratification — `diff.merged` is a
-/// proposed subject, flagged in the S4 work order):
+/// fixture; `diff.merged` is ratified in `spec/ontology.md` at `v = 1`):
 /// - `diff.merged` `{run, worktree, diff: CasRef}` → `outcome =
 ///   Some("merged")` and `last_diff = Some(diff.hash)`, leaving `lifecycle`
 ///   alone (inserted even if never allocated — the log is truth, I3). A merged
@@ -853,7 +853,7 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         // (mirroring the `pep`/`role` optional-field fold above). A DAEMON stop
         // (reaper TERM→KILL) carries NEITHER, so both stay `None` — ABSENCE is
         // the honest representation, NEVER synthesized to a sentinel (DR-012;
-        // the daemon-vs-operator distinction `debrief` reads, I6). This arm does
+        // the daemon-vs-operator distinction, I6). This arm does
         // NOT touch `status` — the signaled run-status transition rides
         // `agent.status.changed`, untouched here. A keyless fact folds
         // counters-only (never guesses a key, I3). `#[serde(default)]` on the
@@ -1027,13 +1027,16 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             // gate that runs with an exec cwd AFTER a merge would overwrite
             // `"merged"` with `"failed"` on a tree that did in fact merge.
             //
-            // No guard is placed here, deliberately. `spec/ontology.md:330`
-            // declares `worktree?` present IFF the gate executed against an
+            // No guard is placed here, deliberately. The `worktree?` field
+            // declaration under `gate.failed` in `spec/ontology.md`
+            // declares it present IFF the gate executed against an
             // allocated tree, and names `pre_merge` only as the golden-path
             // case — so a fold that accepted the field from one gate name and
             // dropped it from every other would be narrowing the taxonomy from
-            // the reducer, which is the wrong end of I3. The taxonomy is where
-            // that ruling belongs.
+            // the reducer, which is the wrong end of I3. The taxonomy HAS
+            // ruled: the DR-052 §Decision 4 entry in `spec/ontology.md`
+            // (owner-ratified 2026-07-25) settles `outcome` as latest-write
+            // and cites this reducer range back.
             //
             // Today the exposure is unreachable on the golden path: `pre_merge`
             // is the only gate given a worktree cwd, the release follows the
@@ -1108,8 +1111,8 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         // one ledger entry). A payload without `run`/`request_id` folds as
         // counters-only — reducers never choke, never guess a key (I3). The
         // decision facts also accumulate per-session running state (spend/risk)
-        // that the contextual C1/C7 verifiers read (SP0–SP4 work; this is the
-        // fold that feeds them).
+        // that the contextual C1/C6 verifiers read (this is the fold that
+        // feeds them).
         "permit.requested" => {
             if let Some(run) = payload_run(event)
                 && let Some(request_id) = payload_request_id(event)
@@ -1187,7 +1190,7 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             }
         }
         // DR-010 run-intent reducer (the run-intent axis). Keyed by the payload
-        // `run`; folds onto `AgentRunState::intent` the pinned state the future
+        // `run`; folds onto `AgentRunState::intent` the pinned state the
         // `intent-lock` verifier reads. A payload without `run` folds as
         // counters-only — the reducer never guesses a key, never chokes (I3,
         // the permit-reducer discipline). The enforced set is the DECLARED list
@@ -1363,8 +1366,7 @@ fn apply_permit_decision(graph: &mut Graph, event: &Event, decision: &str) {
     entry.policy_ref = payload["policy_ref"]["hash"].as_str().map(String::from);
     entry.reason = payload["reason"].as_str().map(String::from);
 
-    // Accumulators: fold the optional per-session deltas + decision counters,
-    // the state the contextual permit-verifiers read (C1/C6/C7).
+    // Accumulators: fold the optional per-session deltas + decision counters.
     let acc = &mut state.permit_accumulators;
     // DR-021 B2 (C1): `spend_delta_usd` is RETIRED as the permit-path fold source;
     // the permit fact now folds ZERO spend. Measured spend rides the post-action
@@ -1803,7 +1805,8 @@ pub struct OrchestrationView {
 /// It used to be `lead.delegations[].child_badge_id == sub.badge_id`. That read
 /// a `permit.delegated` fact as a fan-out, but that subject's ratified semantics
 /// are ATTENUATION, and a fan-out attenuates nothing — the sub's badge is a
-/// fresh mint over the SUB's own run (`bins/rezidentd/src/runs.rs:802`). The
+/// fresh mint over the SUB's own run (the `Macaroon::mint` call in
+/// `bins/rezidentd/src/runs.rs`). The
 /// lead-parented emit was WITHDRAWN (DR-046 §Decision 4) and replaced by a field
 /// on the sub's own spawn fact, so this projection no longer reads
 /// `delegations` at all. Two structural consequences worth stating:
@@ -1874,8 +1877,10 @@ pub fn orchestration_graph(graph: &Graph) -> OrchestrationView {
     // actually minted — the same posture the badge match had, where a lead had
     // to be in `agent_runs` to carry any delegation at all. A sub naming a lead
     // this log never spawned therefore surfaces no row; the daemon's `fan_out`
-    // door already refuses a badge that folds to no spawned run
-    // (`bins/rezidentd/src/mcp.rs:307`), so that shape is malformed-log-only.
+    // door already refuses a badge that folds to no spawned run (the
+    // `codes::RUN_UNKNOWN` refusal in `fan_out`, not the one in `kill_run`),
+    // so that
+    // shape is malformed-log-only.
     let mut leads = Vec::new();
     for lead_run in graph.agent_runs.keys() {
         // Groups are non-empty by construction, so a present group IS a fan-out.

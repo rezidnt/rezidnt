@@ -20,7 +20,9 @@ use rezidnt_fabric::Fabric;
 use rezidnt_gate::Verdict;
 use rezidnt_gate::permit::PermitVerifierSpec;
 use rezidnt_run::RunId;
-use rezidnt_run::adapter::{ClaudeCodeAdapter, MESSAGE_INLINE_CAP, MappedFact};
+use rezidnt_run::adapter::{
+    AdapterError, ClaudeCodeAdapter, ERROR_MESSAGE_CAP, MESSAGE_INLINE_CAP, MappedFact,
+};
 use rezidnt_run::badge::{Caveat, Macaroon, RootKey};
 use rezidnt_run::capture::{DEFAULT_CHUNK_BYTES, DEFAULT_RING_BYTES, RingBuffer, chunk_into_cas};
 use rezidnt_run::compose::{ComposedChild, ComposedDegrade, compose_degrade, degrade_fact};
@@ -1098,8 +1100,12 @@ pub async fn launch_agent(
         .unwrap_or(&base_badge);
     let badge_wire = injected_badge.to_wire();
 
-    let pep_enforced = agent.gates.iter().any(|g| g == "permit");
-    let plan = if pep_enforced {
+    // The spec's REQUEST to be governed. This selects the PEP-WIRING PLAN
+    // CONSTRUCTOR and nothing else — it is deliberately NOT the signal the
+    // `pep` stamp is keyed on (DR-050 §Decision 2(a); see `pep_enforced`
+    // below, which reads the plan the constructor actually produced).
+    let gates_declare_permit = agent.gates.iter().any(|g| g == "permit");
+    let plan = if gates_declare_permit {
         let socket = rezidnt_proto::socket_path();
         SpawnPlan::for_claude_code_permit(
             agent,
@@ -1111,6 +1117,16 @@ pub async fn launch_agent(
     } else {
         SpawnPlan::for_claude_code(agent, &badge_wire, std::env::vars())
     };
+    // DR-050 §Decision 2(a): whether the PEP was actually WIRED at spawn, read
+    // from the PLAN — the only thing that knows. The gates list above is the
+    // spec's REQUEST to be governed; the two coincide for claude-code by
+    // construction (the request selects the wiring constructor), which is
+    // exactly what hid the mis-keying: a substrate whose PEP-equivalent is not
+    // gate-name-shaped could log itself `pep = "enforced"` while running
+    // un-intercepted. `SpawnPlan::for_codex` refuses a declared `[gates.permit]`
+    // for this reason — the crate closed the trap from its side; this closes it
+    // from the daemon's.
+    let pep_enforced = plan.permit_hook_config().is_some();
     // Write the PreToolUse hook settings into the worktree so claude-code loads
     // them (design §3(2)). Best-effort surface: a settings-write failure must
     // not silently drop enforcement, so it is a hard error here.
@@ -1277,11 +1293,13 @@ pub async fn launch_agent(
         }
     }
     // DR-014 §Decision 5 / ontology `agent.spawned.pep?`: record `pep:
-    // "enforced"` iff the permit PEP was wired at spawn (the agent declared a
-    // `[gates.permit]` gate), so `gate_explain` distinguishes a
-    // mid-run-PEP-enforced run from an edge-gated-only one (I4). ABSENT when no
-    // PEP was wired — never synthesized to `false`/`"unenforced"` (DR-012
-    // declared-vs-absent discipline; absence is the honest "no PEP wired").
+    // "enforced"` iff the permit PEP was WIRED at spawn — keyed on the plan
+    // (DR-050 §Decision 2(a)), never on the spec's gates list, so the stamp
+    // claims what was enforced rather than what was asked for. `gate_explain`
+    // then distinguishes a mid-run-PEP-enforced run from an edge-gated-only one
+    // (I4). ABSENT when no PEP was wired — never synthesized to
+    // `false`/`"unenforced"` (DR-012 declared-vs-absent discipline; absence is
+    // the honest "no PEP wired").
     if pep_enforced && let Some(obj) = spawned_payload.as_object_mut() {
         obj.insert("pep".to_string(), json!("enforced"));
     }
@@ -1737,6 +1755,34 @@ struct PreMergePlan {
     gate: GateSpec,
 }
 
+/// Bound a failure reason to [`ERROR_MESSAGE_CAP`] before it rides a fact.
+///
+/// The reason is harness-controlled text with no promised length, and the
+/// fabric REFUSES an oversized payload (I2) — unbounded, the honest failure
+/// fact would become unpublishable at exactly the sizes it exists to carry.
+///
+/// Semantics match `spec/ontology.md`'s `agent.completed.error?` clause and the
+/// adapter crate's private `elide`, which enforces the same bound for every
+/// substrate rendering through `Completion::into_fact`: text within the cap
+/// rides VERBATIM and unmarked; longer text is cut at the last char boundary at
+/// or below the cap and a single `…` is appended, so truncation is never
+/// silent. The daemon's fallback is not a substrate rendering and so cannot go
+/// through that builder (the type is crate-private), which is why the bound is
+/// restated here rather than called — the cap CONSTANT is shared, so the two
+/// sites cannot disagree about the number.
+fn bounded_reason(mut text: String) -> String {
+    if text.len() <= ERROR_MESSAGE_CAP {
+        return text;
+    }
+    let mut cut = ERROR_MESSAGE_CAP;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push('…');
+    text
+}
+
 /// Read the child's stream-json stdout to EOF: every byte into the capture
 /// (ring + live attach + full-stream accumulator), every line through the
 /// adapter onto the fabric. On exit: a failure-shaped completion if the
@@ -1750,6 +1796,14 @@ async fn drive_run(
 ) -> anyhow::Result<()> {
     let mut adapter = ClaudeCodeAdapter::new(ctx.run);
     let mut completed_id: Option<Ulid> = None;
+    // The last non-empty line the child emitted, whatever it was. When the
+    // child dies without a result line the fallback below carries this
+    // VERBATIM as the run's failure reason — it is the only reason-bearing
+    // text the daemon has, and it is harness-authored (DR-051 §Decision 4;
+    // §Context finding 3 named it "discarded, not carried").
+    let mut last_line: Option<String> = None;
+    // Set once the adapter REFUSES the stream (see the error arm below).
+    let mut contract_violation: Option<String> = None;
 
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -1768,12 +1822,45 @@ async fn drive_run(
         if line.trim().is_empty() {
             continue;
         }
+        last_line = Some(line.clone());
+
+        // Once the adapter has refused the stream, keep DRAINING stdout into
+        // the capture — the bytes stay evidence, and an unread pipe would
+        // block the child and hang the reap below — but stop MAPPING: every
+        // later fact would rest on the premise the adapter just refused (I3).
+        if contract_violation.is_some() {
+            continue;
+        }
         let facts = match adapter.map_line(&line) {
             Ok(facts) => facts,
             Err(e) => {
-                // A harness emitting a garbage line must not kill the run;
-                // the byte stream already captured the evidence verbatim.
-                tracing::warn!(error = %e, "unmappable stream line tolerated");
+                // DR-050 §Decision 2(b): the two adapter failures are
+                // categorically different and must not share one arm.
+                //
+                // `ContractViolated` is the adapter saying the contract its
+                // facts REST ON is false — refusing rather than logging a fact
+                // the stream does not support (I3). Whispering that through the
+                // garbage-line branch would let the daemon keep folding facts
+                // off a stream whose premise the substrate just withdrew. It
+                // surfaces instead as a fact-worthy failure: the run stops
+                // mapping and terminates through the failure-shaped completion
+                // below, carrying this refusal as its reason.
+                //
+                // Every OTHER adapter error stays tolerated. "A harness
+                // emitting a garbage line must not kill the run" is deliberate
+                // design, not an oversight — the byte stream already captured
+                // the evidence verbatim (pinned by
+                // `tests/dr050_badline_tolerated_e2e.rs`).
+                if matches!(e, AdapterError::ContractViolated { .. }) {
+                    tracing::error!(
+                        error = %e,
+                        "adapter refused the stream: recorded contract violated; \
+                         no further facts will be mapped from this run"
+                    );
+                    contract_violation = Some(e.to_string());
+                } else {
+                    tracing::warn!(error = %e, "unmappable stream line tolerated");
+                }
                 continue;
             }
         };
@@ -1801,18 +1888,50 @@ async fn drive_run(
     let status = child.wait().await.context("reap child")?;
     tracing::debug!(?status, "harness exited");
 
-    // Failure-shaped completion when the child died without a result line —
-    // the run always terminates on the fabric (accounting zeroed honestly).
+    // Failure-shaped completion when the child died without a result line — the
+    // run always terminates on the fabric.
+    //
+    // The shape is pinned CROSS-CRATE against `Completion::into_fact`'s FAILURE
+    // rendering (DR-050 §Decision 2(c) as sharpened by DR-051 §Decision 4) by
+    // `tests/dr051_fallback_completion_fidelity_e2e.rs`, so this literal and the
+    // adapter crate's single completion builder cannot drift apart again.
+    //
+    // ACCOUNTING IS ABSENT, NOT ZEROED. This arm fires precisely when the
+    // harness reported no result line, so it reported no token accounting
+    // either — and the ontology's `agent.completed` v1 cost bullet ratifies "a
+    // failed candidate's cost is ABSENT, not zero": the token keys are OMITTED
+    // together. A `0` would be a present claim of a measurement that never
+    // happened, and a zero-token failure reads as a FREE run on the DR-048
+    // slice-C leaderboard. `total_usd` stays present as the honest zero-default
+    // the same bullet requires of it. (The literal here previously zeroed all
+    // three — DR-051 §Context finding 3.)
+    //
+    // THE REASON IS CARRIED, NOT DISCARDED. `error.message` is the adapter's
+    // refusal text when the substrate withdrew the stream's premise above,
+    // otherwise the child's last stream line VERBATIM — harness-authored text,
+    // kept opaque and merely length-bounded, exactly as the ontology's
+    // `error?` clause describes the field. ABSENT when the child died silently
+    // with neither: a failure whose harness gave no reason omits the key rather
+    // than synthesizing one (DR-012 declared-vs-absent).
     if completed_id.is_none() {
         let mut payload = json!({
             "run": ctx.run,
             "status": "error",
-            "cost": {"total_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+            "cost": {"total_usd": 0.0},
             "num_turns": 0,
             "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         });
         if let (Some(session), Some(obj)) = (adapter.session_id(), payload.as_object_mut()) {
             obj.insert("session_id".to_string(), json!(session));
+        }
+        // The refusal wins over the last line: when the adapter withdrew the
+        // contract, THAT is why this run has no completion of its own.
+        let reason = contract_violation.or(last_line);
+        if let (Some(reason), Some(obj)) = (reason, payload.as_object_mut()) {
+            obj.insert(
+                "error".to_string(),
+                json!({ "message": bounded_reason(reason) }),
+            );
         }
         let event = Event::new(
             SourceId::new("rezidnt-run"),

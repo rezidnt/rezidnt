@@ -1,0 +1,455 @@
+name: ci
+
+# The definition of done, enforced by a machine.
+#
+# CONTRIBUTING.md §"How changes land" says done means the verifier gauntlet
+# (`bash .claude/hooks/vet.sh`) passes. Until this file existed that was a
+# documented process with nothing behind it. This workflow INVOKES that script —
+# it does not carry its own copy of the fmt/clippy/test/fixture sequence. If CI
+# ever grows a second implementation of the gate, the two drift and "done"
+# becomes ambiguous; every change to what the gauntlet checks belongs in
+# `.claude/hooks/vet.sh`, and lands here for free.
+#
+# Nothing below cites vet.sh by line number. That script is under active
+# remediation and its line numbers moved while this file was authored;
+# citations here describe BEHAVIOR, which is the part that is stable.
+#
+# ## Why a two-OS matrix, and why NEITHER leg is a superset of the other
+#
+# The platform split is real but it is TWO-DIRECTIONAL, and getting the
+# direction right matters more than the conclusion — a maintainer who believes
+# Windows is a strict subset will eventually delete the Windows leg to save
+# minutes, and take real coverage with it.
+#
+#   Linux-only, invisible to the Windows leg:
+#     56 files carry a crate-root or module-scope `#![cfg(unix)]` — reproduce with
+#       grep -rl '^#!\[cfg(unix)\]' --include='*.rs' crates/ bins/ bench/ | wc -l
+#     They include every `crates/rezidnt-gate` exec-verifier contract suite and
+#     ~30 `bins/rezidentd` e2e suites. On Windows those compile to ZERO tests and
+#     libtest reports `0 passed` — green, having executed nothing.
+#
+#   Windows-only, invisible to the Linux leg:
+#     11 `#[cfg(not(unix))]` arms — reproduce with
+#       grep -rnE '^\s*#\[cfg\(not\(unix\)\)\]' --include='*.rs' crates/ bins/ bench/ | wc -l
+#     in bins/rezidnt/src/main.rs (5), bins/rezidnt/src/permit_hook.rs,
+#     bins/rezidentd/src/main.rs, crates/rezidnt-run/src/{compose,egress}.rs,
+#     bench/harness/src/lib.rs. These are the honest unsupported-platform error
+#     paths. They are COMPILED AND LINTED on this leg and nowhere else. (A plain
+#     `cfg(windows)` grep returns nothing and is the wrong spelling to check —
+#     that mistake is what this paragraph previously got wrong.)
+#
+# A caveat on framing: `#![cfg(unix)]` also sits at MODULE scope in the daemon's
+# own source — `bins/rezidentd/src/{runs,gates,mcp}.rs` — so Windows clippy is
+# linting a substantially hollowed-out daemon. That weakens any claim that
+# windows-latest is "the real gate" and strengthens the actual conclusion:
+# each leg is the only place part of this tree is compiled at all, so
+# `fail-fast: false` and BOTH must be green.
+#
+# Both jobs should be added as REQUIRED status checks in branch protection —
+# otherwise this matrix is advisory and the gate is still unenforced.
+#
+# ## Known fragility, stated rather than papered over
+#
+# There are NO test retries here, deliberately. An auto-retry hides exactly the
+# class of failure this repo is currently working to make diagnosable. The Linux
+# leg is expected to be the slower and more fragile one: the runner is 2 cores,
+# and under core contention the timing-sensitive suites are the likely first
+# flakes — the git adapter's `diff_ready` suite (hard wall-clock assertions
+# against the S2 `diff.ready` <= 1 s criterion) and the `verify_*_cli` e2e suites
+# (which shell out to real `cargo` invocations inside a test). A red from those
+# is a signal about the tests, and the fix belongs in the tests.
+#
+# Tests that need an absent external tool (`bwrap`, `pasta`, the `op` CLI) take
+# this repo's established availability-gate path and SKIP honestly rather than
+# fail, so a stock runner is a valid host for the suite.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read # the gate reads the tree and nothing else
+
+concurrency:
+  # One in-flight gauntlet per ref. Superseded PR pushes are cancelled — the
+  # older run's verdict is about a diff nobody will merge.
+  #
+  # DELIBERATE NARROWING: cancellation is disabled on `main`. Per-ref grouping
+  # would otherwise let a second push to main cancel the first, leaving a commit
+  # on the default branch with no verdict attached. On main every commit gets
+  # its own recorded verdict. Flip this to plain `true` if the owner prefers
+  # speed over a complete main-branch record.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # No `target/` cache is kept (see the cache step), so incremental artifacts are
+  # discarded at job end anyway. Off is faster and removes a stale-incremental
+  # class of failure entirely.
+  CARGO_INCREMENTAL: 0
+  # vet.sh bounds its test lane with `timeout -k 10 ${VET_TEST_TIMEOUT:-1800}`.
+  # Raised for CI because a 2-core runner is materially slower than the owner's
+  # host, and blowing the bound yields an INCONCLUSIVE verdict (correct per I6,
+  # but a chronic one would be noise).
+  #
+  # SCOPE, stated precisely: this bounds the TEST LANE ONLY. `cargo fetch`, fmt,
+  # `clippy --workspace --all-targets`, and the fixture lane are all UNBOUNDED by
+  # the script — and the fixture lane runs through vet.sh's plain `run` helper,
+  # not the instrumented one, while invoking `cargo test` twice more
+  # (scripts/replay-fixtures.sh). So the budget is: 45 min reserved for the test
+  # lane, ~75 min left for everything else on a cold, target-uncached, 2-core
+  # runner. That headroom is what makes 2700 genuinely binding.
+  #
+  # The ordering it buys is REAL BUT PARTIAL, and the limit is worth stating
+  # rather than implying a guarantee this file cannot make:
+  #   - Ordinary slow lane: vet.sh's bound fires, vet.sh emits a diagnosable
+  #     "no verdict" inconclusive with a retained partial log, exits, the tee in
+  #     the gauntlet step sees EOF, and the step ends cleanly. This is the case
+  #     the raised bound is for, and here the script's bound does fire first.
+  #   - LEAKED CHILD (the class vet.sh's own header documents — native
+  #     cargo.exe/rustc.exe descendants not reliably reached by process-group
+  #     signalling). On the TEST lane the orphan inherits the inner pipe into
+  #     vet.sh's own `tee "$VET_LOG"`, not this step's stdout — see the extraction
+  #     comment below. vet.sh's bound releases VET.SH; whether it releases the
+  #     inner tee depends on the group signal reaching it. Measured on the host:
+  #     it does — a piped leak run released in ~7s, so the outer pipe was freed.
+  #     The unbounded case is therefore NARROWER than "always": it is the run
+  #     where the group signal misses the inner tee, and there the step runs to
+  #     `timeout-minutes` and a runner-level kill also leaves the `if: always()`
+  #     upload unproven.
+  #     A second, uninstrumented exposure is worse-shaped: the FIXTURES lane runs
+  #     through vet.sh's plain `run` helper, so its child inherits this step's
+  #     stdout DIRECTLY — no inner tee, no watchdog, no bound — and that child is
+  #     scripts/replay-fixtures.sh, which invokes `cargo test` twice. A leak there
+  #     can also WRITE after the verdict is emitted, displacing it from the last
+  #     line, so an otherwise-green run classifies `absent`. That is a false red,
+  #     not a false green, and the `absent` branch prints the stdout tail so the
+  #     stray output is visible.
+  # Bounding the outer wait is possible — redirect to a file instead of piping,
+  # so an orphan holding the fd cannot block the shell — at the cost of live
+  # streaming on a step that can run 45+ minutes. That tradeoff is left to the
+  # owner rather than taken silently here.
+  VET_TEST_TIMEOUT: 2700
+
+jobs:
+  gauntlet:
+    name: gauntlet (${{ matrix.os }})
+    strategy:
+      fail-fast: false # neither leg may mask the other's result
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120 # see the VET_TEST_TIMEOUT budget note above
+    defaults:
+      run:
+        # `shell: bash` on the Windows runner is Git Bash
+        # (`bash --noprofile --norc -eo pipefail`), which is what vet.sh needs:
+        # it uses `timeout`, `awk`, `tee`, and `date -u`, all present in Git for
+        # Windows' coreutils (verified on the same distribution on the owner's
+        # host). If `timeout` were ever missing, vet.sh degrades its test lane to
+        # uninstrumented rather than lying about a verdict.
+        shell: bash
+
+    steps:
+      # ---- Trap 1: CRLF on the Windows runner -----------------------------
+      # This repo had a repo-wide golden-fixture corruption from CRLF, fixed by
+      # `.gitattributes` (`* text=auto eol=lf`) plus `core.autocrlf=false`.
+      # Golden `.txt`/`.jsonl` fixture replay is one of vet.sh's lanes and the
+      # comparisons are byte-for-byte, so a CRLF checkout is directly in the
+      # blast radius — as is vet.sh itself, since bash chokes on `\r`.
+      #
+      # The reasoning, checked against the file rather than assumed: an explicit
+      # `eol=lf` attribute overrides `core.autocrlf`, and `.gitattributes` line 5
+      # applies `text=auto eol=lf` to `*` with no exceptions, so the attribute
+      # should win even with the Windows runner's `core.autocrlf=true` default.
+      # "Should" is not "does", so this is belt AND braces: config first, then a
+      # whole-tree assertion after checkout that proves it.
+      - name: Pin git line-ending behavior (before checkout)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      # SHA-pinned. Posture inherited from release.yml, which pins its one action
+      # deliberately; no invariant or decision record covers action pinning, so
+      # none is cited here. (An earlier draft of this file cited I8 — I8 is the
+      # clean-room rule about reading AGPL source and says nothing about supply
+      # chain. Citing an invariant that does not say what it is claimed to say is
+      # the same defect class as asserting a mechanism that does not exist.)
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Assert an LF working tree
+        run: |
+          set -eu
+          crlf=$(git ls-files --eol | grep 'w/crlf' || true)
+          if [ -n "$crlf" ]; then
+            echo "::error::CRLF in the working tree — golden-fixture byte comparison and vet.sh itself are unsafe"
+            echo "$crlf"
+            exit 1
+          fi
+          echo "working tree is LF-clean ($(git ls-files | wc -l) tracked files)"
+
+      # ---- Trap 2: the toolchain is pinned --------------------------------
+      # `rust-toolchain.toml` pins channel 1.97.1 with rustfmt/clippy/rust-src,
+      # deliberately: a stale host silently WEAKENS the gate, because lints added
+      # after the pinned version can never fire. The runners ship a preinstalled
+      # rustup, so no third-party toolchain action is needed.
+      #
+      # The install line is best-effort across rustup versions (bare
+      # `rustup toolchain install` reads rust-toolchain.toml on rustup >= 1.28
+      # and errors on older; `rustup show` covers the older path). The
+      # ASSERTION below is what actually carries the weight — if neither form
+      # installed the pin, the version comparison goes red with a clear message
+      # instead of the job quietly building on `stable`.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install || rustup show
+
+      - name: Assert the pin is honored (channel + components)
+        run: |
+          set -eu
+          want=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          got=$(rustc --version | awk '{print $2}')
+          echo "rust-toolchain.toml pins: $want"
+          echo "rustc reports:            $got"
+          if [ "$want" != "$got" ]; then
+            echo "::error::toolchain drift — the pin is $want but this runner is using $got; the gate would be weaker than the owner's host"
+            exit 1
+          fi
+          # The pinned components must be PRESENT, not merely requested: vet.sh's
+          # first two lanes are `cargo fmt` and `cargo clippy`.
+          cargo fmt --version
+          cargo clippy --version
+          src="$(rustc --print sysroot)/lib/rustlib/src/rust"
+          [ -d "$src" ] || { echo "::error::rust-src component missing at $src"; exit 1; }
+
+      # Dependency cache ONLY — the registry index, the downloaded .crate files,
+      # and git checkouts of git dependencies. `target/` is deliberately NOT
+      # cached: cargo's and clippy's fingerprint databases live there, and a
+      # stale one is precisely the artifact that can mask a real failure by
+      # replaying an old lint result instead of re-linting. Restoring a partial
+      # registry cache is safe by contrast — cargo verifies every download's
+      # checksum against the lockfile, so the cache can make the job faster but
+      # cannot make it wronger.
+      #
+      # The key hashes the manifests as well as the lock. `cargo fetch` below is
+      # intentionally not `--locked`, which means it MAY rewrite Cargo.lock if a
+      # manifest has drifted from it — after this key was already computed.
+      # Keying on `**/Cargo.toml` too means that drift invalidates the cache
+      # rather than silently pairing a rewritten lock with a key derived from the
+      # committed one.
+      #
+      # NOT SHA-pinned, unlike the checkout above. Reason stated rather than a
+      # fabricated digest: no digest could be verified offline while authoring
+      # this, and inventing one produces a hard red. Note the real divergence
+      # from release.yml — that workflow uses NO cache or upload actions at all
+      # and states "minimal external-action surface" as its posture, so this file
+      # expands a surface release.yml deliberately kept at zero. The mitigations
+      # are that these are first-party `actions/*` and that this job holds only
+      # `contents: read` with no secrets, unlike release.yml's `contents: write`.
+      # Pinning both to a verified SHA is a follow-up.
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: cargo-deps-${{ matrix.os }}-
+
+      # Downloads only, kept as its own step so a registry outage reads as a
+      # network failure instead of an ambiguous gate failure. Not `--locked`:
+      # that would be a NEW check this repo's gate does not make, which is the
+      # drift this workflow exists to avoid. See the cache-key note above for the
+      # consequence that choice carries.
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      # ---- Trap 3: vet.sh has THREE verdicts, and exit status can diverge --
+      # vet.sh emits `{"verdict":"pass|fail|inconclusive"}` on its last stdout
+      # line. Its exit STATUS does not carry the same information:
+      #
+      #   fail          -> exit 2  (preflight failure; --fast failure; final fail)
+      #   pass          -> exit 0
+      #   inconclusive  -> exit 0  (no Cargo.toml at root; --fast; final gap)  <--
+      #
+      # An INCONCLUSIVE verdict exits ZERO. A job keyed on the exit code alone
+      # would go green on "the check could not run" — a missing Cargo.toml, an
+      # absent fixture-replay script, or a test lane killed by its own timeout
+      # bound with no verdict at all. Per I6 inconclusive is NEVER coerced to
+      # pass, so the success condition below is the VERDICT, with the exit status
+      # kept as a cross-check: a `pass` verdict alongside a nonzero exit is a
+      # contradiction and also fails.
+      #
+      # TWO THINGS HAVE TO BE RIGHT: the parse and the SELECTION.
+      #
+      # Parse: the match is anchored on the object's PREFIX, not a substring
+      # search, so nothing carried inside the `evidence` array can be mistaken
+      # for the verdict. That matters because vet.sh emits a pass that CARRIES
+      # evidence (`{"verdict":"pass","evidence":[{"kind":"note",...}]}`) when a
+      # lane degraded without failing; a prefix match is indifferent to what the
+      # evidence contains, today or after the next change to that script. It is
+      # also robust to a trailing CR on the Windows leg.
+      #
+      # Selection: vet.sh is NOT the only verdict emitter in this pipe. It
+      # invokes `.claude/hooks/preflight.sh` with stdout UN-REDIRECTED, and
+      # preflight prints on success:
+      #
+      #     {"verdict":"pass","evidence":[]}
+      #
+      # byte-identical to vet.sh's own clean pass. That line lands in the log at
+      # the start of EVERY run, before any lane. So "the last verdict-shaped line
+      # anywhere in the stream" is not the same thing as "the gate's word": if
+      # vet.sh terminates after preflight without emitting its own object, that
+      # search finds preflight's pass and reports a GREEN GAUNTLET. The exit
+      # cross-check catches the killed case, but vet.sh exits 0 on inconclusive,
+      # so a lost final line on a zero exit would resolve to pass — a false green
+      # on the default branch, and the `absent` branch below would be unreachable
+      # while claiming to detect exactly that.
+      #
+      # Therefore: classify STRICTLY the last line of stdout. Anything other than
+      # a verdict object in that position means the gate did not finish, which is
+      # what `absent` is for.
+      #
+      # The limit of that, stated rather than overclaimed: vet.sh's verdict object
+      # is the last thing VET.SH writes, which is not the same as the last thing
+      # this PIPE contains, and nothing enforces the ordering. 11 spawn sites
+      # start `rezidentd` with stdout inherited and no redirect — 9 in
+      # crates/rezidnt-testkit/src/lib.rs, plus bins/rezidentd/tests/
+      # init_wrapper_e2e.rs and tail_socket.rs — so every daemon under test holds
+      # an inherited fd. Note what it actually inherits: on the test lane that is
+      # the inner pipe into vet.sh's own `tee "$VET_LOG"`, not this step's stdout,
+      # so those bytes reach this log only transitively and only while that inner
+      # tee lives. An orphan that outlives BOTH tees and writes one byte displaces
+      # the verdict from the last line — a Windows-specific path, since it needs
+      # the emulated process-group kill to miss the inner tee.
+      #
+      # What makes last-line selection correct TODAY is a property of the daemon,
+      # not a guarantee this gate holds: `bins/rezidentd/src` contains zero
+      # `println!`/`print!` and installs no stdout tracing writer, so those
+      # inherited fds are never written to. If the daemon ever prints to stdout,
+      # this classifier needs a stronger channel than "last line" — and the
+      # failure would surface as an unexplained `absent` on a green run.
+      #
+      # `--fast` is not used and must not be: it skips tests and fixtures and is
+      # inconclusive BY DESIGN. CI runs the full gauntlet.
+      - name: Run the gauntlet (bash .claude/hooks/vet.sh)
+        id: vet
+        run: |
+          set -eu
+          mkdir -p target/vet
+          log=target/vet/ci-gauntlet-stdout.log
+
+          # tee keeps the run streaming live in the log view while retaining
+          # stdout for verdict extraction; PIPESTATUS[0] is vet.sh's own status,
+          # never tee's.
+          #
+          # stdout carries vet.sh's lane markers (its `run` helper echoes
+          # `== <lane>`) and, on the TEST lane only, all cargo output — that lane
+          # runs `"$@" 2>&1 | tee`, folding stderr in. The fmt, clippy and fixture
+          # lanes go through the plain `run` helper, which does not redirect, so
+          # THEIR child stderr bypasses this log entirely and never reaches the
+          # uploaded artifact. vet.sh's own diagnostics are three lines (five
+          # `>&2` writes): the no-verdict notice, the failing-test roster, and the
+          # dirty-seed warning. The verdict object is not distinguished by stream;
+          # it is merely LAST. That is the entire basis for the selection below.
+          set +e
+          bash .claude/hooks/vet.sh | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          # STRICTLY the last line — not a search for the last verdict-shaped
+          # line. See the selection note above: preflight emits a byte-identical
+          # pass earlier in this same stream.
+          line=$(tail -n 1 "$log" 2>/dev/null || true)
+          case "$line" in
+            '{"verdict":"pass"'*)         verdict=pass ;;
+            '{"verdict":"fail"'*)         verdict=fail ;;
+            '{"verdict":"inconclusive"'*) verdict=inconclusive ;;
+            *)                            verdict=absent ;;
+          esac
+
+          {
+            echo "### gauntlet: \`$verdict\` on ${{ matrix.os }}"
+            echo
+            echo '```json'
+            echo "${line:-<no verdict object on stdout>}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "verdict=$verdict (vet.sh exit status $status)"
+
+          case "$verdict" in
+            pass)
+              if [ "$status" -ne 0 ]; then
+                echo "::error::contradiction — vet.sh reported pass but exited $status; treating as not-passing"
+                exit 1
+              fi
+              ;;
+            fail)
+              echo "::error::gauntlet FAILED — see the evidence array above and the uploaded vet logs"
+              exit 1
+              ;;
+            inconclusive)
+              # I6: inconclusive is not a pass. It means a lane could not run.
+              echo "::error::gauntlet INCONCLUSIVE — a lane could not run, so no pass verdict exists (I6: never coerced to pass)"
+              exit 1
+              ;;
+            absent)
+              # Reachable and meaningful now that selection is last-line-strict:
+              # it means stdout did not END with a verdict object, whatever else
+              # the stream contained. Print the tail so the cause is visible
+              # without downloading the artifact.
+              echo "::error::vet.sh did not end with a verdict object (exit status $status) — the gate did not complete"
+              echo "-- last 20 lines of gauntlet stdout --"
+              tail -n 20 "$log" 2>/dev/null || echo "(no log)"
+              exit 1
+              ;;
+          esac
+
+      # vet.sh retains a stamped failure log under target/vet/ and warns that
+      # dirty `.proptest-regressions` seeds must be COPIED OUT before teardown —
+      # a CI runner IS teardown, and a proptest seed is the only reproduction
+      # handle for a rare-input property failure. Both are collected here so a
+      # red run stays diagnosable after the runner is gone.
+      #
+      # The seed glob is `**/*.proptest-regressions`, matching proptest's actual
+      # persistence filename `<test>.proptest-regressions` — e.g.
+      # crates/rezidnt-gate/tests/verdict_contract.proptest-regressions. A
+      # leading-dot `**/.proptest-regressions` matches a path component named
+      # exactly that, of which this tree has none, and would upload NOTHING while
+      # reporting success. vet.sh itself uses `'*.proptest-regressions'`; this
+      # now agrees with it.
+      #
+      # (`include-hidden-files` defaults to false in upload-artifact v4, so the
+      # leading-dot spelling would have been excluded twice over.)
+      #
+      # Residual limitation, disclosed as a CHOSEN TRADEOFF rather than an
+      # unavoidable one: `if-no-files-found` is evaluated over the whole path
+      # set, and target/vet/ is always non-empty after a run, so this step can
+      # never warn about the seed glob specifically. Splitting the seeds into
+      # their own step with `if-no-files-found: warn` would not restore the
+      # signal either — this action globs the FILESYSTEM, not `git status`, and
+      # three `*.proptest-regressions` files are committed and present in every
+      # checkout, so the glob always matches and `warn` can never fire in either
+      # direction. Combined paths with `ignore` is therefore the deliberate call,
+      # and correctness rests on the filename match above.
+      #
+      # The corollary, so nobody misreads the artifact: those three committed
+      # seeds ride along on EVERY run, green or red. Their presence is not
+      # evidence that this run produced a new one. vet.sh's own notice (stderr)
+      # fires only on a FAILING test lane and says "dirty, may predate this run"
+      # — it distinguishes dirty-from-committed on a red lane, not fresh-from-
+      # stale, and a green lane returns before emitting it at all.
+      - name: Upload gauntlet evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vet-evidence-${{ matrix.os }}
+          path: |
+            target/vet/
+            **/*.proptest-regressions
+          if-no-files-found: ignore
+          retention-days: 14

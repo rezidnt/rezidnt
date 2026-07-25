@@ -82,9 +82,17 @@
 //! (DR-046 §Decision 8: the daemon publishes its own `worktree.allocated` at
 //! `runs.rs`, so a repoint without silencing one side emits two), because that
 //! needs both emitters in one process. C4's whole-system leg is in
-//! `bins/rezidentd/tests/registry_convergence_e2e.rs` (WSL) with a host-side
-//! structural backstop in `bins/rezidentd/src/registry_convergence_tests.rs`.
-//! Said here so nobody reads the one-fact assertion below as covering it.
+//! `bins/rezidentd/tests/registry_convergence_e2e.rs` (`#[cfg(unix)]`, so WSL
+//! only) with a host-side structural backstop in
+//! `bins/rezidentd/tests/registry_convergence_structure.rs` — a `tests/`
+//! integration board that reads the manifest and `runs.rs` as TEXT, which is
+//! why it runs on the host at all. (Corrected: this paragraph pointed at
+//! `bins/rezidentd/src/registry_convergence_tests.rs`, which does not exist.
+//! The similarly named `bins/rezidentd/src/runs/registry_convergence_tests.rs`
+//! is the WSL-ONLY in-crate board — the daemon's `mod runs` is `#[cfg(unix)]` —
+//! so the old pointer inverted the exact host/WSL distinction this paragraph
+//! draws.) Said here so nobody reads the one-fact assertion below as covering
+//! the whole-system leg.
 
 mod util;
 

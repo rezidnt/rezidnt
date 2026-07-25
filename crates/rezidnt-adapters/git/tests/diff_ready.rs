@@ -9,17 +9,26 @@
 //! With a 250 ms debounce the bound leaves 750 ms of real margin — a miss is
 //! an adapter defect, not CI weather.
 //!
-//! Payload-shape caveat (flagged in the work order): `diff.ready` has no
-//! ratified v1 payload baseline; these tests pin the semantically forced
-//! minimum — the worktree it concerns (`worktree`) and the summary ref
-//! (`diff: CasRef`). Warden ratification via /subject required.
+//! Emitter note (disclosed 2026-07-24, registry-convergence remediation): this
+//! board judges the WATCHER's `diff.ready` — `source` = `SOURCE_ID` — which is
+//! one of TWO emitters of the subject. The daemon mints a second, deterministic
+//! one at `pre_merge` (`bins/rezidentd/src/runs.rs`, `run_pre_merge`); the
+//! split and its ownership guard are documented in the adapter's module header.
+//! Nothing on this board covers that emitter.
+//!
+//! Payload-shape note (CORRECTED 2026-07-24; the same stale-caveat class the
+//! warden ruled on for `worktree_conflict.rs`): `diff.ready` v1 IS ratified —
+//! `{worktree: string, diff: CasRef}`, S2 set, 2026-07-17. What these tests pin
+//! — the worktree it concerns (`worktree`) and the summary ref (`diff: CasRef`)
+//! — is that baseline, not a guess at it; no /subject is owed for it.
 
 mod util;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rezidnt_adapter_git::{GitAdapter, RepoSubstrate, WorktreeReq};
+use rezidnt_adapter_git::{FactSink, GitAdapter, RepoSubstrate, WorktreeReq};
 use rezidnt_cas::Cas;
 use rezidnt_types::refs::CasRef;
 
@@ -166,4 +175,131 @@ async fn diff_summary_is_deterministic_cas_ref() {
         String::from_utf8_lossy(&blob).contains("summed.txt"),
         "the summary names the changed file"
     );
+}
+
+/// A sink that refuses the FIRST `diff.ready` and accepts everything after,
+/// recording every fact it was offered. Stands in for a fabric append that
+/// failed once — the transient case, the one where recovery is meaningful.
+#[derive(Default)]
+struct FlakySink {
+    offered: Mutex<Vec<rezidnt_types::Event>>,
+}
+
+impl FlakySink {
+    /// Hashes of the `diff.ready` facts offered, in order, paired with whether
+    /// this sink accepted them.
+    fn diff_ready(&self) -> Vec<(String, bool)> {
+        self.offered
+            .lock()
+            .expect("sink lock")
+            .iter()
+            .filter(|e| e.subject.as_str() == "diff.ready")
+            .enumerate()
+            .map(|(i, e)| (payload_diff_ref(e).hash, i > 0))
+            .collect()
+    }
+}
+
+impl FactSink for FlakySink {
+    fn emit(&self, event: &rezidnt_types::Event) -> Result<(), rezidnt_adapter_git::GitError> {
+        let mut offered = self.offered.lock().expect("sink lock");
+        let refuse = event.subject.as_str() == "diff.ready"
+            && !offered.iter().any(|e| e.subject.as_str() == "diff.ready");
+        offered.push(event.clone());
+        if refuse {
+            return Err(rezidnt_adapter_git::GitError::Registry(
+                "sink refused the first diff.ready".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A `diff.ready` whose append is REFUSED is re-emitted at the next change —
+/// it is not suppressed as a duplicate of a fact the log never received.
+///
+/// The regression this pins is an ordering one. `debounce_loop` advanced its
+/// suppression hash BEFORE the emit, so a refused append lost that summary
+/// permanently: the next identical summary matched the remembered hash and was
+/// dropped as "an unchanged tree carries no new information" — true of the tree,
+/// false of the log, which had never heard of it. Unlike an allocation there is
+/// no caller to fail here (the debounce loop is detached), so re-emission at the
+/// next change is the ENTIRE recovery, and the module header says so rather than
+/// letting the header's "a sink refusal fails the operation" stand as a claim
+/// covering a path where no operation exists.
+///
+/// The second write is byte-IDENTICAL to the first, deliberately: that is the
+/// only shape in which the two summaries collide and the suppression path is
+/// reached at all. A differing second write would pass under the defect too.
+#[tokio::test]
+async fn a_refused_diff_ready_is_retried_not_suppressed_as_a_duplicate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    util::init_committed_repo(&repo);
+
+    let sink = Arc::new(FlakySink::default());
+    let adapter = GitAdapter::open(&repo, &tmp.path().join("cas"))
+        .await
+        .unwrap()
+        .with_sink(Arc::clone(&sink) as Arc<dyn FactSink>);
+    let wt = adapter
+        .alloc_worktree(branch_req("feat-refused", "feat/refused"))
+        .await
+        .unwrap();
+
+    let file = wt.path.join("refused_change.txt");
+    const CONTENT: &str = "one summary, offered twice\n";
+    std::fs::write(&file, CONTENT).unwrap();
+
+    // The refused attempt. Polled rather than slept on: the debounce is 250 ms
+    // and the outer tolerance is the hang guard, not a timing criterion.
+    let refused = await_diff_ready_count(&sink, 1, OUTER).await;
+    assert_eq!(
+        refused.len(),
+        1,
+        "the watcher offered the summary to the sink once and the sink refused it"
+    );
+    assert!(!refused[0].1, "precondition: that first offer was REFUSED");
+
+    // The same bytes again: a filesystem event whose summary is IDENTICAL to
+    // the one the log never received.
+    std::fs::write(&file, CONTENT).unwrap();
+
+    let offers = await_diff_ready_count(&sink, 2, OUTER).await;
+    assert_eq!(
+        offers.len(),
+        2,
+        "the summary the log refused is offered AGAIN at the next change to the tree. \
+         Suppressing it — because the loop remembered a hash it never got onto the log — \
+         loses that summary permanently and silently (I3: the log is truth, and a fact that \
+         reached no append never happened). Offers: {offers:?}"
+    );
+    assert_eq!(
+        offers[0].0, offers[1].0,
+        "and it is the SAME summary, not a different one that happened to arrive: the \
+         suppression path is only reached when the hashes collide"
+    );
+    assert!(offers[1].1, "the retry was accepted, so the log now has it");
+}
+
+/// Poll `sink` until it has been offered `want` `diff.ready` facts, or panic at
+/// `deadline`. Polling (not sleeping) keeps the wait proportional to the 250 ms
+/// debounce without turning a hang guard into a timing assertion.
+async fn await_diff_ready_count(
+    sink: &FlakySink,
+    want: usize,
+    deadline: Duration,
+) -> Vec<(String, bool)> {
+    let started = Instant::now();
+    loop {
+        let seen = sink.diff_ready();
+        if seen.len() >= want {
+            return seen;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "waited {deadline:?} for {want} `diff.ready` offer(s); saw {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }

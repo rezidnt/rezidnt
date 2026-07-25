@@ -14,7 +14,15 @@
 //!
 //! ## RED MODE
 //!
-//! ASSERT-RED on the live tree, all three tests, for distinct reasons:
+//! The three ORACLE tests were ASSERT-RED on the pre-repoint tree, for distinct
+//! reasons (below). The fourth —
+//! `diff_ready_ownership_one_gate_time_fact_per_pre_merge_and_the_rest_are_the_watcher`
+//! — is NOT an oracle test and was never red: it is a REMEDIATION guard, added
+//! after the repoint was found to have given `diff.ready` a second live emitter
+//! with no disclosure anywhere, and it pins the ownership ruling that followed
+//! (two emitters, deliberately, with distinct semantics — see the test).
+//!
+//! The three, as written:
 //!
 //! - the one-fact test fails once the repoint lands and both emitters run
 //!   (`bins/rezidentd/src/runs.rs` publishes `worktree.allocated` and so does
@@ -54,6 +62,19 @@ use rezidnt_types::Event;
 use serde_json::Value;
 
 const FACT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Stub-harness inter-message gap for the merge-driving fixture, milliseconds.
+///
+/// Deliberately larger than the other boards' 50 ms, and the reason is the
+/// whole point of the ownership guard: the stub writes its change and the run
+/// then lives `2 * gap` before completing. At 50 ms the run is OVER — daemon
+/// killed, log cold-read — before the adapter watcher's 250 ms trailing
+/// debounce has even elapsed, so the second emitter is invisible and the guard
+/// would pass while observing only one of the two emitters it exists to
+/// separate. 700 ms leaves ~1.4 s of post-write life against a 250 ms debounce
+/// and the S2 criterion's 1 s write-to-fact bound, which is a slice criterion
+/// and not CI weather.
+const HARNESS_GAP_MS: u64 = 700;
 
 /// Drive one `open` to completion and cold-read the daemon's PERSISTED log —
 /// the log is the judge, not the live stream (I3).
@@ -297,6 +318,150 @@ fn every_allocated_path_is_claimed_in_the_sole_allocator_registry() {
             fact.payload()["allocator"].as_str(),
             "the registry entry and the log fact must record the SAME allocating principal, or \
              \"who allocated this worktree\" has two answers: entry {entry:#}, fact {:#}",
+            fact.payload()
+        );
+    }
+}
+
+/// Drive one gated `open` all the way through `pre_merge` to `diff.merged`,
+/// then cold-read the persisted log.
+///
+/// Distinct from [`open_and_cold_read`], which stops at `agent.completed`:
+/// `pre_merge` runs AFTER completion, so a board that asserts anything about
+/// gate-time facts must wait for the merge or it is asserting on a log that may
+/// simply not have reached them yet.
+fn open_and_cold_read_after_merge() -> (tempfile::TempDir, Vec<Event>) {
+    let mut daemon = common::start_daemon();
+    let (project, spec) = make_gated_project(HARNESS_GAP_MS);
+
+    let mut opener = connect(&daemon.socket);
+    send_line(&mut opener, &open_request(&spec));
+
+    let mut tail = connect(&daemon.socket);
+    send_line(&mut tail, r#"{"op":"tail"}"#);
+    // The merge is the far end of the chain (spawn → complete → pre_merge →
+    // merge), so it gets `golden_path.rs`'s 45 s tolerance rather than the
+    // single-fact deadline above.
+    let _ = read_until(&mut tail, Duration::from_secs(45), |v: &Value| {
+        v["subject"] == "diff.merged"
+    });
+
+    let log = cold_read(&mut daemon);
+    (project, log)
+}
+
+/// OWNERSHIP OF `diff.ready` — counted on the replayed log.
+///
+/// The repoint gave this subject a second LIVE emitter and named it nowhere:
+/// `alloc_worktree` now starts the adapter's notify watcher on every allocated
+/// tree, so its debounced `diff.ready` stream reaches this daemon's log
+/// alongside the one `run_pre_merge` has always minted at gate time. Two
+/// emitters is the right answer here — and precisely the wrong one for
+/// `worktree.allocated`, which is why the difference is pinned rather than
+/// assumed:
+///
+/// - `worktree.allocated` is two records of ONE occurrence. Folding it twice
+///   doubles every worktree count, so one emitter was silenced (C4 above).
+/// - `diff.ready` is two DIFFERENT observations. The watcher's is continuous,
+///   debounced 250 ms, deduplicated against the previous summary, and minted by
+///   a detached task nothing waits on; the daemon's is one deterministic
+///   gate-time pin of the exact ref `pre_merge` verifies (I6 — a gate's inputs
+///   are fixed at gate time, never inherited from a race). `WorktreeState`
+///   folds `last_diff` last-write-wins and nothing counts them.
+///
+/// So what must hold is not "exactly one" but OWNERSHIP: exactly one gate-time
+/// fact per `pre_merge`, ordered before the gate it feeds, and every other
+/// `diff.ready` on the log accounted for by the watcher. A third emitter, or a
+/// second gate-time fact per gate, fails here.
+#[test]
+fn diff_ready_ownership_one_gate_time_fact_per_pre_merge_and_the_rest_are_the_watcher() {
+    let (_project, log) = open_and_cold_read_after_merge();
+
+    const GATE_TIME_SOURCE: &str = "rezidnt-adapter-git";
+    let watcher_source = rezidnt_adapter_git::SOURCE_ID;
+
+    let ready: Vec<(usize, &Event)> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.subject.as_str() == "diff.ready")
+        .collect();
+    assert!(
+        !ready.is_empty(),
+        "precondition: the gated run reached `pre_merge`, which mints one; saw subjects {:?}",
+        log.iter().map(|e| e.subject.as_str()).collect::<Vec<_>>()
+    );
+
+    // No third emitter: every `diff.ready` on the log is one of the two.
+    let sources: BTreeSet<&str> = ready.iter().map(|(_, e)| e.source.as_str()).collect();
+    assert!(
+        sources
+            .iter()
+            .all(|s| *s == GATE_TIME_SOURCE || *s == watcher_source),
+        "every `diff.ready` comes from one of the two disclosed emitters — the gate-time pin \
+         ({GATE_TIME_SOURCE}) or the adapter's watcher ({watcher_source}). A third source means \
+         a third emitter arrived the way the second one did: silently. Saw: {sources:?}"
+    );
+
+    // NON-VACUITY, and the empirical basis of the whole ruling: the watcher IS
+    // one of the live emitters on the daemon's log. Without this leg the
+    // assertions above are satisfiable by a one-emitter world — which is
+    // exactly what this board saw at the other fixtures' 50 ms harness gap,
+    // where the run ends before the 250 ms debounce and the watcher's fact
+    // never exists (see `HARNESS_GAP_MS`). "Two emitters" would then be an
+    // inspection claim about `alloc_worktree` rather than an observed fact.
+    assert!(
+        sources.contains(watcher_source),
+        "the adapter's notify watcher appends `diff.ready` to the DAEMON's log — the repoint \
+         put it on the golden path for the first time by starting a watch inside \
+         `alloc_worktree`, and this is the leg that observes it rather than inferring it. \
+         Absent, either the watcher stopped reaching the sink (its facts would be riding a \
+         broadcast into nowhere — I3) or the fixture stopped outliving the debounce. \
+         Sources seen: {sources:?}"
+    );
+
+    // Exactly one gate-time fact per pre_merge gate.
+    let pre_merge_gates = log
+        .iter()
+        .filter(|e| e.subject.as_str() == "gate.entered" && e.payload()["gate"] == "pre_merge")
+        .count();
+    assert!(pre_merge_gates > 0, "precondition: a pre_merge gate ran");
+    let gate_time: Vec<&(usize, &Event)> = ready
+        .iter()
+        .filter(|(_, e)| e.source.as_str() == GATE_TIME_SOURCE)
+        .collect();
+    assert_eq!(
+        gate_time.len(),
+        pre_merge_gates,
+        "ONE gate-time `diff.ready` per `pre_merge`, no more and no fewer. More means the \
+         daemon acquired a second emit site; fewer means the gate is verifying a diff whose \
+         fact never landed, and `debrief` replays a gate over a ref the log cannot show. \
+         Gates: {pre_merge_gates}, gate-time facts: {}",
+        gate_time.len()
+    );
+
+    // And it precedes the gate it feeds — the golden path's causal order.
+    let first_pre_merge = log
+        .iter()
+        .position(|e| e.subject.as_str() == "gate.entered" && e.payload()["gate"] == "pre_merge")
+        .expect("a pre_merge gate.entered is on the log");
+    assert!(
+        gate_time[0].0 < first_pre_merge,
+        "the gate-time fact is appended BEFORE the gate that verifies it — `pre_merge` \
+         verifies the CAS-pinned diff, so a fact landing after the gate would be describing \
+         something the gate did not read (`golden_path.rs` pins the same order on the stream)"
+    );
+
+    // Both emitters honor the ratified v1 payload: the summary is a REF (I2).
+    for (_, fact) in &ready {
+        assert_eq!(fact.v, 1, "taxonomy v0 mints `diff.ready` at v = 1");
+        assert!(
+            fact.payload()["worktree"].is_string(),
+            "`worktree` is a REQUIRED v1 field: {:#}",
+            fact.payload()
+        );
+        assert!(
+            fact.payload()["diff"]["hash"].is_string(),
+            "the summary rides as a CAS ref, never inline diff bytes (I2): {:#}",
             fact.payload()
         );
     }

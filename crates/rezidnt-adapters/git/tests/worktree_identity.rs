@@ -146,10 +146,27 @@ async fn foreign_readd_on_registered_branch_is_detected_exactly_once() {
         &repo,
         &["worktree", "add", plain.to_str().unwrap(), "feat/worn"],
     );
+    // Test setup, asserted against an INDEPENDENT record (see the twin note in
+    // `restart_and_discovery.rs`): the impostor sits on a path the REGISTRY
+    // still holds, read back off the JSONL file rather than re-derived from the
+    // adapter's own report — and it holds it on the registered BRANCH, which is
+    // the entire point of this false-negative scenario.
+    let entries = util::registry_entries_for(&repo, &plain);
     assert_eq!(
-        util::canon(&plain),
-        util::canon(&wt_path),
-        "test setup: same registry key"
+        entries.len(),
+        1,
+        "test setup: the re-add happened on a path the registry still holds — no standing \
+         entry, no takeover to detect, and the conflict assertions below would be vacuous. \
+         Registry holds: {:#?}",
+        util::registry_entries(&repo)
+    );
+    assert_eq!(
+        entries[0]["branch"].as_str(),
+        Some("feat/worn"),
+        "test setup: the registry holds it on the branch the impostor checked out — \
+         branch-as-identity would therefore ADOPT this tree, which is the S2-T3 false \
+         negative this test exists to catch: {:#?}",
+        entries[0]
     );
 
     // Restart 1: the impostor is on the registered path and branch — only a

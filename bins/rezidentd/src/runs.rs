@@ -900,9 +900,18 @@ pub async fn launch_agent(
     // ULID>` (a bare ULID is not legal on this field), so the log ALONE answers
     // "which lead allocated this worktree". The sole-allocator model is untouched
     // (DR-001): a lead is not a second allocator — what widened is the recorded
-    // principal, not the set of allocators. As of this slice that sentence is
-    // true of the MECHANISM as well, not only of the vocabulary: the guard the
-    // ontology describes is the one this path now runs through.
+    // principal, not the set of allocators.
+    //
+    // The ratified text for that claim is `spec/ontology.md`, `worktree.allocated`
+    // v1, the bullet "Sole-allocator model UNCHANGED (DR-001)" and its nested
+    // "Exactly ONE `worktree.allocated` per allocation" — cited by HEADING, never
+    // by line number, because line cites in this repo have drifted four times in
+    // this arc alone. Read that bullet, not this comment, for what is ratified:
+    // it was corrected by the warden after this slice landed, and until that
+    // correction it described the registry guard as UNREACHED. An earlier draft
+    // of this comment asserted the ontology already described the mechanism this
+    // path runs through; it did not, and a comment that pre-announces a document
+    // is exactly what stops a reader from checking.
     let principal = match lead {
         Some(lead) => Allocator::Run(lead.lead_run.ulid()),
         None => Allocator::Rezidnt,
@@ -1767,8 +1776,35 @@ async fn run_pre_merge(
 ) -> anyhow::Result<()> {
     let run_str = ctx.run.ulid().to_string();
 
-    // 1. Summarize the worktree's change into the CAS and emit diff.ready
-    //    (the S2 watcher fact, produced here at completion for the gated run).
+    // 1. Summarize the worktree's change into the CAS and emit diff.ready —
+    //    the GATE-TIME pin, and the SECOND of two emitters of this subject.
+    //
+    //    Disclosed here because the registry-convergence repoint made the other
+    //    one live and said so nowhere: `alloc_worktree` now starts the git
+    //    adapter's notify watcher on every allocated tree, so that watcher's
+    //    debounced `diff.ready` stream reaches this daemon's log too (source
+    //    `git-adapter`). This fact is not a duplicate of one of those, and the
+    //    two are not interchangeable:
+    //
+    //    - the watcher's stream is CONTINUOUS and best-effort — trailing-edge
+    //      debounced 250 ms, a consecutive identical summary suppressed, minted
+    //      by a detached task nothing waits on. A gate that depended on it would
+    //      be depending on an event that may not have happened yet, may have
+    //      been suppressed as unchanged, or may have failed its append with no
+    //      caller to tell;
+    //    - this one is DETERMINISTIC and synchronous: exactly one per pre_merge,
+    //      summarized inline, pinned to the CAS ref the gate is about to verify,
+    //      caused by the run's completion. I6 wants a gate's inputs fixed at
+    //      gate time, not inherited from a race.
+    //
+    //    Unlike `worktree.allocated` — two records of ONE occurrence, which
+    //    folds an allocation twice and was therefore silenced daemon-side — these
+    //    are two different observations at two different instants.
+    //    `WorktreeState.last_diff` keeps the most recent and nothing counts them.
+    //    Ownership is pinned by `bins/rezidentd/tests/registry_convergence_e2e.rs`
+    //    (one gate-time fact per pre_merge; every other `diff.ready` on the log
+    //    carries the adapter's source) with a host-side single-site backstop in
+    //    `bins/rezidentd/tests/registry_convergence_structure.rs`.
     let (diff_ref, cas_ref) = gates::summarize_worktree(&ctx.daemon, &ctx.worktree).await?;
     let diff_ready_id = publish(
         &ctx.daemon.fabric,

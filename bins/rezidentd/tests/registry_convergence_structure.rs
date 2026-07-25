@@ -13,8 +13,13 @@
 //!
 //! ## RED MODE (stated plainly, per test)
 //!
-//! Both tests are ASSERT-RED today, for the right reason, and both are
-//! LOAD-BEARING-ON-REGRESSION afterwards:
+//! The two ORACLE tests were ASSERT-RED when written, for the right reason, and
+//! both are LOAD-BEARING-ON-REGRESSION afterwards. The third —
+//! `the_daemon_mints_diff_ready_at_exactly_one_site` — is NOT an oracle test
+//! and was never red: it is a REMEDIATION guard, added after the repoint was
+//! found to have quietly given `diff.ready` a second live emitter, and it pins
+//! the ownership ruling that followed. Stated rather than dressed up as an
+//! oracle, in the house style.
 //!
 //! - the manifest guard fails because `bins/rezidentd/Cargo.toml`
 //!   `[dependencies]` has no `rezidnt-adapter-git` at all (DR-046 §Decision 8:
@@ -113,6 +118,42 @@ fn rezidentd_depends_on_the_git_adapter_in_production() {
          sole-allocator double-claim guard are unreachable from the golden path, and DR-044 \
          §Decision 3's conflict semantics stay a description of a mechanism the code does not \
          have. A dev-only edge does NOT satisfy this. Runtime deps: {runtime:?}; dev deps: {dev:?}"
+    );
+}
+
+/// OWNERSHIP OF `diff.ready` (host-side backstop) — the daemon mints it at
+/// EXACTLY ONE site, and that site is the `pre_merge` gate-time pin.
+///
+/// This subject has two emitters and, unlike `worktree.allocated`, is MEANT to:
+/// the git adapter's notify watcher emits the continuous, debounced,
+/// best-effort stream (`source` = `git-adapter`), and `run_pre_merge` mints one
+/// deterministic fact per gate (`source` = `rezidnt-adapter-git`) because a gate
+/// may not depend on a detached task having fired. The repoint made the watcher
+/// live on the golden path for the first time and disclosed the split nowhere;
+/// the ruling and its reasoning now stand in `runs.rs` at the emit site and in
+/// the adapter's module header.
+///
+/// What this guard holds is the DAEMON side of that ruling: one construction
+/// site, so a third emitter cannot appear the way the second one silently did.
+/// Same disclosure as the guard below — it matches one literal and a subject
+/// assembled from a variable would slip past it. The counting judge is
+/// `bins/rezidentd/tests/registry_convergence_e2e.rs`, which is `#[cfg(unix)]`.
+#[test]
+fn the_daemon_mints_diff_ready_at_exactly_one_site() {
+    const LITERAL: &str = r#"Subject::new("diff.ready")"#;
+    let runs = crate_root().join("src").join("runs.rs");
+    let source = read(&runs);
+
+    let hits = source.matches(LITERAL).count();
+    assert_eq!(
+        hits,
+        1,
+        "the daemon's `diff.ready` is the gate-time pin at `run_pre_merge` and nothing else. \
+         The adapter's watcher is the subject's OTHER emitter and that split is deliberate and \
+         documented; a THIRD site is not — it would put facts on the log that neither the \
+         watcher's continuous-observation semantics nor the gate's deterministic-pin semantics \
+         describe, and no reader could tell which they were reading. Found {hits} in {}",
+        runs.display()
     );
 }
 

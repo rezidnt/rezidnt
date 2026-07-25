@@ -309,3 +309,126 @@ async fn the_conflict_mark_survives_restart_on_the_allocation_path() {
          S2 remediation)"
     );
 }
+
+/// A sink that RECORDS every fact and REFUSES exactly `worktree.conflict` —
+/// the fabric append failing for the one fact that reports a double claim.
+/// Recording the refused fact is what lets the test count ATTEMPTS, which is
+/// how the in-memory dedup mark is interrogated without reaching into the
+/// adapter.
+#[derive(Default)]
+struct ConflictRefusingSink {
+    attempts: Mutex<Vec<Event>>,
+}
+
+impl ConflictRefusingSink {
+    fn attempts(&self, subject: &str) -> usize {
+        self.attempts
+            .lock()
+            .expect("sink lock")
+            .iter()
+            .filter(|e| e.subject.as_str() == subject)
+            .count()
+    }
+}
+
+impl FactSink for ConflictRefusingSink {
+    fn emit(&self, event: &Event) -> Result<(), GitError> {
+        self.attempts.lock().expect("sink lock").push(event.clone());
+        if event.subject.as_str() == "worktree.conflict" {
+            return Err(GitError::Registry("sink refused the conflict fact".into()));
+        }
+        Ok(())
+    }
+}
+
+/// I6 — a double claim whose FACT cannot be appended is still a CONFLICT, and
+/// the unrecorded collision is not silently swallowed.
+///
+/// The regression this pins is a one-character one: the guard used to append
+/// the conflict fact with `?`, so a fabric refusal returned the sink's
+/// `GitError::Registry` instead of `GitError::Conflict`. The daemon maps
+/// `Registry` to `codes::SPAWN_FAILED`, so a real double claim — the tree IS
+/// held, by somebody — degraded into "this spawn is broken" precisely when the
+/// log was already in trouble. That is the collapse DR-046 §Decision 9 exists to
+/// forbid: a caller cannot distinguish "contended, retry with the same keys"
+/// from a broken spawn, and I6 does not let an inconclusive log coerce a
+/// verdict about the registry.
+///
+/// The refusal is a fact about the REGISTRY, not about the log: the path is
+/// claimed whether or not the news was accepted. So the error is asserted, and
+/// then the dedup mark is interrogated in BOTH records — the registry file on
+/// disk, and (by attempt count) the adapter's in-memory mirror. They must agree,
+/// or the next claim is refused with nothing on the log to say why.
+#[tokio::test]
+async fn a_conflict_whose_fact_cannot_be_appended_is_still_a_conflict() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    util::init_committed_repo(&repo);
+    let workspace = WorkspaceId::new(Ulid::new());
+
+    let sink = Arc::new(ConflictRefusingSink::default());
+    let adapter = GitAdapter::open(&repo, &tmp.path().join("cas"))
+        .await
+        .expect("open adapter")
+        .with_sink(Arc::clone(&sink) as Arc<dyn FactSink>);
+
+    let wt = adapter
+        .alloc_worktree(detached_req("unappendable-conflict", workspace))
+        .await
+        .expect("the first allocation's own fact is accepted by this sink");
+    remove_out_of_band(&repo, &wt.path);
+
+    let error = adapter
+        .alloc_worktree(detached_req("unappendable-conflict", workspace))
+        .await
+        .expect_err("a second claim on a registered path is refused");
+
+    assert!(
+        matches!(&error, GitError::Conflict { .. }),
+        "a double claim is a fact about the REGISTRY — the path is held whether or not the log \
+         accepted the news — so a failed append must NOT downgrade it to the sink's error. The \
+         daemon maps `Registry` to `codes::SPAWN_FAILED`, which tells a caller its spawn is \
+         broken when the truth is that the tree is contended (DR-046 §Decision 9, I6). \
+         Got: {error:?}"
+    );
+    assert_eq!(
+        sink.attempts("worktree.conflict"),
+        1,
+        "the fact was still MINTED and offered to the log — refusing to append is the log's \
+         failure, not a reason to stop reporting the collision"
+    );
+
+    // The mark, on disk: the fact never landed, so nothing may claim it did.
+    // The refused claim's own `git worktree add` re-created the tree before the
+    // guard fired, so the path is on disk here and canonicalizes.
+    let entries = util::registry_entries_for(&repo, &wt.path);
+    assert_eq!(entries.len(), 1, "the standing claim is still registered");
+    assert_ne!(
+        entries[0]["conflicted"],
+        serde_json::json!(true),
+        "the persisted dedup mark must NOT record an announcement the log never received: \
+         `persist_registry` is skipped on this path, so a `conflicted: true` on disk could only \
+         come from a write that did not happen. Entry: {:#}",
+        entries[0]
+    );
+
+    // The mark, in memory: it must agree with disk. A third claim re-announces.
+    remove_out_of_band(&repo, &wt.path);
+    let again = adapter
+        .alloc_worktree(detached_req("unappendable-conflict", workspace))
+        .await
+        .expect_err("still contended");
+    assert!(
+        matches!(&again, GitError::Conflict { .. }),
+        "still a conflict"
+    );
+    assert_eq!(
+        sink.attempts("worktree.conflict"),
+        2,
+        "and the collision is RE-ANNOUNCED, because the in-memory mark agrees with the disk \
+         mark: neither claims a fact reached the log. An optimistic in-memory `conflicted = \
+         true` left standing after a refused append would silence every later claim on this \
+         path — a silent double claim, which is the one outcome DR-001 exists to prevent, \
+         reached by the back door"
+    );
+}

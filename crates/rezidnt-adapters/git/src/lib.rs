@@ -45,6 +45,37 @@
 //!   has been quiet that long) and surface as `diff.ready` carrying the diff
 //!   summary as a CAS ref (I2 — never inline diff bytes). S2 exit criterion:
 //!   `diff.ready` lands within 1 s of the write, post-debounce.
+//! - **`diff.ready` has TWO emitters, and they are not the same fact
+//!   (disclosed 2026-07-24, registry-convergence remediation).** This adapter's
+//!   watcher is one; `run_pre_merge` in `bins/rezidentd/src/runs.rs` is the
+//!   other. Before the repoint the watcher was unreachable from the daemon, so
+//!   only one ran in production; the repoint put both on the golden path and
+//!   said so nowhere, which is why it is said here. The split is deliberate and
+//!   the two are distinguished on the wire by `source`:
+//!   - **watcher, `source` = [`SOURCE_ID`] (`"git-adapter"`)** — the CONTINUOUS
+//!     observation: N facts over an allocation's life, one per quiet period, a
+//!     consecutive identical summary suppressed, `causation` = the allocation
+//!     fact. Asynchronous and best-effort by construction: nothing waits on it
+//!     and no caller can be failed by it.
+//!   - **daemon, `source` = `"rezidnt-adapter-git"`** — the GATE-TIME pin:
+//!     exactly one per `pre_merge`, minted synchronously at the gate so the
+//!     verified diff is pinned deterministically (I6) rather than depending on
+//!     a debounced task having happened to fire, `causation` = the run's
+//!     completion fact. `bins/rezidentd/tests/golden_path.rs` pins its ordering
+//!     before `gate.entered(pre_merge)`.
+//!
+//!   This is NOT the double-emit that `worktree.allocated` was ruled on: that
+//!   was two records of ONE occurrence, which folds one allocation twice. These
+//!   are records of two different observations at two different instants;
+//!   `WorktreeState.last_diff` takes the most recent and nothing counts them.
+//!   Ownership is pinned by `bins/rezidentd/tests/registry_convergence_e2e.rs`
+//!   (counts on a replayed daemon log) with a host-side backstop in
+//!   `bins/rezidentd/tests/registry_convergence_structure.rs`. The daemon's
+//!   `source` spelling is a legacy wart — it names the adapter for a fact the
+//!   adapter did not mint — kept because the value is wire-visible and pinned
+//!   by golden fixtures; renaming it is a `/subject` question, not a comment's.
+//!   `spec/ontology.md`'s `diff.ready` emitter cell names the watcher only and
+//!   is owed the second-emitter clause; that file is warden-only.
 //! - **[`GitAdapter::observe`]** is the watcher's ingest point for a worktree
 //!   discovered out-of-band (human `git worktree add`): unregistered path →
 //!   `worktree.observed` (allocator `"human"`, registered so re-observation
@@ -63,10 +94,33 @@
 //!   fact's id as `causation`.
 //! - **Fact delivery (DR-046 §Decision 8, I3):** facts always ride the
 //!   broadcast. When the daemon injects a [`FactSink`] via
-//!   [`GitAdapter::with_sink`], each fact ALSO goes through it first, and a
-//!   sink refusal fails the operation that minted the fact — a broadcast is a
-//!   fan-out to live subscribers, not an append, and only an append is a
-//!   commit point. The on-open reconciliation scan runs inside
+//!   [`GitAdapter::with_sink`], each fact ALSO goes through it first — a
+//!   broadcast is a fan-out to live subscribers, not an append, and only an
+//!   append is a commit point. What a refusal does then depends on whether
+//!   there is an operation left to fail, and the honest split is:
+//!   - `worktree.allocated` — the refusal FAILS the allocation, and the tree
+//!     just created is taken back off disk. The append is the commit point.
+//!   - `worktree.conflict` on the allocation path — the refusal does NOT
+//!     convert the conflict into an append error: a double claim is a fact
+//!     about the REGISTRY, true whether or not the log accepted the news, so
+//!     [`GitError::Conflict`] is returned either way (I6 — a real double claim
+//!     must never degrade into a generic spawn failure). The dedup mark is then
+//!     left UNSET, so the collision is re-announced on the next claim rather
+//!     than silently swallowed forever.
+//!   - `diff.ready` — there is NO operation to fail: [`debounce_loop`] is a
+//!     detached task with no caller. A refusal is logged at `warn` and the
+//!     suppression hash is NOT advanced, so the same summary is re-emitted at
+//!     the next filesystem event instead of being suppressed as a duplicate.
+//!     Stated plainly: if no further write ever comes, that summary is absent
+//!     from the log. Nothing on the golden path depends on it — the gate-time
+//!     `diff.ready` above is minted by the daemon and its append failure does
+//!     fail the merge.
+//!   - every other fact (`worktree.observed`, `worktree.released`, and
+//!     `worktree.conflict` raised through [`GitAdapter::observe`]) propagates
+//!     the refusal to its caller unchanged — each of those operations IS
+//!     "record this", so failing to record it is failing the operation.
+//!
+//!   The on-open reconciliation scan runs inside
 //!   [`GitAdapter::open`], before any sink can be injected, so its facts reach
 //!   the sink only via [`GitAdapter::startup_facts`] — the seam that already
 //!   exists for exactly that reason.
@@ -872,12 +926,21 @@ impl GitAdapter {
                     payload.insert("claimed_path".into(), Value::String(claimed_str));
                 }
                 payload.insert("holder".into(), Value::String(holder));
-                self.inner.emit(
+                if let Err(e) = self.inner.emit(
                     "worktree.conflict",
                     &FactCtx::default(),
                     None,
                     Value::Object(payload),
-                )?;
+                ) {
+                    // The fact never reached the log, so the mark it dedups
+                    // against must not stand: an in-memory `conflicted` the
+                    // registry file does not carry would silence the NEXT
+                    // observation of a collision the log never heard about.
+                    // Reverted, and the error propagates — `observe`'s whole
+                    // contract is "record this observation".
+                    unmark_conflicted(&mut state, &canonical_str);
+                    return Err(e);
+                }
                 self.inner.persist_registry(&state).await?;
                 return Ok(());
             }
@@ -926,10 +989,17 @@ impl GitAdapter {
     /// **Moved 2026-07-24 (registry-convergence slice; DEFAULT, note in lieu of
     /// a `/dr`).** This was the sibling layout `<repo-parent>/<repo>-wt-<name>`,
     /// designed so allocated trees never polluted the primary working tree.
-    /// That concern is already answered elsewhere: the repo `.gitignore`
-    /// designates `.rezidnt/` as the home for "worktrees, captures materialized
-    /// by `rezidnt open`", so an in-repo tree is ignored, not pollution.
-    /// Converging on the daemon's in-repo layout instead preserves shipped
+    ///
+    /// **The pollution claim, narrowed (remediation, same day).** This comment
+    /// argued the concern was answered because "the repo `.gitignore`
+    /// designates `.rezidnt/` as the home for worktrees" — true of THIS repo and
+    /// of nothing else. rezidnt writes no ignore rule into an operator's repo,
+    /// so in an arbitrary repo an allocated tree under `.rezidnt/worktrees/` is
+    /// UNTRACKED content: invisible to `git status --porcelain` only if the
+    /// operator ignores it themselves, and removable by `git clean -fdx`. What
+    /// actually justifies the layout is narrower and does not depend on any
+    /// repo's ignore file: the daemon has shipped this exact on-disk layout
+    /// since v0.0.1, so converging on it preserves shipped
     /// v0.0.1 on-disk behavior and the two test levers built against it
     /// (`bins/rezidentd/tests/spec_init_open_e2e.rs`'s tempdir-confinement
     /// guard, and `fan_out_live_e2e.rs`'s `block_allocations`), which a move in
@@ -1093,13 +1163,54 @@ impl RepoSubstrate for GitAdapter {
                 entry.conflicted = true;
                 let holder = entry.allocator.clone();
                 if emit_conflict {
-                    self.inner.emit(
+                    // I6: the REFUSAL is not contingent on the log. A double
+                    // claim is a fact about the registry — the path is held,
+                    // and it is held whether or not the fabric accepted the
+                    // news — so a failed append must never turn a contended
+                    // tree into a generic append error, which the daemon would
+                    // map to `codes::SPAWN_FAILED` and a caller would read as
+                    // "this spawn is broken" instead of "retry with the same
+                    // keys" (DR-046 §Decision 9). Both failure arms therefore
+                    // fall through to the `Conflict` return below; what differs
+                    // is what happens to the dedup mark.
+                    match self.inner.emit(
                         "worktree.conflict",
                         &ctx,
                         None,
                         serde_json::json!({ "path": canonical_str, "holder": holder }),
-                    )?;
-                    self.inner.persist_registry(&state).await?;
+                    ) {
+                        Ok(_) => {
+                            if let Err(e) = self.inner.persist_registry(&state).await {
+                                // The fact IS on the log; only its mark failed
+                                // to persist. In-memory stays marked (this
+                                // process emits once), disk does not — which is
+                                // exactly the at-least-once window the module
+                                // header already documents: a restart may
+                                // re-announce this collision.
+                                tracing::warn!(
+                                    path = %canonical_str,
+                                    error = %e,
+                                    "worktree.conflict was recorded but its dedup mark could \
+                                     not be persisted; a restart may re-announce this collision"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // The fact never reached the log. Leaving the mark
+                            // set would diverge memory from disk AND silence
+                            // the next claim on a collision the log never heard
+                            // about — a silent double claim, the one outcome
+                            // DR-001 exists to prevent. Unmark: the collision is
+                            // re-announced on the next claim (at-least-once).
+                            unmark_conflicted(&mut state, &canonical_str);
+                            tracing::warn!(
+                                path = %canonical_str,
+                                error = %e,
+                                "worktree.conflict could not be appended; the collision stays \
+                                 unmarked and will be re-announced on the next claim"
+                            );
+                        }
+                    }
                 }
                 // STRUCTURAL, not a message: the daemon maps this variant to a
                 // distinct refusal code, and must never have to parse prose to
@@ -1283,10 +1394,26 @@ async fn debounce_loop(
                 if last_hash.as_deref() == Some(r.hash.as_str()) {
                     continue;
                 }
-                last_hash = Some(r.hash.clone());
+                let hash = r.hash.clone();
                 let payload = serde_json::json!({ "worktree": path_str, "diff": r });
-                if let Err(e) = inner.emit("diff.ready", &ctx, causation, payload) {
-                    tracing::warn!(error = %e, "diff.ready emission failed");
+                match inner.emit("diff.ready", &ctx, causation, payload) {
+                    // The suppression hash advances ONLY on a fact that
+                    // actually landed. Advancing it first (as this loop did
+                    // until the registry-convergence remediation) made a
+                    // refused append lose that summary permanently: the next
+                    // identical summary matched the hash of a fact the log
+                    // never received and was suppressed as a duplicate of
+                    // nothing. There is no caller here to fail — see the
+                    // module header's fact-delivery split — so re-emission at
+                    // the next filesystem event is the whole recovery, and it
+                    // is stated rather than implied.
+                    Ok(_) => last_hash = Some(hash),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        worktree = %path_str,
+                        "diff.ready could not be appended; the summary is NOT on the log and \
+                         will be re-emitted at the next change to this tree"
+                    ),
                 }
             }
             Err(e) => tracing::warn!(error = %e, "diff summary failed; skipping emission"),
@@ -1352,6 +1479,21 @@ fn parse_worktree_porcelain(out: &str) -> Vec<PorcelainBlock> {
         blocks.push(done);
     }
     blocks
+}
+
+/// Roll the in-memory `conflicted` dedup mark back to `false` for one key.
+///
+/// Called on exactly one path: the conflict fact was minted, the sink REFUSED
+/// it, and `persist_registry` therefore never ran. Leaving the optimistic mark
+/// standing would put memory and disk into disagreement about whether a
+/// collision has been announced, and memory is the side that decides — so the
+/// next claim on that path would be refused SILENTLY, with nothing on the log
+/// to say why. Missing key is a no-op: the caller has already established the
+/// entry exists, and re-establishing it here would be ceremony.
+fn unmark_conflicted(state: &mut State, key: &str) {
+    if let Some(entry) = state.registry.get_mut(key) {
+        entry.conflicted = false;
+    }
 }
 
 /// serde helper: keep the registry JSONL lean — `conflicted` is written only

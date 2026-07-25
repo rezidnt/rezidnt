@@ -11,11 +11,13 @@
 //! the diff_ready timing tests. These tests pin single-process semantics;
 //! restart durability of the exactly-once marks is restart_and_discovery's.
 //!
-//! Payload-shape caveat (flagged in the oracle work order): the ontology
-//! ratifies no v1 payload baseline for `worktree.observed`/`worktree.conflict`
-//! — these tests pin only the semantically forced minimum (`path`; observed
-//! `allocator: "human"`). Warden ratification via /subject is required before
-//! the implementer freezes a richer shape.
+//! Payload-shape note (CORRECTED 2026-07-24; the caveat this replaced was
+//! stale, and the warden said so): the ontology DOES ratify v1 baselines for
+//! both subjects — `worktree.observed` `{path, allocator: "human", branch?}`
+//! and `worktree.conflict` `{path, claimed_path?, holder?}`, S2 set, ratified
+//! 2026-07-17, `holder?` widened 2026-07-24 under DR-044. These tests pin the
+//! semantically forced minimum of those baselines, which is a subset and not a
+//! competing shape; no further /subject is owed for what is asserted here.
 
 mod util;
 

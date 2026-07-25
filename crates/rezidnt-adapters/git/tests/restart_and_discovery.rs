@@ -357,10 +357,20 @@ async fn open_surfaces_startup_collision_exactly_once_across_restarts() {
         &repo,
         &["worktree", "add", "--detach", plain.to_str().unwrap()],
     );
+    // Test setup, asserted against an INDEPENDENT record: the path the human
+    // tree now occupies is the one the REGISTRY holds — read back off the JSONL
+    // file, not re-derived from the adapter's own report. Comparing
+    // `plain_spelling(&wt_path)` to `wt_path` would be an identity on Unix
+    // (`plain_spelling` is the identity there) and would read like a check
+    // while checking nothing; the collision precondition is that a REGISTERED
+    // key is occupied, so that is what is asserted.
     assert_eq!(
-        util::canon(&plain),
-        util::canon(&wt_path),
-        "test setup: same key"
+        util::registry_entries_for(&repo, &plain).len(),
+        1,
+        "test setup: the takeover happened on a path the registry still holds for rezidnt — \
+         without a standing entry there is no collision to surface, and the assertions below \
+         would pass vacuously. Registry holds: {:#?}",
+        util::registry_entries(&repo)
     );
 
     // Restart 1: the startup scan discovers the collision.

@@ -1,0 +1,18 @@
+{
+  "events_folded": 2,
+  "last_event": "01DR050CV00000000000000E02",
+  "counts_by_subject": {
+    "run.contract.violated": 2
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01DR050CV00000000000000R01": {
+      "status": "",
+      "contract_violated": {
+        "harness": "codex",
+        "detail": "a second turn-terminal line arrived on one `codex exec --json` stream (terminal turn 2), falsifying the single-shot premise the recorded contract rests on"
+      }
+    }
+  },
+  "worktrees": {}
+}

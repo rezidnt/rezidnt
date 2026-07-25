@@ -25,21 +25,24 @@
 //! crates cannot drift apart by coincidence again (DR-050 §Context finding 2,
 //! third trap).
 //!
-//! ## RED MODE (stated plainly, per test)
+//! ## STATE (truth pass, session 31 — the stale RED MODE header retired)
 //!
-//! All three tests are ASSERT-RED today against the fallback literal in
-//! `bins/rezidentd/src/runs.rs` (`drive_run`, the `completed_id.is_none()`
-//! arm), which hardcodes zeroed token keys and carries no `error` key at all:
+//! All three tests were ASSERT-RED when written and are GREEN PINS since the
+//! fallback literal in `bins/rezidentd/src/runs.rs` (`drive_run`, the
+//! `completed_id.is_none()` arm) landed the arm (commit 462dee1): token keys
+//! absent together, `error.message` carried, key set matching the adapter's
+//! failure rendering. They stay as the regression board for that arm.
 //!
-//! - `fallback_completion_reports_usage_as_absent_not_zero` fails because the
-//!   fallback emits `cost.input_tokens = 0` / `cost.output_tokens = 0` for a
-//!   run whose harness reported no accounting;
-//! - `fallback_completion_carries_the_dying_childs_error_text` fails because
-//!   the fallback discards the failure reason the child's last stream line
-//!   reported (DR-051 §Context finding 3: "discarded, not carried");
-//! - `fallback_completion_matches_the_adapters_failure_shape` fails on the
-//!   key-set comparison against the recorded failure rendering (the reference
-//!   carries `error` and no token keys; the fallback is the mirror image).
+//! DR-050-set NOTE for the next touch of the arm (the surfacing work order):
+//! the fallback's `contract_violation.or(last_line)` routing is ratified for
+//! REMOVAL — `agent.completed.error?` is harness-authored ONLY, and the
+//! adapter-composed refusal moves to `run.contract.violated.detail`
+//! (`spec/ontology.md` "### DR-050 set"; removal guard:
+//! `tests/dr050_contract_violated_surfacing.rs`). The SURVIVOR half of that
+//! routing — the dying child's LAST STREAM LINE still rides `error.message` —
+//! is exactly what `fallback_completion_carries_the_dying_childs_error_text`
+//! pins behaviorally (its stub dies with no contract violation in play), so
+//! this suite must stay green through the removal.
 #![cfg(unix)]
 
 mod common;

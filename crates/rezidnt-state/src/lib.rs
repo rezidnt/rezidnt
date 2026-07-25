@@ -40,8 +40,10 @@ pub enum WorkspaceStatus {
 /// - `gate.passed` `{run, gate, verifiers: [{verifier, cost_ms, evidence,
 ///   inputs}]}` → `verdict = "pass"`, `verifier = None`, `evidence` = the
 ///   verifiers' evidence hashes flattened in order;
-/// - `gate.failed` `{run, gate, verifier, evidence, inputs}` →
-///   `verdict = "fail"`, the FAILING verifier named, evidence hashes copied;
+/// - `gate.failed` `{run, gate, verifier, evidence, inputs, worktree?}` →
+///   `verdict = "fail"`, the FAILING verifier named, evidence hashes copied.
+///   The optional `worktree` is NOT gate state — it folds onto
+///   [`WorktreeState::outcome`] instead (DR-049 criterion (c));
 /// - `gate.inconclusive` (failed shape + `reason`) →
 ///   `verdict = "inconclusive"` plus `reason` — never coerced (I6).
 ///
@@ -691,6 +693,16 @@ impl AgentRunState {
 ///   Some("merged")` and `last_diff = Some(diff.hash)`, leaving `lifecycle`
 ///   alone (inserted even if never allocated — the log is truth, I3). A merged
 ///   tree is not yet a released one.
+///
+/// DR-049 criterion (c) — the failure outcome:
+/// - `gate.failed` `{…, worktree?}` → `outcome = Some("failed")` on the entry
+///   keyed by `worktree`, and NOTHING else. The field is additive-optional and
+///   present IFF the gate ran against an allocated tree (ontology v1), so the
+///   pre-spawn `vet` refusal — which has no tree — folds no outcome at all,
+///   and the fold never invents a path. OUTCOME ONLY: a failed tree is
+///   RETAINED for triage (DR-049 §Decision 3), so its `lifecycle` stays
+///   `"allocated"` until an explicit release writes the other axis, at which
+///   point `"failed"` survives that release exactly as `"merged"` does.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeState {
     /// The allocate/release axis: `"allocated"` | `"observed"` |
@@ -996,6 +1008,21 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                     evidence: evidence_hashes(event),
                     reason: None,
                 };
+            }
+            // DR-049 criterion (c) — attribute the failure to the tree it ran
+            // against. `worktree?` is additive-optional and present IFF an
+            // allocated tree existed at gate time, so the pre-spawn `vet`
+            // refusal folds nothing here and no path is ever synthesized (I3:
+            // the fold reads the log, it does not infer). Deliberately NOT a
+            // correlation join — one correlation spans every sibling run of a
+            // spec, so joining on it would mark every sibling's tree failed.
+            //
+            // OUTCOME ONLY, symmetric with `diff.merged`: `lifecycle` stays
+            // whatever the `worktree.*` facts made it, because a failed tree
+            // survives for triage until an explicit release (§Decision 3).
+            if let Some(path) = event.payload()["worktree"].as_str() {
+                graph.worktrees.entry(path.to_string()).or_default().outcome =
+                    Some("failed".to_string());
             }
         }
         "gate.inconclusive" => {

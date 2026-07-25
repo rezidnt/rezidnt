@@ -182,6 +182,34 @@ pub async fn run_gate(
                 }));
             }
             Verdict::Fail => {
+                // DR-049 lane 1 — failure attribution rides the fact itself.
+                // `worktree?` is present IFF the gate ran against an ALLOCATED
+                // tree, mirroring `exec_cwd`'s `Option` exactly (ontology
+                // `gate.failed` v1, additive-optional, `v` stays 1): the
+                // golden-path `pre_merge` passes `Some(&ctx.worktree)`; the
+                // pre-spawn `vet` refusal runs before any allocation and
+                // passes `None`. Absence is the honest representation — never
+                // synthesized to `""` (DR-012 declared-vs-absent). The path is
+                // emitted in the same form `worktree.allocated` / `diff.ready`
+                // / `diff.merged` carry, so the fold keys ONE entry.
+                //
+                // NOT a correlation join: the open path mints one correlation
+                // per SPEC and threads it into every sibling run, so a
+                // correlation-keyed join would attribute one sub's failure to
+                // all of its siblings' trees (rationale recorded at the
+                // ontology entry so the broken join is never re-derived).
+                let mut fail_payload = json!({
+                    "run": run,
+                    "gate": gate_name,
+                    "verifier": record.verifier,
+                    "evidence": evidence_refs(&record),
+                    "inputs": inputs_doc,
+                });
+                if let Some(cwd) = exec_cwd
+                    && let Some(obj) = fail_payload.as_object_mut()
+                {
+                    obj.insert("worktree".to_string(), json!(cwd.display().to_string()));
+                }
                 let verdict_id = publish(
                     &daemon.fabric,
                     Event::new(
@@ -191,13 +219,7 @@ pub async fn run_gate(
                         correlation,
                         Some(entered_id),
                         1,
-                        json!({
-                            "run": run,
-                            "gate": gate_name,
-                            "verifier": record.verifier,
-                            "evidence": evidence_refs(&record),
-                            "inputs": inputs_doc,
-                        }),
+                        fail_payload,
                     )?,
                 )
                 .await?;

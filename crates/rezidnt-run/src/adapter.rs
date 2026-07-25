@@ -126,6 +126,26 @@ pub const MESSAGE_INLINE_CAP: usize = 8 * 1024;
 /// human-readable glimpse, never the bulk input (I2).
 const INPUT_SUMMARY_CAP: usize = 256;
 
+/// Truncation cap for the completion fact's `error.message` (DEFAULT), sized
+/// to the discipline the ontology already states for the analogous
+/// harness/operator free-text field `agent.signaled.reason?`: "DEFAULT cap
+/// <= 1 KiB, keeping envelope headroom under the 32 KiB I2 hard cap".
+///
+/// This is harness-CONTROLLED text — a failing turn's reason is whatever the
+/// upstream provider put in it, with no promised bound. Uncapped it is an I2
+/// hole with a sharp edge: `Event::from_parts` refuses a payload over
+/// [`rezidnt_types::MAX_PAYLOAD_BYTES`], so the largest failure reasons — the
+/// ones this fact exists to carry — would be the exact ones that never reach
+/// the log. Bounded here at the mapper, a failure is always publishable.
+///
+/// Truncation, not a CAS ref, because this mapper is PURE (it holds no CAS,
+/// by design — the daemon owns that swap) and because a reason is a short
+/// string by nature: 1 KiB carries the whole of every reason in the recorded
+/// transcripts with three orders of magnitude of headroom. The bulk-body
+/// escape hatch stays [`MESSAGE_INLINE_CAP`]'s, for `agent.message`, where
+/// the bytes are genuinely the payload.
+pub const ERROR_MESSAGE_CAP: usize = 1024;
+
 /// Accept or refuse a harness version string (semver-ish, e.g. "2.1.191")
 /// against an explicit tested list. The one gate body every substrate shares,
 /// so the RULE cannot diverge between harnesses — but the DEPTH is per
@@ -226,10 +246,14 @@ struct Completion {
     num_turns: Value,
     duration_ms: Value,
     session_id: Option<String>,
-    /// The harness's own failure reason, VERBATIM, when it reported one. Kept
-    /// opaque: a harness may put a JSON-encoded upstream response here (codex
-    /// 0.145.0 does) or plain prose, so parsing it would pin structure no
-    /// recording promises.
+    /// The harness's own failure reason, when it reported one — carried
+    /// VERBATIM up to [`ERROR_MESSAGE_CAP`], `…`-marked beyond it (see
+    /// [`elide`]). Kept OPAQUE: a harness may put a JSON-encoded upstream
+    /// response here (codex 0.145.0 does) or plain prose, so parsing it would
+    /// pin structure no recording promises. Opaque and unbounded are different
+    /// claims — the string's CONTENT is never interpreted, but its LENGTH is
+    /// this crate's problem, because the fabric refuses an oversized payload
+    /// (I2).
     error_message: Option<String>,
 }
 
@@ -274,10 +298,17 @@ impl Completion {
         if let Some(session) = self.session_id {
             obj.insert("session_id".to_string(), Value::String(session));
         }
+        // Bounded HERE, at the single rendering point, not at each substrate's
+        // mapper: the message is harness-controlled text with no promised
+        // length, and a payload over the I2 hard cap is REFUSED by
+        // `Event::from_parts` — an unbounded field would make the honest
+        // failure fact unpublishable exactly on the failures carrying the
+        // biggest reasons. One enforcement site means a substrate added later
+        // inherits the bound instead of having to remember it (I2).
         if let Some(message) = self.error_message {
             obj.insert(
                 "error".to_string(),
-                serde_json::json!({ "message": message }),
+                serde_json::json!({ "message": elide(message, ERROR_MESSAGE_CAP) }),
             );
         }
         MappedFact {
@@ -659,7 +690,9 @@ impl CodexAdapter {
             // Read from THIS line's own `error.message`, not from the preceding
             // top-level `error` line: the two carry identical strings in the
             // recording, and sourcing it locally keeps the mapping free of
-            // cross-line state and leaves that line as unmapped noise.
+            // cross-line state and leaves that line as unmapped noise. Length
+            // is bounded downstream in `into_fact` (ERROR_MESSAGE_CAP), the one
+            // place every substrate's completion is rendered.
             error_message: value["error"]["message"].as_str().map(String::from),
         }
         .into_fact())
@@ -698,13 +731,27 @@ fn input_summary(input: &Value) -> Option<String> {
         return None;
     }
     // Compact JSON is deterministic and readable for small inputs.
-    let rendered = serde_json::to_string(input).ok()?;
-    if rendered.len() <= INPUT_SUMMARY_CAP {
-        return Some(rendered);
+    Some(elide(serde_json::to_string(input).ok()?, INPUT_SUMMARY_CAP))
+}
+
+/// The ONE truncation body in this file: every harness-controlled free-text
+/// field an adapter puts on the fabric is bounded through here, so a second
+/// capped field cannot arrive with different semantics.
+///
+/// Semantics: text within `cap` bytes rides VERBATIM and unmarked. Longer
+/// text is cut at the last char boundary at or below `cap` bytes and a single
+/// `…` is appended, so a reader can always tell a complete value from an
+/// elided one — the truncation is never silent. The returned string is at most
+/// `cap + 3` bytes (the marker's UTF-8 width).
+fn elide(mut text: String, cap: usize) -> String {
+    if text.len() <= cap {
+        return text;
     }
-    let mut cut = INPUT_SUMMARY_CAP;
-    while !rendered.is_char_boundary(cut) {
+    let mut cut = cap;
+    while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    Some(format!("{}…", &rendered[..cut]))
+    text.truncate(cut);
+    text.push('…');
+    text
 }

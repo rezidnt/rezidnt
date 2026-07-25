@@ -21,17 +21,23 @@
 //! whether a failed turn counts toward `num_turns`, and whether `turn.failed`
 //! trips the single-shot guard.
 //!
+//! The last two pin the I2 bound on `error.message` — provenance: the
+//! /debrief fail verdict on `4ceccb7`. The recorded reason is 231 bytes, so
+//! no transcript test could ever reach the cap; only a synthetic
+//! over-cap reason exercises the edge where the feature previously broke.
+//!
 //! None of these weakens an oracle assertion; each pins behavior the oracle
 //! left open or did not reach.
 
 use rezidnt_run::RunId;
 use rezidnt_run::adapter::{
-    AdapterError, AgentSubstrate, ClaudeCodeAdapter, CodexAdapter, MappedFact,
+    AdapterError, AgentSubstrate, ClaudeCodeAdapter, CodexAdapter, ERROR_MESSAGE_CAP, MappedFact,
     TESTED_CODEX_VERSIONS, codex_version_gate,
 };
 use rezidnt_run::badge::Badge;
 use rezidnt_run::spawner::SpawnPlan;
 use rezidnt_run::spec::AgentSpec;
+use rezidnt_types::{Event, MAX_PAYLOAD_BYTES, SourceId, Subject};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -257,5 +263,104 @@ fn codex_plan_refuses_a_declared_permit_gate_rather_than_ignoring_it() {
     assert!(
         msg.contains("permit") && msg.contains("codex"),
         "the refusal must name the gate and the harness: {msg}"
+    );
+}
+
+/// Mint the completion payload a synthetic `turn.failed` carrying `message`
+/// produces, driven through the seam the daemon holds.
+fn completion_payload_for_failure(message: &str, entropy: u128) -> Value {
+    let line = serde_json::json!({
+        "type": "turn.failed",
+        "error": { "message": message },
+    })
+    .to_string();
+    let mut substrate: Box<dyn AgentSubstrate> =
+        Box::new(CodexAdapter::new(RunId::new(Ulid::from_parts(50, entropy))));
+    substrate
+        .map_line(&line)
+        .expect("a turn.failed line maps cleanly")
+        .into_iter()
+        .find(|f| f.subject == "agent.completed")
+        .expect("turn.failed yields a completion fact")
+        .payload
+}
+
+/// I2, the sharp end. `error.message` is HARNESS-CONTROLLED text with no
+/// promised length — a provider that returns a large body puts that body here.
+/// `Event::from_parts` REFUSES a payload over `MAX_PAYLOAD_BYTES`, so an
+/// unbounded field does not merely bloat the log: it makes the honest failure
+/// fact UNPUBLISHABLE exactly on the failures carrying the biggest reasons,
+/// i.e. the feature fails hardest in the case it was built for. This test
+/// proves both halves — that the raw reason really would have been refused,
+/// and that the fact the adapter emits from it is accepted.
+///
+/// The cut is pinned exactly, on a MULTI-BYTE reason whose char boundary does
+/// not align with the cap (`€` is 3 bytes; 1024 = 3·341 + 1), so a naive byte
+/// slice would panic mid-character and the backoff cannot silently regress.
+#[test]
+fn an_oversized_failure_message_is_bounded_so_the_failure_stays_publishable() {
+    let raw = "€".repeat(30_000); // 90 KB — comfortably past the 32 KiB cap
+    assert!(
+        raw.len() > MAX_PAYLOAD_BYTES,
+        "the premise: this reason alone exceeds the I2 hard cap, so carrying it \
+         verbatim could not produce a publishable fact"
+    );
+
+    let payload = completion_payload_for_failure(&raw, 50);
+    let carried = payload["error"]["message"]
+        .as_str()
+        .expect("the failure reason still rides the fact — bounded, never dropped");
+
+    // Exact cut semantics: the largest whole-character prefix at or under the
+    // cap, plus a single `…` so an elided reason is never mistaken for a
+    // complete one.
+    assert_eq!(
+        carried,
+        format!("{}…", "€".repeat(341)),
+        "the reason is truncated on a char boundary and visibly marked"
+    );
+    assert!(
+        carried.len() <= ERROR_MESSAGE_CAP + '…'.len_utf8(),
+        "the carried reason must stay inside the cap plus its marker; got {} bytes",
+        carried.len()
+    );
+
+    // The point of the whole exercise: the resulting fact is publishable.
+    Event::new(
+        SourceId::new("rezidnt-run"),
+        None,
+        Subject::new("agent.completed"),
+        Ulid::from_parts(50, 60),
+        None,
+        1,
+        payload,
+    )
+    .expect("a bounded failure fact must be accepted by the fabric (I2)");
+}
+
+/// The other side of the bound: a reason that FITS rides verbatim and
+/// unmarked, so the cap costs nothing in the normal case and a reader can tell
+/// a complete reason from an elided one. Pinned at the exact boundary — cap
+/// bytes is untouched, one byte more is marked — because an off-by-one here
+/// would silently start eliding complete reasons.
+#[test]
+fn a_failure_message_within_the_cap_rides_verbatim_and_unmarked() {
+    let at_cap = "x".repeat(ERROR_MESSAGE_CAP);
+    let payload = completion_payload_for_failure(&at_cap, 51);
+    assert_eq!(
+        payload["error"]["message"],
+        Value::String(at_cap),
+        "a reason of exactly the cap is complete and must not be marked as elided"
+    );
+
+    let over_by_one = "x".repeat(ERROR_MESSAGE_CAP + 1);
+    let payload = completion_payload_for_failure(&over_by_one, 52);
+    let carried = payload["error"]["message"]
+        .as_str()
+        .expect("the reason rides the fact");
+    assert!(
+        carried.ends_with('…') && carried.len() == ERROR_MESSAGE_CAP + '…'.len_utf8(),
+        "one byte past the cap is elided and marked; got {} bytes",
+        carried.len()
     );
 }

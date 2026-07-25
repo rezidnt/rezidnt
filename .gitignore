@@ -11,3 +11,10 @@
 # C:\Users\...). Never track it.
 /C*Usersdakot*
 .cache/
+# Lane worktrees materialized by /lanes — each is a FULL checkout of this repo,
+# live and dirty while a parallel build runs. Untracked but not ignored meant a
+# `git add -A` on main would swallow both lanes wholesale (flagged twice in
+# handoffs). Also keeps rust-analyzer from indexing three copies of the tree.
+.claude/worktrees/
+# Playwright MCP scratch.
+.playwright-mcp/

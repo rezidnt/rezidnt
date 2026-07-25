@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use crate::RunError;
 use crate::spec::AgentSpec;
 
 /// A fully resolved spawn: argv + scrubbed env, ready for `tokio::process`.
@@ -33,23 +34,73 @@ impl SpawnPlan {
     /// The env seam is unchanged; only the token VALUE flips from a DR-005
     /// opaque hex token to a serialized agent macaroon
     /// ([`crate::badge::Macaroon::to_wire`]) — inline under the 32 KiB cap (I2).
+    /// DR-048: a DECLARED `model` appends `--model <value>` AFTER the pinned
+    /// base invocation; an absent model leaves the argv byte-identical to the
+    /// pre-DR-048 plan (the harness picks its own default — never synthesized).
     pub fn for_claude_code(
         agent: &AgentSpec,
         badge_token: &str,
         parent_env: impl Iterator<Item = (String, String)>,
     ) -> Self {
+        let mut args: Vec<String> = ["-p", "--output-format", "stream-json", "--verbose"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        push_model_flag(&mut args, agent);
         Self {
             bin: agent
                 .bin_override
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("claude")),
-            args: ["-p", "--output-format", "stream-json", "--verbose"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            args,
             env: crate::badge::scrubbed_env(parent_env, badge_token),
             permit_hook_config: None,
         }
+    }
+
+    /// Build the codex headless invocation for one agent (DR-048 slice A, the
+    /// second [`crate::adapter::AgentSubstrate`]): `codex exec --json` — JSONL
+    /// events on stdout, prompt over stdin, mirroring the claude-code
+    /// stdin-prompt shape. `bin_override` redirects the executable only (the
+    /// pinned-version / contract-test seam), env is scrubbed with the badge
+    /// injected, and a declared `model` appends `--model <value>` (the real
+    /// `codex exec` flag, long form).
+    ///
+    /// # A declared `[gates.permit]` is REFUSED, not ignored
+    ///
+    /// The PEP is claude-code's `.claude/settings.json` `PreToolUse` hook and
+    /// has no recorded codex equivalent, so a codex plan can carry no
+    /// interception mechanism. Returning a plan anyway would leave a spec that
+    /// ASKED to be permit-governed spawning unintercepted — and the daemon
+    /// stamps `agent.spawned.pep = "enforced"` off the spec's gates list rather
+    /// than off the plan, so such a run would record itself as governed while
+    /// running ungoverned. Refusing here means that trap cannot be sprung from
+    /// this side of the seam, whatever the caller does.
+    pub fn for_codex(
+        agent: &AgentSpec,
+        badge_token: &str,
+        parent_env: impl Iterator<Item = (String, String)>,
+    ) -> Result<Self, RunError> {
+        if agent.gates.iter().any(|g| g == "permit") {
+            return Err(RunError::Spawn(format!(
+                "agent {:?}: [gates.permit] is declared but harness `codex` has no recorded PEP \
+                 mechanism (claude-code's PreToolUse hook has no codex equivalent in this tree). \
+                 Refusing rather than spawning a run that would be recorded as permit-governed \
+                 while running unintercepted",
+                agent.name
+            )));
+        }
+        let mut args: Vec<String> = ["exec", "--json"].into_iter().map(String::from).collect();
+        push_model_flag(&mut args, agent);
+        Ok(Self {
+            bin: agent
+                .bin_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("codex")),
+            args,
+            env: crate::badge::scrubbed_env(parent_env, badge_token),
+            permit_hook_config: None,
+        })
     }
 
     /// Build the claude-code invocation for a permit-gated agent (DR-014
@@ -109,6 +160,18 @@ impl SpawnPlan {
             env: Vec::new(),
             permit_hook_config: None,
         }
+    }
+}
+
+/// Append the DR-048 model selector to an argv when the spec declares one.
+/// Both harnesses spell it `--model <value>` in long form (claude-code
+/// `--model`; codex `-m, --model <MODEL>` per `codex exec --help`, codex-cli
+/// 0.145.0), so the one helper serves both and the flag cannot drift apart.
+/// An absent model appends NOTHING — the byte-identical pre-DR-048 argv.
+fn push_model_flag(args: &mut Vec<String>, agent: &AgentSpec) {
+    if let Some(model) = &agent.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
     }
 }
 

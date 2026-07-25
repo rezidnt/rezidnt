@@ -90,6 +90,16 @@ pub struct AgentSpec {
     /// `Some("")`, distinct from absent (the policy interprets it, not rezidnt).
     #[serde(default)]
     pub role: Option<String>,
+    /// Trial-matrix model axis (DR-048 slice A): the model the harness is asked
+    /// to run, passed through as `--model <value>` on the spawn argv. An opaque
+    /// string — rezidnt mints no model vocabulary and validates no vendor's
+    /// names. ABSENT = no model declared ⇒ the harness's own default, never
+    /// synthesized (DR-012 declared-vs-absent; mirrors `harness_version`).
+    /// Declared values ride the vet preimage ([`agent_spec_toml`]) so two trial
+    /// variants differing only by model cannot hash to the same `refs["spec"]`
+    /// and become uninterrogable per-variant (§8, I6).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// One `[gates.<name>]` table: the ordered verifier set a gate runs (S4).
@@ -168,6 +178,12 @@ pub fn agent_spec_toml(spec: &AgentSpec) -> String {
     s.push_str(&format!("bare = {}\n", spec.bare));
     if let Some(v) = &spec.harness_version {
         s.push_str(&format!("harness_version = {}\n", q(v)));
+    }
+    // DR-048: a DECLARED model is part of the governed spawn posture the vet
+    // verdict is pinned to. Absent emits NOTHING — every pre-DR-048 spec's
+    // preimage bytes, and therefore its CAS hash, are unmoved.
+    if let Some(v) = &spec.model {
+        s.push_str(&format!("model = {}\n", q(v)));
     }
     if !spec.allowed_tools.is_empty() {
         let items: Vec<String> = spec.allowed_tools.iter().map(|t| q(t)).collect();

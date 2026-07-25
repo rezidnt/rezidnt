@@ -3,8 +3,10 @@
 # Decision Record DR-050 — Trials slice A closeout: an unreachable version gate, three daemon-side traps, and a contested codex-success mapping
 
 **Date:** 2026-07-25
-**Status:** PROPOSED. Slice A (`AgentSubstrate` trait + codex adapter + `model` field) landed and passed `/debrief` at commit `a559623` on branch `worktree-agent-ab4e17a54fbbdb421` — that part is settled fact, not before the owner here. This record is PROPOSED, not ACCEPTED, because Decision 3 below turns on a contested reading of I6 that the auditor and the implementer hold differently; the owner should adjudicate it knowingly rather than have it default-ratify under the standing autonomy grant.
+**Status:** ACCEPTED (owner, 2026-07-25). Slice A (`AgentSubstrate` trait + codex adapter + `model` field) landed and passed `/debrief` at commit `a559623` on branch `worktree-agent-ab4e17a54fbbdb421` — that part was settled fact from the start. Decision 3 below turned on a contested reading of I6 that the auditor and the implementer held differently; the owner adjudicated it on evidence — a recorded failing codex transcript, not a default ratification under the standing autonomy grant — and accepts this record as originally drafted. See [DR-051](DR-051-codex-failure-recording-and-fallback-fidelity.md) for the recording, what it settled, and what it corrected.
 **Amends:** [DR-048](DR-048-trials.md) §Decision 4 — slice B's ("trial matrix primitive") entry criteria are NARROWED by Decision 2 below; DR-048's own text and its already-passed slice A criteria are untouched. No amendment to DR-049; this record shares its file (`runs.rs`) but not its decisions. Mints NO invariant, NO subject, NO trait method, NO dep. Adds a §20 index row.
+
+> **Amended by [DR-051](DR-051-codex-failure-recording-and-fallback-fidelity.md).** Settles §Context finding 3 (the codex success-mapping contest) by recording — the auditor's mismapped-failure branch is refuted for codex-cli 0.145.x only. Strikes this record's Consequences risk item 5, corrects the "clean residual" claim on the daemon fallback, records an absent-usage/cost finding, and sharpens §Decision 2(c)'s entry criterion. This record's Context and Decision text below are UNCHANGED — left as the historical account of what was known and decided at the time.
 
 ## Context
 

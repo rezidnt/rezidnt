@@ -44,6 +44,23 @@ daemon lead→sub path, and the `orchestration_graph` read side now folding a re
   shipped path. No reducer reads either; the edge is faithful, the envelope approximate.
 - **`crates/rezidnt-tui/examples/board_rich.rs:323`** fails WSL clippy (`unnecessary_sort_by`), pre-existing, invisible
   to host clippy (newer WSL toolchain). Same class as [[golden-txt-crlf-host-vet]].
+- **OWED (registry-convergence, 2026-07-24): `release_worktree` has no production caller.** DR-007's ratified
+  allocate→use→release lifecycle never completes. Every finished run leaks a `notify` watcher plus its detached debounce
+  task (daemon-lifetime), leaves the tree on disk, and leaves the sole-allocator registry entry open — live claims only
+  grow. Not a one-liner: releasing emits `worktree.released`, which the S4 reducer folds to `status = "released"` OVER
+  the `"merged"` `diff.merged` just set, so wiring it in without ruling on what a merged-then-released worktree reads as
+  trades one derived-state regression for another. Also needs the `WorktreeId` threaded into `RunTaskContext` (it carries
+  only the path) and an answer for whether a FAILED run's tree survives for triage. Recorded at the site: end of
+  `drive_run`, `bins/rezidentd/src/runs.rs`. The watch outliving the run is not academic — it is what made the
+  post-merge `diff.ready` clobber reachable.
+- **OWED: stale caveat in `crates/rezidnt-mcp/tests/gate_explain.rs:10-15`.** It says the ontology "ratifies no v1
+  payload baseline" for `gate.entered` / `gate.failed` / `gate.inconclusive` / `gate.explained` and that warden
+  ratification is required before a richer shape is frozen. **Confirmed false** — all four are ratified in
+  `spec/ontology.md`, "S3 set (ratified 2026-07-17)", one section each. (`gate.passed` is the one gate subject
+  deliberately left unratified there — S4 scope — so the correction is "these four are ratified", not "all gate
+  subjects are".) Same stale-caveat class the warden already ruled on for
+  `worktree_conflict.rs` and `diff_ready.rs`. Left uncorrected only because the file is outside the
+  registry-convergence slice's diff; it is a comment fix, no code or assertion changes.
 
 ## Decisions still needing a /dr
 None outstanding. DR-046 §Decision 8 already **fixes the brief** for the next slice, so it needs a slice, not a record.

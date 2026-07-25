@@ -24,9 +24,17 @@
 //!   (ids were process-local before the fields existed, so nothing is lost)
 //!   and later facts carry no causation; missing `conflicted` → `false` (a
 //!   legacy collision surfaced before the upgrade may re-surface at most
-//!   once). The observed mark needs no field: a `"human"` entry exists only
-//!   because `worktree.observed` was emitted, so the entry IS the mark.
-//!   `release_worktree` closes (removes) the entry.
+//!   once). The observed mark needs no field, because
+//!   [`GitAdapter::observe`] emits BEFORE it persists: a `"human"` entry is
+//!   written only after `worktree.observed` was accepted, so the entry IS the
+//!   mark. (Corrected 2026-07-24: this read "a `"human"` entry exists only
+//!   because `worktree.observed` was emitted" while the code persisted first —
+//!   so a refused fact left a durable mark for an entry the log never
+//!   received, and both the re-observation arm and the reconciliation scan
+//!   then treated the tree as already observed forever. The claim is now true
+//!   because the ordering was fixed, not because the sentence was rewritten.)
+//!   `release_worktree` closes (removes) the entry — though nothing in
+//!   production calls it yet; see [`RepoSubstrate::release_worktree`].
 //! - **On-open reconciliation scan (S2 remediation):** [`GitAdapter::open`]
 //!   compares the reloaded registry against `git worktree list --porcelain`.
 //!   Intact rezidnt allocations (the private-gitdir identity marker carries
@@ -76,14 +84,16 @@
 //!   by golden fixtures; renaming it is a `/subject` question, not a comment's.
 //!   `spec/ontology.md`'s `diff.ready` emitter cell names the watcher only and
 //!   is owed the second-emitter clause; that file is warden-only.
-//! - **[`GitAdapter::observe`]** is the watcher's ingest point for a worktree
-//!   discovered out-of-band (human `git worktree add`): unregistered path →
-//!   `worktree.observed` (allocator `"human"`, registered so re-observation
-//!   stays silent); already-registered path → `worktree.conflict`,
-//!   deduplicated per canonicalized path so repeated observation of the same
-//!   collision emits nothing further once the mark is persisted: the dedup
-//!   marks persist in the registry, so on the crash-free path restart does not
-//!   resurface a fact. Because the emit precedes the mark-persist, the fact is
+//! - **[`GitAdapter::observe`]** is the ingest point for a worktree discovered
+//!   out-of-band (human `git worktree add`) — NO production caller today; the
+//!   reconciliation scan's pass 2 is what actually surfaces such trees, running
+//!   the same dedup rule at startup. Unregistered path → `worktree.observed`
+//!   (allocator `"human"`, registered so re-observation stays silent);
+//!   already-registered path → `worktree.conflict`, deduplicated per
+//!   canonicalized path so repeated observation of the same collision emits
+//!   nothing further once the mark is persisted: the dedup marks persist in the
+//!   registry, so on the crash-free path restart does not resurface a fact.
+//!   Because the emit precedes the mark-persist in BOTH arms, the fact is
 //!   at-least-once — a crash in that window can resurface it on restart.
 //! - **Facts** ride the envelope with `source` = [`SOURCE_ID`], `v = 1`, and
 //!   payloads per `spec/ontology.md`. `workspace`, `correlation` and
@@ -98,8 +108,17 @@
 //!   broadcast is a fan-out to live subscribers, not an append, and only an
 //!   append is a commit point. What a refusal does then depends on whether
 //!   there is an operation left to fail, and the honest split is:
-//!   - `worktree.allocated` — the refusal FAILS the allocation, and the tree
-//!     just created is taken back off disk. The append is the commit point.
+//!   - `worktree.allocated` — the refusal FAILS the allocation, and removal of
+//!     the tree just created is attempted BEST-EFFORT: `git worktree remove
+//!     --force` runs, and a failure is logged at `warn` leaving the tree on
+//!     disk (there is no second mechanism behind it). The append is the commit
+//!     point, so nothing is registered and nothing is tracked live either way.
+//!     (Narrowed 2026-07-24: this said the tree "is taken back off disk",
+//!     unconditional prose over best-effort code.) The refusal, the removal on
+//!     the path a test can reach, and the empty registry are asserted by
+//!     `tests/allocation_principal_and_sink.rs`; the branch where `git worktree
+//!     remove` itself fails is stated here and guarded nowhere — provoking it
+//!     needs a git failure a tempdir will not produce.
 //!   - `worktree.conflict` on the allocation path — the refusal does NOT
 //!     convert the conflict into an append error: a double claim is a fact
 //!     about the REGISTRY, true whether or not the log accepted the news, so
@@ -119,6 +138,12 @@
 //!     `worktree.conflict` raised through [`GitAdapter::observe`]) propagates
 //!     the refusal to its caller unchanged — each of those operations IS
 //!     "record this", so failing to record it is failing the operation.
+//!
+//!   A REGISTRY-WRITE failure after a successful emit is a separate question
+//!   from a refused emit, and the two were answered inconsistently across
+//!   `observe` and `alloc_worktree` until 2026-07-24. The rule ("mark, not
+//!   claim") is stated in full on [`GitAdapter::observe`] and marked at the one
+//!   site that deliberately differs.
 //!
 //!   The on-open reconciliation scan runs inside
 //!   [`GitAdapter::open`], before any sink can be injected, so its facts reach
@@ -167,7 +192,12 @@ pub const REGISTRY_PATH: &str = ".rezidnt/registry.jsonl";
 
 /// Directory hosting allocated worktrees, relative to the repo root (DEFAULT).
 /// See [`GitAdapter::derive_worktree_path`] for why the layout is in-repo.
-const WORKTREE_BASE: &str = ".rezidnt/worktrees";
+///
+/// `pub` so a test can locate an allocated tree from the constant rather than
+/// re-spelling the layout — the same reason [`REGISTRY_PATH`] is public, and
+/// the same failure it prevents (a literal that silently stops naming the file
+/// the adapter uses; that has happened once in this arc already).
+pub const WORKTREE_BASE: &str = ".rezidnt/worktrees";
 
 /// Identity-marker filename inside a worktree's PRIVATE gitdir
 /// (`<repo>/.git/worktrees/<name>/`), carrying the persisted [`WorktreeId`]
@@ -896,6 +926,42 @@ impl GitAdapter {
     /// Watcher ingest for an out-of-band worktree discovery (see module
     /// docs). Idempotent per canonicalized path: re-observation of a known
     /// tree or an already-emitted collision emits nothing further.
+    ///
+    /// **No production caller today.** Out-of-band trees reach the log through
+    /// [`GitAdapter::reconcile_on_open`]'s pass 2, which runs the same dedup
+    /// rule at startup; `observe` is the per-event door for a watcher that does
+    /// not yet call it. Reachable from tests only — which bounds the blast
+    /// radius of anything wrong here, and is not a licence for the code to be
+    /// wrong.
+    ///
+    /// ## MARK, NOT CLAIM — what a failed registry persist does here
+    ///
+    /// Both arms below emit first and persist second, and a persist failure is
+    /// WARNED rather than returned. The rule, stated once and applied at every
+    /// site that writes the registry after a fact has been APPENDED:
+    ///
+    /// - a registry write that is a DEDUP MARK for a fact already on the log is
+    ///   not part of the operation. The operation was "record this"; the record
+    ///   landed. Losing the mark costs a possible re-announcement after a
+    ///   restart — the at-least-once window the module header documents — and
+    ///   failing the call instead would tell the caller nothing happened when
+    ///   something did. This is the rule `alloc_worktree`'s conflict arm
+    ///   already followed; `observe` returned `Err` in the identical situation
+    ///   until this was reconciled (2026-07-24), which is why it is written
+    ///   down rather than left to be inferred from two sites that agreed by
+    ///   accident.
+    /// - a registry write that constitutes the sole-allocator CLAIM is part of
+    ///   the operation and fails it. That is `alloc_worktree`'s success path
+    ///   only, where the entry is what makes the tree rezidnt's under DR-001.
+    ///   The asymmetry is deliberate and marked at that site.
+    ///
+    /// Two registry writes are outside the rule because neither follows an
+    /// append, and they are named so the rule is not read as covering them:
+    /// [`GitAdapter::reconcile_on_open`]'s batched persist (its facts have not
+    /// been appended yet — they reach the log only later, via
+    /// [`GitAdapter::startup_facts`] — so aborting `open` there discards
+    /// nothing the log holds), and [`RepoSubstrate::release_worktree`], which
+    /// persists BEFORE it emits.
     pub async fn observe(&self, path: &Path) -> Result<(), GitError> {
         let span = tracing::info_span!("adapter", kind = "git", op = "observe");
         async move {
@@ -941,7 +1007,19 @@ impl GitAdapter {
                     unmark_conflicted(&mut state, &canonical_str);
                     return Err(e);
                 }
-                self.inner.persist_registry(&state).await?;
+                // The fact IS on the log; only its dedup mark failed to
+                // persist. Warned, not failed — see [`GitAdapter::observe`]'s
+                // "mark, not claim" rule. A restart may re-announce this
+                // collision, which is the at-least-once window the module
+                // header already documents.
+                if let Err(e) = self.inner.persist_registry(&state).await {
+                    tracing::warn!(
+                        path = %canonical_str,
+                        error = %e,
+                        "worktree.conflict was recorded but its dedup mark could not be \
+                         persisted; a restart may re-announce this collision"
+                    );
+                }
                 return Ok(());
             }
 
@@ -959,6 +1037,30 @@ impl GitAdapter {
             if let Some(branch) = &branch {
                 payload.insert("branch".into(), Value::String(branch.clone()));
             }
+            // EMIT BEFORE PERSIST — the ordering, and the reason for it
+            // (remediation, 2026-07-24). This ran the other way round: the
+            // `"human"` entry was written and persisted FIRST, so a refused
+            // `worktree.observed` returned `Err` while leaving a durable entry
+            // behind. Because that entry IS the dedup mark, the discovery was
+            // then unrecoverable: re-observation returns `Ok(())` silently
+            // (the `allocator == "human"` arm above), and the on-open
+            // reconciliation scan skips `"human"` entries as already-observed.
+            // The registry ended up asserting a fact the log never received —
+            // derived state claiming a log entry that does not exist (I3), the
+            // same shape as the `last_hash` bug in [`debounce_loop`] with the
+            // ordering inverted. Emitting first leaves NOTHING to unwind on a
+            // refusal: no entry, no mark, and the next observation of this tree
+            // is news again.
+            //
+            // This is also what reconciliation pass 2 does (see
+            // [`GitAdapter::reconcile_on_open`]), which aborts `open` on a
+            // refusal before any persist runs. `observe` was the outlier.
+            self.inner.emit(
+                "worktree.observed",
+                &FactCtx::default(),
+                None,
+                Value::Object(payload),
+            )?;
             state.registry.insert(
                 canonical_str.clone(),
                 RegistryEntry {
@@ -970,13 +1072,16 @@ impl GitAdapter {
                     conflicted: false,
                 },
             );
-            self.inner.persist_registry(&state).await?;
-            self.inner.emit(
-                "worktree.observed",
-                &FactCtx::default(),
-                None,
-                Value::Object(payload),
-            )?;
+            // Mark, not claim: the observation is recorded, and a mark that
+            // fails to persist only means the next restart re-announces it.
+            if let Err(e) = self.inner.persist_registry(&state).await {
+                tracing::warn!(
+                    path = %canonical_str,
+                    error = %e,
+                    "worktree.observed was recorded but its registry entry could not be \
+                     persisted; a restart may re-announce this discovery"
+                );
+            }
             Ok(())
         }
         .instrument(span)
@@ -1094,6 +1199,9 @@ impl GitAdapter {
         let mut watcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 match res {
+                    // Reads are not changes ([`is_change_event`]) and must not
+                    // wake the debounce loop.
+                    Ok(event) if !is_change_event(&event.kind) => {}
                     // Send failure means the receiver (debounce loop) is
                     // gone, which only happens on release — nothing to do.
                     Ok(_event) => drop(tx.blocking_send(())),
@@ -1181,12 +1289,14 @@ impl RepoSubstrate for GitAdapter {
                     ) {
                         Ok(_) => {
                             if let Err(e) = self.inner.persist_registry(&state).await {
-                                // The fact IS on the log; only its mark failed
-                                // to persist. In-memory stays marked (this
-                                // process emits once), disk does not — which is
-                                // exactly the at-least-once window the module
-                                // header already documents: a restart may
-                                // re-announce this collision.
+                                // MARK, NOT CLAIM (the rule is stated in full
+                                // on [`GitAdapter::observe`], which now follows
+                                // it too). The fact IS on the log; only its
+                                // mark failed to persist. In-memory stays
+                                // marked (this process emits once), disk does
+                                // not — which is exactly the at-least-once
+                                // window the module header already documents: a
+                                // restart may re-announce this collision.
                                 tracing::warn!(
                                     path = %canonical_str,
                                     error = %e,
@@ -1277,6 +1387,16 @@ impl RepoSubstrate for GitAdapter {
                     conflicted: false,
                 },
             );
+            // CLAIM, not mark — the one site where a persist failure FAILS the
+            // call, and the deliberate other side of the rule on
+            // [`GitAdapter::observe`]. This entry is what makes the tree
+            // rezidnt's under DR-001: without it on disk, a restart sees an
+            // unclaimed path and the sole-allocator guard has nothing to guard
+            // with. Stated exactly: on failure the call returns `Err` while the
+            // tree, its identity marker and its `worktree.allocated` fact all
+            // remain — this process's in-memory registry holds the claim, a
+            // restarted one does not, and the reconciliation scan meets the
+            // tree as an unregistered linked worktree (a `"human"` discovery).
             self.inner.persist_registry(&state).await?;
 
             // Watch starts after the allocated fact is minted so its id can
@@ -1364,6 +1484,66 @@ impl RepoSubstrate for GitAdapter {
         }
         .instrument(span)
         .await
+    }
+}
+
+/// Does this notify event report a CHANGE to the tree, or merely a read of it?
+///
+/// `diff.ready` is about content, so only content events may wake the debounce
+/// loop: `Create`, `Modify`, `Remove`, and the two catch-alls (`Any`/`Other`,
+/// kept as changes because an unclassified event is not evidence of a read).
+/// Every other `Access` variant is treated as a read and ignored — including
+/// the ambiguous `Access(Any)`, on the ground that an event a backend could
+/// classify no further than "access" is not evidence that anything changed.
+/// `Close(Write)` is the one retained, because it marks a completed write. No
+/// backend in use reports a write as a bare `Access(Any)`; if one ever does,
+/// this is the line that will need to know.
+///
+/// **This is a platform-asymmetric defect fix, measured rather than reasoned
+/// (registry-convergence remediation, 2026-07-24).** The inotify backend arms
+/// `IN_OPEN`, so *opening a file for reading* inside a watched tree surfaces as
+/// `EventKind::Access(Open(Any))`. The closure previously treated every `Ok`
+/// event as a change, which had two measured consequences on Linux — the
+/// daemon's platform — and neither on Windows, whose `ReadDirectoryChangesW`
+/// backend has no open/read notification at all (so host `/vet` could not see
+/// either):
+///
+/// 1. **The golden-path clobber.** `gates::merge_worktree` runs `git add -A`
+///    plus `git commit` INSIDE the still-watched tree (nothing releases the
+///    watch — see [`RepoSubstrate::release_worktree`], which has no production
+///    caller). Those commands modify nothing INSIDE the worktree: a linked
+///    tree's index and refs live in its private gitdir and its objects in the
+///    shared repo, so neither `add` nor `commit` writes a byte under the
+///    watched path (measured — nothing in the tree is newer afterwards). They
+///    only READ the tracked files, and those reads woke the loop. 250 ms later
+///    the now-clean tree summarized to the header-only string and appended a
+///    fresh `diff.ready`, overwriting `WorktreeState.last_diff` on a worktree
+///    `diff.merged` had just folded to `status = "merged"` with the merged
+///    diff. Derived state then disagreed with the log about what was merged
+///    (I3). Measured: 1 post-merge `diff.ready` of 26 bytes (the bare header)
+///    under WSL, 0 under Windows.
+/// 2. **A self-feeding treadmill.** [`summarize_to_cas`] reads the tree to hash
+///    it, which fired `Access(Open)` on the tree it was summarizing, which
+///    re-armed the debounce, which re-summarized. The `last_hash` dedup kept
+///    the extra facts off the log, so the cost was invisible: a gix status walk
+///    plus a blake3 of the changed files every 250 ms, forever, per allocated
+///    worktree. Measured on one allocation with a single write and then no test
+///    activity at all: 40 notify events in a 2 s window before the fix, 0
+///    after (`tests/diff_ready.rs`,
+///    `an_allocated_worktree_goes_quiet_when_nothing_touches_it`).
+///
+/// Filtering here rather than dropping the watch at merge is the narrower fix
+/// and the one the evidence names: the merge burst is entirely reads, so no
+/// change event is lost by ignoring it, and the fix holds for every other
+/// reader of a watched tree (a verifier, a grep, the operator's editor opening
+/// a file) rather than for the one caller that was caught.
+fn is_change_event(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Access(_) => false,
+        _ => true,
     }
 }
 
@@ -1528,4 +1708,55 @@ fn cli_path(p: &Path) -> String {
 
 fn join_err(e: tokio::task::JoinError) -> GitError {
     GitError::Git(format!("background task join: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind};
+
+    use super::is_change_event;
+
+    /// The read/change split, asserted on the event VARIANTS rather than on a
+    /// live filesystem.
+    ///
+    /// The behavioral guard for this
+    /// (`crates/rezidnt-adapters/git/tests/diff_ready.rs`,
+    /// `a_git_commit_inside_the_watched_tree_is_not_a_change`) can only be
+    /// meaningful where the backend reports reads at all, which is inotify and
+    /// not `ReadDirectoryChangesW` — so on Windows it passes vacuously. This
+    /// test does not: `Access(Open)` is a value on every platform, so the rule
+    /// that the defect turned on is judged in host `/vet` too.
+    #[test]
+    fn reads_are_not_changes_and_writes_are() {
+        // The exact variant the inotify backend produced during `git add -A`
+        // and `git commit` inside a watched worktree (measured, WSL).
+        assert!(
+            !is_change_event(&EventKind::Access(AccessKind::Open(AccessMode::Any))),
+            "opening a file for READING is not a change to the tree: git reads every tracked \
+             file during `add`/`commit`, and treating those opens as changes is what appended a \
+             post-merge `diff.ready` over the merged one"
+        );
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+
+        // A completed WRITE reported through the same enum is a change.
+        assert!(
+            is_change_event(&EventKind::Access(AccessKind::Close(AccessMode::Write))),
+            "`Close(Write)` is the one Access variant that reports a finished write; ignoring it \
+             would risk dropping a real change on a backend that reports writes that way"
+        );
+        assert!(is_change_event(&EventKind::Create(CreateKind::File)));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_change_event(&EventKind::Remove(RemoveKind::File)));
+        // Unclassified events stay changes: not knowing what happened is not
+        // evidence that nothing did.
+        assert!(is_change_event(&EventKind::Any));
+        assert!(is_change_event(&EventKind::Other));
+    }
 }

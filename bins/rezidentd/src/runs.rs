@@ -1764,6 +1764,29 @@ async fn drive_run(
         )?;
         publish(&ctx.daemon.fabric, event).await?;
     }
+
+    // OWED: the allocation is never RELEASED — recorded here because this is
+    // where the release would go (2026-07-24, registry-convergence
+    // remediation).
+    //
+    // The run is over. DR-007's ratified worktree lifecycle is allocate → use →
+    // release, and `RepoSubstrate::release_worktree` is implemented and tested
+    // — but nothing in production calls it, so the third step never runs. Per
+    // completed run that leaks a `notify` watcher plus its detached debounce
+    // task (both live for the daemon's lifetime), leaves the tree on disk, and
+    // leaves the sole-allocator registry entry open, so the registry's live
+    // claims only ever grow. The watch outliving the run is not academic: the
+    // adapter's `is_change_event` filter exists because merge activity in a
+    // still-watched tree was appending a `diff.ready` over the merged one.
+    //
+    // Not closed here because releasing is a design call, not a line of code:
+    // `release_worktree` removes the tree and emits `worktree.released`, which
+    // the S4 reducer folds to `status = "released"` OVER the `"merged"` that
+    // `diff.merged` just set — so wiring it in without deciding what a merged-
+    // then-released worktree reads as would trade one derived-state regression
+    // for another. It also needs the `WorktreeId` threaded into
+    // `RunTaskContext` (which carries only the path today) and an answer for
+    // whether a FAILED run's tree should survive for triage.
     Ok(())
 }
 

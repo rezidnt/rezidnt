@@ -133,11 +133,19 @@ fn rezidentd_depends_on_the_git_adapter_in_production() {
 /// the ruling and its reasoning now stand in `runs.rs` at the emit site and in
 /// the adapter's module header.
 ///
-/// What this guard holds is the DAEMON side of that ruling: one construction
-/// site, so a third emitter cannot appear the way the second one silently did.
-/// Same disclosure as the guard below — it matches one literal and a subject
-/// assembled from a variable would slip past it. The counting judge is
-/// `bins/rezidentd/tests/registry_convergence_e2e.rs`, which is `#[cfg(unix)]`.
+/// What this guard holds is NARROW, and the claim is written to the guard
+/// rather than to the hope (corrected 2026-07-24): `runs.rs` constructs this
+/// subject at exactly ONE site. That is all. It would NOT have caught the
+/// second emitter and would not catch a recurrence of it — the second emitter
+/// appeared in the ADAPTER, as a side effect of `alloc_worktree` starting a
+/// notify watch, and never as a `Subject::new("diff.ready")` literal in this
+/// file. This guard scans one file for one literal; an emit elsewhere in the
+/// daemon, an emit in a crate, or a subject assembled from a variable all slip
+/// past it. Say "one site in `runs.rs`", never "a third emitter cannot
+/// appear". The counting judge over BOTH emitters is
+/// `bins/rezidentd/tests/registry_convergence_e2e.rs`, which is `#[cfg(unix)]`
+/// and therefore outside host `/vet` — which is the gap this file narrows and
+/// does not close.
 #[test]
 fn the_daemon_mints_diff_ready_at_exactly_one_site() {
     const LITERAL: &str = r#"Subject::new("diff.ready")"#;
@@ -148,11 +156,13 @@ fn the_daemon_mints_diff_ready_at_exactly_one_site() {
     assert_eq!(
         hits,
         1,
-        "the daemon's `diff.ready` is the gate-time pin at `run_pre_merge` and nothing else. \
-         The adapter's watcher is the subject's OTHER emitter and that split is deliberate and \
-         documented; a THIRD site is not — it would put facts on the log that neither the \
-         watcher's continuous-observation semantics nor the gate's deterministic-pin semantics \
-         describe, and no reader could tell which they were reading. Found {hits} in {}",
+        "the daemon's `diff.ready` is the gate-time pin at `run_pre_merge` and nothing else IN \
+         THIS FILE. The adapter's watcher is the subject's OTHER emitter and that split is \
+         deliberate and documented; a further site here is not — it would put facts on the log \
+         that neither the watcher's continuous-observation semantics nor the gate's \
+         deterministic-pin semantics describe, and no reader could tell which they were reading. \
+         This is a single-file literal scan, not a proof that no third emitter exists anywhere. \
+         Found {hits} in {}",
         runs.display()
     );
 }

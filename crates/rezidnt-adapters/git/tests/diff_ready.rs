@@ -282,6 +282,175 @@ async fn a_refused_diff_ready_is_retried_not_suppressed_as_a_duplicate() {
     assert!(offers[1].1, "the retry was accepted, so the log now has it");
 }
 
+/// A `git add -A` + `git commit` INSIDE the still-watched tree — exactly what
+/// `bins/rezidentd/src/gates.rs::merge_worktree` runs on the golden path —
+/// appends NO further `diff.ready`.
+///
+/// ## What this pins (measured, not reasoned)
+///
+/// Nothing releases the watch: `release_worktree` has no production caller, so
+/// the watcher outlives the run and is still armed when the merge mutates the
+/// tree. Those two commands change nothing inside a linked worktree (its index,
+/// refs and objects live in the private gitdir) — but they READ every tracked
+/// file, and the inotify backend arms `IN_OPEN`, so each read surfaced as
+/// `EventKind::Access(Open)` and woke the debounce loop like a write. 250 ms
+/// later the post-commit tree was clean, summarized to the bare 26-byte header,
+/// and appended a `diff.ready` carrying the finished run's correlation — which
+/// `WorktreeState.last_diff` then took last-write-wins over the value
+/// `diff.merged` had set moments earlier, leaving derived state disagreeing
+/// with the log about what was merged (I3).
+///
+/// ## Platform disclosure (this board is host-runnable and this test is not
+/// uniformly meaningful)
+///
+/// Measured before the fix: 1 post-merge `diff.ready` under WSL, 0 under
+/// Windows. `ReadDirectoryChangesW` has no open/read notification, so on
+/// Windows this test passed on the DEFECTIVE tree too and still would — it is
+/// a real judge on Linux only, which is the daemon's platform and the one host
+/// `/vet` cannot see. The platform-independent leg is the unit test on
+/// `is_change_event` in `src/lib.rs`, which judges the same rule by variant;
+/// the golden-path leg is
+/// `bins/rezidentd/tests/registry_convergence_e2e.rs::the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact`.
+#[tokio::test]
+async fn a_git_commit_inside_the_watched_tree_is_not_a_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    util::init_committed_repo(&repo);
+
+    let adapter = GitAdapter::open(&repo, &tmp.path().join("cas"))
+        .await
+        .unwrap();
+    let mut rx = adapter.subscribe();
+    let wt = adapter
+        .alloc_worktree(branch_req("feat-merge", "feat/merge"))
+        .await
+        .unwrap();
+    util::recv_subject(&mut rx, "worktree.allocated", OUTER).await;
+
+    // The agent's change, and the watcher fact it legitimately produces.
+    std::fs::write(wt.path.join("agent_change.txt"), "the agent's change\n").unwrap();
+    let before = util::recv_subject(&mut rx, "diff.ready", OUTER).await;
+    let before_hash = payload_diff_ref(&before).hash;
+    assert!(
+        before.payload()["diff"]["bytes"].as_u64().unwrap_or(0) > 26,
+        "precondition: the pre-merge summary describes a DIRTY tree — a header-only summary here \
+         would make the post-merge comparison below meaningless"
+    );
+    // Quiesce, so what follows measures the merge burst and nothing before it.
+    let _ = util::drain_for(&mut rx, Duration::from_millis(600)).await;
+
+    // `merge_worktree` step 1, verbatim.
+    let plain = util::plain_spelling(&wt.path);
+    util::git(&plain, &["add", "-A"]);
+    util::git(
+        &plain,
+        &[
+            "-c",
+            "user.email=rezidnt@localhost",
+            "-c",
+            "user.name=rezidnt",
+            "commit",
+            "-q",
+            "-m",
+            "rezidnt: verified merge",
+        ],
+    );
+
+    // Well past the 250 ms debounce: a woken loop has had time to fire.
+    let after = util::drain_for(&mut rx, Duration::from_millis(1500)).await;
+    let ready: Vec<&rezidnt_types::Event> = after
+        .iter()
+        .filter(|e| e.subject.as_str() == "diff.ready")
+        .collect();
+    assert!(
+        ready.is_empty(),
+        "committing inside the watched tree appended {} further `diff.ready` fact(s). Those \
+         commands write nothing in the worktree — they only read it — so a fact here means reads \
+         are waking the debounce loop again, and on the golden path this one lands AFTER \
+         `diff.merged` and overwrites the merged diff in `WorktreeState.last_diff` (I3). \
+         Pre-merge summary was {before_hash}; post-merge facts: {:#?}",
+        ready.len(),
+        ready
+            .iter()
+            .map(|e| e.payload().clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// QUIESCENCE — an allocated worktree that nobody touches produces no
+/// filesystem activity at all.
+///
+/// The second measured consequence of the same root cause, and the one no other
+/// board could see. [`summarize_to_cas`] READS the tree to hash it; when reads
+/// woke the debounce loop, summarizing re-armed the watch that had just fired
+/// it, so the loop re-summarized every 250 ms for the life of the allocation.
+/// The `last_hash` dedup kept those repeats off the log, which is exactly why it
+/// was invisible: `write_burst_coalesces_into_one_diff_ready` asserts no
+/// trailing FACT and passed throughout, while a gix status walk plus a blake3 of
+/// the changed files ran four times a second, per allocated worktree, forever.
+///
+/// So this test judges the tree, not the log: an independent watcher counts raw
+/// notify events in a window where the test does nothing. Measured 40 before the
+/// fix, 0 after. Windows reports no reads, so — like the merge guard above —
+/// this is a real judge on Linux only; the platform-independent statement of the
+/// rule is the `is_change_event` unit test in `src/lib.rs`.
+#[tokio::test]
+async fn an_allocated_worktree_goes_quiet_when_nothing_touches_it() {
+    use notify::Watcher as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    util::init_committed_repo(&repo);
+
+    let adapter = GitAdapter::open(&repo, &tmp.path().join("cas"))
+        .await
+        .unwrap();
+    let mut rx = adapter.subscribe();
+    let wt = adapter
+        .alloc_worktree(branch_req("feat-quiet", "feat/quiet"))
+        .await
+        .unwrap();
+    util::recv_subject(&mut rx, "worktree.allocated", OUTER).await;
+
+    // An independent watcher over the same tree: it sees whatever the ADAPTER
+    // does to that tree, including the reads its own summary performs.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let mut spy = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            recorder
+                .lock()
+                .expect("spy lock")
+                .push(format!("{:?} {:?}", ev.kind, ev.paths));
+        }
+    })
+    .expect("spy watcher");
+    spy.watch(&wt.path, notify::RecursiveMode::Recursive)
+        .expect("watch the allocated tree");
+
+    // One write, and the fact it legitimately produces — the trigger that used
+    // to start the treadmill.
+    std::fs::write(wt.path.join("one_write.txt"), "then silence\n").unwrap();
+    let _ = util::recv_subject(&mut rx, "diff.ready", OUTER).await;
+
+    // Let the emission and its own reads settle, then observe a window in which
+    // the TEST touches nothing whatsoever.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    seen.lock().expect("spy lock").clear();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let during_quiet = seen.lock().expect("spy lock").clone();
+    assert!(
+        during_quiet.is_empty(),
+        "the adapter generated {} filesystem event(s) over a tree nothing touched for 2 s. That \
+         is the adapter reading its own watched tree and re-arming its own watch: summarize → \
+         reads → wake → summarize, four times a second, for as long as the allocation lives. No \
+         fact reaches the log (the summary is identical and `last_hash` suppresses it), so \
+         nothing else on this board can see it. Events: {during_quiet:#?}",
+        during_quiet.len()
+    );
+}
+
 /// Poll `sink` until it has been offered `want` `diff.ready` facts, or panic at
 /// `deadline`. Polling (not sleeping) keeps the wait proportional to the 250 ms
 /// debounce without turning a hang guard into a timing assertion.

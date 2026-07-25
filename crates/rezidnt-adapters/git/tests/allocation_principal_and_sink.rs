@@ -401,6 +401,21 @@ async fn the_allocation_fact_reaches_the_sink_with_its_workspace_and_causation()
 ///
 /// Without this leg, an implementation that logged-and-continued on a failed
 /// append would pass every other test on this board.
+///
+/// ## The rollback legs (added by remediation, 2026-07-24)
+///
+/// `outcome.is_err()` alone was the whole test, and it was the weaker half. The
+/// module header's four-case fact-delivery split makes its STRONGEST claim about
+/// this path — the refusal fails the allocation *and the tree just created is
+/// taken back off disk* — and nothing asserted the second clause, so an
+/// implementation that returned `Err` while leaving an unregistered worktree
+/// behind passed. The disk and registry legs below are that clause.
+///
+/// Removal is BEST-EFFORT by construction (a `worktree remove` failure is
+/// warned and the tree stays), so this asserts what the code does on the path
+/// it can actually reach: in a healthy tempdir the removal succeeds, and the
+/// registry — which is written only after a successful emit — was never touched
+/// at all.
 #[tokio::test]
 async fn an_allocation_whose_fact_cannot_be_appended_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -419,5 +434,131 @@ async fn an_allocation_whose_fact_cannot_be_appended_fails() {
         "a sink refusal FAILS the allocation: the append is the commit point (I3), and an \
          allocation whose fact never reached the log is a tree on disk that the log does not \
          know about — underivable state. Got: {outcome:?}"
+    );
+
+    // DISK: the tree `git worktree add` created is gone. Located from the
+    // adapter's own layout constant rather than a re-derived guess, so a layout
+    // move cannot turn this leg into a check of a path nothing ever used.
+    let tree = repo
+        .join(rezidnt_adapter_git::WORKTREE_BASE)
+        .join("unappendable");
+    assert!(
+        !tree.exists(),
+        "the tree created for a refused allocation is taken back off disk. Left behind, it is a \
+         worktree the log never heard of: `git worktree list` reports it, the next reconciliation \
+         scan discovers it as a HUMAN tree, and the allocation that failed reappears as somebody \
+         else's. Still at {}",
+        tree.display()
+    );
+
+    // REGISTRY: nothing was claimed. The entry is written after the emit, so a
+    // refusal must leave no claim — a claimed path with no log fact is the
+    // sole-allocator registry asserting an allocation that never happened.
+    let entries = util::registry_entries_if_any(&repo);
+    assert!(
+        entries.is_empty(),
+        "a refused allocation claims nothing in the sole-allocator registry (DR-001): a claim \
+         with no `worktree.allocated` on the log would block the path forever against an \
+         allocation the log cannot show. Registry holds: {entries:#?}"
+    );
+}
+
+/// The `observe` counterpart, and the ordering defect it pins (remediation,
+/// 2026-07-24) — a REFUSED `worktree.observed` leaves NO durable registry
+/// entry, and the discovery stays news.
+///
+/// ## The defect
+///
+/// `observe` persisted the `"human"` registry entry BEFORE emitting. On a
+/// refusal it returned `Err` with that entry already on disk — and because the
+/// entry IS the observed mark, the discovery became unrecoverable: the
+/// re-observation arm returns `Ok(())` for any `"human"` entry, and the on-open
+/// reconciliation scan skips `"human"` entries as already-observed. The
+/// registry asserted a fact the log never received (I3), permanently and
+/// silently. Same shape as the `debounce_loop` suppression-hash bug the same
+/// remediation fixed, with the ordering inverted.
+///
+/// ## What passes and what fails
+///
+/// Three legs. The refusal fails the call; the registry FILE holds nothing
+/// afterwards; and a RESTARTED adapter — which reloads that file and is the
+/// only reader that can prove durability rather than in-memory state — still
+/// reports the tree as a discovery. The third leg is the one the defect fails:
+/// with a durable `"human"` entry present, pass 1 of the reconciliation scan
+/// skips it as already-observed and pass 2 never sees it, so the restart is
+/// silent and the fact is lost for good.
+///
+/// The human tree is created AFTER the adapter opens, deliberately: `open` runs
+/// the reconciliation scan, so a tree that exists beforehand is discovered by
+/// the scan and `observe` is never the emitter under test.
+#[tokio::test]
+async fn a_refused_observation_leaves_no_mark_and_stays_news() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    util::init_committed_repo(&repo);
+
+    let refusing = GitAdapter::open(&repo, &tmp.path().join("cas"))
+        .await
+        .expect("open adapter")
+        .with_sink(Arc::new(FailingSink) as Arc<dyn FactSink>);
+
+    // A human tree, added out-of-band once the scan has already run.
+    let human = tmp.path().join("human-tree");
+    util::git(
+        &util::plain_spelling(&repo),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &util::plain_spelling(&human).to_string_lossy(),
+        ],
+    );
+
+    let outcome = refusing.observe(&human).await;
+    assert!(
+        outcome.is_err(),
+        "a refused `worktree.observed` fails the observation — `observe`'s whole contract is \
+         \"record this discovery\" (module header, fact-delivery split). Got: {outcome:?}"
+    );
+    let entries = util::registry_entries_if_any(&repo);
+    assert!(
+        entries.is_empty(),
+        "and it leaves NO registry entry. A durable `\"human\"` entry here is the mark for a \
+         fact the log never received: re-observation then returns `Ok(())` and the on-open scan \
+         skips `\"human\"` entries, so the discovery is lost forever while the registry asserts \
+         it happened (I3). Registry holds: {entries:#?}"
+    );
+    drop(refusing);
+
+    // RESTART — the durability leg. A fresh adapter reloads the registry file
+    // and reconciles against reality; the tree must come back as news.
+    let restarted = GitAdapter::open(&repo, &tmp.path().join("cas2"))
+        .await
+        .expect("re-open adapter over the same repo");
+    let facts = restarted.startup_facts();
+    let observed: Vec<&Event> = facts
+        .iter()
+        .filter(|e| e.subject.as_str() == "worktree.observed")
+        .filter(|e| {
+            e.payload()["path"]
+                .as_str()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .is_some_and(|p| p == util::canon(&human))
+        })
+        .collect();
+    assert_eq!(
+        observed.len(),
+        1,
+        "a restart re-announces the discovery the log never received. Zero means the refused \
+         attempt left its mark on disk after all — the entry the scan reads as \"already \
+         observed, never news\" — and no reader will ever surface this tree again. Startup \
+         facts: {facts:#?}"
+    );
+    assert_eq!(
+        observed[0].payload()["allocator"],
+        serde_json::json!("human"),
+        "and it is recorded as a HUMAN tree (ontology `worktree.observed` v1): {:#}",
+        observed[0].payload()
     );
 }

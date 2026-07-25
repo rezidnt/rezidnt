@@ -12,6 +12,13 @@
 //! left here is the part that genuinely needs a daemon: two emitters in one
 //! process, and a persisted log to count on.
 //!
+//! A fifth test —
+//! `the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact` — was added
+//! by the same remediation and is likewise a guard rather than an oracle: it
+//! pins the golden-path consequence of the watcher outliving the run, which the
+//! repoint made reachable and which reproduced under WSL (never under Windows;
+//! the backends differ on whether reads are reported). See its own header.
+//!
 //! ## RED MODE
 //!
 //! The three ORACLE tests were ASSERT-RED on the pre-repoint tree, for distinct
@@ -58,6 +65,7 @@ use std::time::Duration;
 
 use common::{DaemonGuard, connect, make_gated_project, open_request, read_until, send_line};
 use rezidnt_fabric::EventLog;
+use rezidnt_state::fold;
 use rezidnt_types::Event;
 use serde_json::Value;
 
@@ -321,6 +329,155 @@ fn every_allocated_path_is_claimed_in_the_sole_allocator_registry() {
             fact.payload()
         );
     }
+}
+
+/// Drive one gated `open` through `diff.merged`, then keep the daemon ALIVE
+/// for [`POST_MERGE_WATCH`] before cold-reading.
+///
+/// The wait is the whole point and is not padding: the adapter's watcher is
+/// debounced 250 ms and nothing releases it, so a fact provoked by the merge
+/// lands roughly a quarter-second after `diff.merged`. [`cold_read`] kills the
+/// daemon the instant the merge is seen, which is early enough to cut that
+/// window off entirely — a board that skipped the wait would be reporting the
+/// daemon's death, not the adapter's behavior.
+fn open_and_cold_read_after_merge_settles() -> (tempfile::TempDir, Vec<Event>) {
+    let mut daemon = common::start_daemon();
+    let (project, spec) = make_gated_project(HARNESS_GAP_MS);
+
+    let mut opener = connect(&daemon.socket);
+    send_line(&mut opener, &open_request(&spec));
+
+    let mut tail = connect(&daemon.socket);
+    send_line(&mut tail, r#"{"op":"tail"}"#);
+    let _ = read_until(&mut tail, Duration::from_secs(45), |v: &Value| {
+        v["subject"] == "diff.merged"
+    });
+    std::thread::sleep(POST_MERGE_WATCH);
+
+    let log = cold_read(&mut daemon);
+    (project, log)
+}
+
+/// How long the daemon outlives `diff.merged` before the log is read.
+///
+/// 1.5 s against a 250 ms debounce: six windows, so a merge-provoked fact has
+/// no timing excuse for being absent.
+const POST_MERGE_WATCH: Duration = Duration::from_millis(1500);
+
+/// THE MERGED DIFF SURVIVES THE MERGE — no watcher fact lands after
+/// `diff.merged` and overwrites what it recorded.
+///
+/// ## The defect this pins (reproduced, then fixed)
+///
+/// `gates::merge_worktree` runs `git add -A` + `git commit` INSIDE the
+/// worktree, and the worktree is still watched — `release_worktree` has no
+/// production caller, so the watch outlives the run it was started for. Those
+/// commands write nothing inside a linked tree (its index and refs live in the
+/// private gitdir, its objects in the shared repo); they only READ the tracked
+/// files. But the inotify
+/// backend arms `IN_OPEN`, so every read arrived as `EventKind::Access(Open)`
+/// and the adapter's watcher treated it as a change. 250 ms later the tree —
+/// clean, because the commit had just absorbed it — summarized to the bare
+/// 26-byte header and appended a fresh `diff.ready` carrying the finished run's
+/// correlation. `WorktreeState.last_diff` is last-write-wins, so that
+/// header-only summary replaced the merged diff `diff.merged` had set moments
+/// before, on a worktree already folded `status = "merged"`.
+///
+/// Nothing failed. The log stayed append-only and honest; only the DERIVED
+/// state ended up asserting a diff that was not what was merged — I3's failure
+/// mode exactly, and invisible to every board that stopped reading at
+/// `diff.merged`.
+///
+/// The fix is in the adapter (`is_change_event`): reads no longer wake the
+/// debounce loop. This board judges the CONSEQUENCE on the golden path rather
+/// than the mechanism, so it stays a valid judge if the mechanism is ever
+/// replaced by releasing the watch at merge.
+///
+/// ## Non-vacuity
+///
+/// Two legs make the pass mean something. The fixture must have observed the
+/// WATCHER as a live emitter before the merge (otherwise a world with no
+/// watcher at all passes), and the daemon must have outlived the debounce
+/// window ([`POST_MERGE_WATCH`]).
+#[test]
+fn the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact() {
+    let (_project, log) = open_and_cold_read_after_merge_settles();
+
+    let merged_at = log
+        .iter()
+        .position(|e| e.subject.as_str() == "diff.merged")
+        .expect("precondition: the gated run merged (the fixture waits for `diff.merged`)");
+    let merged = &log[merged_at];
+    let worktree = merged.payload()["worktree"]
+        .as_str()
+        .expect("`diff.merged` names the worktree it closed")
+        .to_string();
+    let merged_hash = merged.payload()["diff"]["hash"]
+        .as_str()
+        .expect("`diff.merged` carries the merged summary as a CAS ref (I2)")
+        .to_string();
+
+    // NON-VACUITY: the watcher was live on this log before the merge. Without
+    // this, a run whose watcher never fired would satisfy everything below.
+    let watcher_before = log[..merged_at]
+        .iter()
+        .filter(|e| {
+            e.subject.as_str() == "diff.ready"
+                && e.source.as_str() == rezidnt_adapter_git::SOURCE_ID
+        })
+        .count();
+    assert!(
+        watcher_before > 0,
+        "precondition: the adapter's watcher appended at least one `diff.ready` BEFORE the merge, \
+         so this board is observing a live watcher rather than the absence of one. Zero means \
+         either the watch never started or the fixture stopped outliving the 250 ms debounce \
+         (see `HARNESS_GAP_MS`), and the assertions below would then be vacuous"
+    );
+
+    // The regression, stated on the log: nothing about this worktree lands
+    // after the merge closed it.
+    let after: Vec<&Event> = log[merged_at + 1..]
+        .iter()
+        .filter(|e| {
+            e.subject.as_str() == "diff.ready"
+                && e.payload()["worktree"].as_str() == Some(&worktree)
+        })
+        .collect();
+    assert!(
+        after.is_empty(),
+        "a `diff.ready` for {worktree} landed AFTER `diff.merged` closed it. The merge commits \
+         inside the still-watched tree, so a fact here means the merge's own filesystem activity \
+         woke the watcher: the post-commit tree is clean, its summary is the bare header, and it \
+         overwrites the merged diff in derived state. Facts: {:#?}",
+        after
+            .iter()
+            .map(|e| e.payload().clone())
+            .collect::<Vec<_>>()
+    );
+
+    // And the consequence, stated on the FOLD — the thing a client actually
+    // reads. Asserted independently of the leg above so that a future
+    // post-merge fact which is genuinely new information (a real write into the
+    // tree after the merge) is judged on whether it corrupts the merge record,
+    // not merely on existing.
+    let graph = fold(log.iter());
+    let state = graph
+        .worktrees
+        .get(&worktree)
+        .unwrap_or_else(|| panic!("the fold holds a worktree entry for {worktree}"));
+    assert_eq!(
+        state.status, "merged",
+        "the worktree stays folded `merged` — its lifecycle closed at `diff.merged`"
+    );
+    assert_eq!(
+        state.last_diff.as_deref(),
+        Some(merged_hash.as_str()),
+        "derived state records the diff that was MERGED. Any other value means the log's last \
+         word about this tree is not the merge — and since the log is truth (I3), a `last_diff` \
+         that disagrees with `diff.merged` is derived state asserting a merge that did not \
+         happen. Folded: {:?}",
+        state.last_diff
+    );
 }
 
 /// Drive one gated `open` all the way through `pre_merge` to `diff.merged`,

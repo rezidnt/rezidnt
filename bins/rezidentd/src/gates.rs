@@ -555,6 +555,22 @@ async fn git_added_content(worktree: &Path) -> anyhow::Result<Vec<u8>> {
 /// Mutation shape: commit every change in the worktree onto its own head, then
 /// `git merge` that head into the repo's current branch. The change reaches the
 /// repo's checked-in history (the golden-path exit reads `git show HEAD:…`).
+///
+/// **This runs inside a STILL-WATCHED tree, and that used to matter.** Nothing
+/// releases the git adapter's notify watch (`release_worktree` has no
+/// production caller — see the note at the end of `drive_run`), so the watcher
+/// is armed while these commands run. They write nothing inside a linked
+/// worktree — its index and refs live in the private gitdir, its objects in the
+/// shared repo — but they READ every tracked file, and the inotify backend
+/// reports reads. Those reads
+/// woke the adapter's debounce loop, which 250 ms later summarized the
+/// now-clean tree to a header-only diff and appended a `diff.ready` that
+/// overwrote `WorktreeState.last_diff` for a worktree `diff.merged` had just
+/// closed. Fixed in the adapter (`is_change_event`: reads are not changes);
+/// guarded on the golden path by
+/// `bins/rezidentd/tests/registry_convergence_e2e.rs::the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact`.
+/// Anything added here that WRITES into the worktree after the merge will
+/// legitimately wake the watcher again, so weigh it against that guard.
 #[allow(clippy::too_many_arguments)]
 pub async fn merge_worktree(
     daemon: &Arc<Daemon>,

@@ -127,6 +127,20 @@ pub fn registry_entries(repo_root: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Registry entries, tolerating a registry file that does not exist.
+///
+/// The strict [`registry_entries`] panics on a missing file, which is right
+/// where an allocation is supposed to have written one. It is exactly wrong for
+/// a test asserting that a FAILED operation left nothing behind: "no registry
+/// at all" is the strongest form of the pass and must not read as an error.
+pub fn registry_entries_if_any(repo_root: &Path) -> Vec<serde_json::Value> {
+    let path = repo_root.join(rezidnt_adapter_git::REGISTRY_PATH);
+    if !path.exists() {
+        return Vec::new();
+    }
+    registry_entries(repo_root)
+}
+
 /// Registry entries whose `path` field canonicalizes to the same file as
 /// `target` (the registry keys canonicalized paths — DR-001 BINDING rule).
 pub fn registry_entries_for(repo_root: &Path, target: &Path) -> Vec<serde_json::Value> {

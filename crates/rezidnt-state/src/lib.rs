@@ -1020,6 +1020,26 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             // OUTCOME ONLY, symmetric with `diff.merged`: `lifecycle` stays
             // whatever the `worktree.*` facts made it, because a failed tree
             // survives for triage until an explicit release (§Decision 3).
+            //
+            // ORDERING EXPOSURE, recorded because it lives nowhere else in the
+            // tree. This arm is GATE-NAME-AGNOSTIC: any `gate.failed` carrying
+            // a `worktree` writes `outcome = "failed"`, last write wins. So a
+            // gate that runs with an exec cwd AFTER a merge would overwrite
+            // `"merged"` with `"failed"` on a tree that did in fact merge.
+            //
+            // No guard is placed here, deliberately. `spec/ontology.md:330`
+            // declares `worktree?` present IFF the gate executed against an
+            // allocated tree, and names `pre_merge` only as the golden-path
+            // case — so a fold that accepted the field from one gate name and
+            // dropped it from every other would be narrowing the taxonomy from
+            // the reducer, which is the wrong end of I3. The taxonomy is where
+            // that ruling belongs.
+            //
+            // Today the exposure is unreachable on the golden path: `pre_merge`
+            // is the only gate given a worktree cwd, the release follows the
+            // merge immediately (`bins/rezidentd/src/runs.rs`), and a released
+            // tree runs no further gates. If a post-merge gate is ever minted,
+            // this is the line it invalidates — route `/subject` first.
             if let Some(path) = event.payload()["worktree"].as_str() {
                 graph.worktrees.entry(path.to_string()).or_default().outcome =
                     Some("failed".to_string());

@@ -47,6 +47,39 @@
 //! here rather than dressed up, in the house style of
 //! `bench/harness/tests/testkit_dev_only.rs`.
 //!
+//! ## Why the allocation board drives a VET-ONLY run (DR-049 remediation)
+//!
+//! The three allocation criteria assert on DISK as well as on the log — the
+//! allocated path exists, and the sole-allocator registry holds its claim.
+//! Those two facts are true only while the tree is unreleased, and DR-049
+//! §Decision 1 gave `release_worktree` its first production caller: a merged
+//! tree releases itself, `git worktree remove --force` deletes it, and
+//! `state.registry.remove(&path_str)` closes the claim.
+//!
+//! `open_and_cold_read` used to drive the FULL gated fixture and stop at
+//! `agent.completed`, then kill. But the whole `diff.ready -> pre_merge ->
+//! diff.merged -> release` chain runs AFTER `agent.completed`, so the kill was
+//! racing that chain: the board passed only when the kill won. A lost race
+//! deleted the tree and emptied the registry, and the failure then surfaced as
+//! the C3 panic accusing the daemon of allocating outside `RepoSubstrate` —
+//! naming a DR-046 convergence regression for what is a `kill()` landing late.
+//! The misdirection was the real cost; a future session would have hunted the
+//! wrong defect.
+//!
+//! The fix removes the chain rather than trying to outrun it. These three tests
+//! are about the ALLOCATION, and an allocation needs no merge, so they drive
+//! [`make_vet_only_project`]: gates `["vet"]` only, no `pre_merge` plan, and
+//! therefore no merge and no release. `agent.completed` becomes the run's
+//! terminal fact instead of a mid-chain one, the tree and its claim persist for
+//! the life of the fixture, and not one assertion changed. (Stopping at
+//! `diff.merged` instead — the last fact before the release — would have made
+//! the race WORSE, not better: the release is the unconditional next step after
+//! the merge, so that kill would lose nearly always.)
+//!
+//! The two merge-dependent tests below keep the full `make_gated_project`
+//! fixture: they are about what happens AT and after the merge, and they read
+//! only the log.
+//!
 //! ## The registry-backing test is the anti-tautology guard
 //!
 //! A repoint could be faked: keep the private git-CLI allocator and just make
@@ -84,6 +117,60 @@ const FACT_DEADLINE: Duration = Duration::from_secs(30);
 /// and not CI weather.
 const HARNESS_GAP_MS: u64 = 700;
 
+/// A VET-ONLY project: the [`make_gated_project`] shape — committed seed,
+/// diff-writing stub harness — with `gates = ["vet"]` and NO `pre_merge`, so
+/// the agent's spawn is still gate-admitted (the vet verdict is what causes the
+/// allocation, which criterion C2 resolves) but the run has no merge chain.
+///
+/// **This exists to delete a race, not to weaken a fixture** (see the module
+/// header's "Why the allocation board drives a vet-only run"). Nothing in a
+/// vet-only run touches the worktree or the registry after `agent.allocated`:
+/// `drive_run` skips `run_pre_merge` entirely when the agent names no
+/// `pre_merge` gate (`bins/rezidentd/src/runs.rs`), so the tree stays on disk
+/// with its registry claim open as a TERMINAL state, for as long as the
+/// project `TempDir` lives. Every assertion the three allocation criteria make
+/// is about the allocation, and none of them needs a merge.
+fn make_vet_only_project(gap_ms: u64) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src/checkout")).expect("mkdir repo/src/checkout");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "oracle@rezidnt.test"]);
+    git(&["config", "user.name", "rezidnt oracle"]);
+    std::fs::write(repo.join("src/checkout/cart.rs"), "// cart v0\n").expect("seed file");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "registry-convergence allocation seed"]);
+
+    let harness = common::gated_stub_harness(dir.path(), gap_ms);
+    let spec = format!(
+        r#"[project]
+name = "registry-convergence"
+repo = "{repo}"
+
+[[agent]]
+name = "impl"
+harness = "claude-code"
+worktree = "auto"
+gates = ["vet"]
+bare = true
+harness_version = "2.1.191"
+allowed_tools = ["Read", "Edit"]
+bin_override = "{harness}"
+"#,
+        repo = repo.display(),
+        harness = harness.display(),
+    );
+    (dir, spec)
+}
+
 /// Drive one `open` to completion and cold-read the daemon's PERSISTED log —
 /// the log is the judge, not the live stream (I3).
 ///
@@ -92,7 +179,7 @@ const HARNESS_GAP_MS: u64 = 700;
 /// the project alive for the whole test.
 fn open_and_cold_read() -> (tempfile::TempDir, std::path::PathBuf, Vec<Event>) {
     let mut daemon = common::start_daemon();
-    let (project, spec) = make_gated_project(50);
+    let (project, spec) = make_vet_only_project(50);
     let repo = project.path().join("repo");
 
     let mut opener = connect(&daemon.socket);
@@ -105,6 +192,25 @@ fn open_and_cold_read() -> (tempfile::TempDir, std::path::PathBuf, Vec<Event>) {
     });
 
     let log = cold_read(&mut daemon);
+
+    // THE FIXTURE'S OWN GUARD — this run reached no merge and no release, so
+    // the on-disk assertions the three criteria make are reading a TERMINAL
+    // state rather than racing a chain (module header). Asserted rather than
+    // trusted: if a future change gives the vet-only spec a merge path again,
+    // the on-disk legs below silently become flaky and their failure accuses
+    // the ALLOCATOR of a DR-046 regression it did not commit. Better to fail
+    // here, naming the actual cause.
+    for subject in ["diff.merged", "worktree.released"] {
+        assert!(
+            log.iter().all(|e| e.subject.as_str() != subject),
+            "the allocation fixture must drive a run that never merges and never releases — a \
+             `{subject}` on this log means the merge chain is back, the allocated tree is being \
+             removed and its registry claim closed while this board reads them off disk, and \
+             every on-disk assertion below is now a race. Subjects seen: {:?}",
+            log.iter().map(|e| e.subject.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     (project, repo, log)
 }
 

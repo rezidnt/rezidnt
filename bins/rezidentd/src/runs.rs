@@ -203,8 +203,11 @@ pub struct Daemon {
     /// [`WorktreeId`], the MCP release door is keyed by PATH (the identity
     /// every consumer already has — the fold's map key, the registry line, the
     /// `worktree.released` payload), and the trait has no path→id lookup. It
-    /// does not get one: DR-007's three-method trait stands, and DR-049 mints
-    /// no trait method. So the daemon remembers what it allocated.
+    /// does not get one: `RepoSubstrate` keeps DR-007's three methods, and
+    /// DR-049 adds none to IT. (DR-049 does mint a trait method — but on
+    /// `McpSubstrate`, the MCP core's seam onto the daemon, which is where the
+    /// path→id resolution below is performed. The repo trait stays keyed by
+    /// [`WorktreeId`].) So the daemon remembers what it allocated.
     ///
     /// NOT derived state pretending to be truth (I3): this is a handle table
     /// for a runtime resource — the same class as `repo_adapters` and the run

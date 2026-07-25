@@ -267,6 +267,33 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch
 
+      # ---- Trap 4: the runner forbids the sandbox the egress tests exercise --
+      # `crates/rezidnt-run/tests/egress_mediation_c3bc.rs` stands up a real
+      # network namespace via pasta to prove DR-029 mediation (the agent reaches
+      # the allowlisted host ONLY through the proxy, and never sees the injected
+      # credential). Ubuntu 24.04 ships
+      # `kernel.apparmor_restrict_unprivileged_userns=1`, so the runner answers
+      # the probe's `clone()` and `/proc/self/uid_map` write with EPERM and all
+      # four tests die in setup — a RED lane that says nothing about the code.
+      # It was red from the day this workflow landed; local host and WSL runs are
+      # green, because both permit the namespace.
+      #
+      # Granting the capability keeps the lane HONEST rather than muting it: the
+      # tests still prove mediation for real. The alternative — degrading a
+      # missing sandbox to `inconclusive` per I6's `could_not_run` — is the more
+      # principled fix for a genuinely capability-less environment, and is
+      # deliberately NOT taken here, because on THIS runner the capability is
+      # available for the asking and an inconclusive would forfeit the proof.
+      # Owner-ruled 2026-07-25. Linux only; the Windows lane skips these tests
+      # by `#[cfg(unix)]` and has always been green.
+      - name: Permit unprivileged user namespaces (Linux egress sandbox tests)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Prove the grant took, rather than trusting it: an unprivileged
+          # `unshare -Ur` is exactly the operation the probe's setup performs.
+          unshare -Ur true && echo "unprivileged userns: available"
+
       # ---- Trap 3: vet.sh has THREE verdicts, and exit status can diverge --
       # vet.sh emits `{"verdict":"pass|fail|inconclusive"}` on its last stdout
       # line. Its exit STATUS does not carry the same information:

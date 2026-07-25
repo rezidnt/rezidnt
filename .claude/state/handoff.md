@@ -13,8 +13,31 @@ enter it). Do not mistake the entry gate for the slice.
 **The auditor failed this arc THREE times before passing.** That is the story of the session and the reason to
 read the next block before touching these files.
 
-## ► NEXT ACTION — `/slice`, then build slice B proper
-Nothing is owed on criterion (b). What follows is what a slice-B (or slice-C) author will hit.
+## ► NEXT ACTION — slice B is a DESIGN-FIRST slice: it owes a DR and a `/subject` BEFORE `/oracle`
+Nothing is owed on criterion (b). Slice B proper is scoped by **DR-048 §Decision 4**:
+
+> **B** — trial matrix primitive: N samples × variants over one task, scored via existing gate events (this is
+> where the idempotency design must answer `mcp.rs:275` — distinct sample identities, no new dedup mechanism
+> weakened).
+
+**Its blocker, named in DR-048 §Context:** `FanOutTask`'s **REQUIRED** per-task `idempotency_key`
+(`crates/rezidnt-types/src/mcp.rs`) deliberately dedupes a retried task to the SAME run — correct for fan-out,
+**fatal for N-samples-of-one-task**. The live mechanism is a per-workspace `spawn_keys: key → RunId` map,
+log-derived from `agent.spawned.idempotency_key` (`bins/rezidentd/src/mcp.rs`), so a repeated key returns the
+existing run rather than spawning. Slice B must give N samples of one task **distinct** identities without
+weakening that. DR-048 §Consequences binds the record: *"any weakening of the idempotency discipline must be
+stated in that slice's record, in plain words."*
+
+**Two things do not exist yet and must land before implementation:**
+1. **A slice-B DR** — the sample-identity design (a deterministic per-sample key derivation looks like the
+   shape that weakens nothing, but that is a proposal, not a ruling), plus the trial primitive's MCP surface.
+2. **A warden `/subject`** — `trial.*` subjects are **NOT minted**. `spec/ontology.md` has no `trial.` entry
+   and `SUBJECTS_V0` stands at 49. `trial.opened`/`trial.scored` have been carried as QUEUED for several
+   sessions; scoring "via existing gate events" may reduce what must be minted, so scope the mint against the
+   gate facts that already exist rather than assuming both.
+
+So: `/dr` → `/subject` → `/oracle` → build → `/gauntlet`. What follows is what a slice-B (or slice-C) author
+will hit in the code that just landed.
 
 ### The three qualifications criterion (b) is met UNDER (auditor's words, carry them forward)
 1. **The emitter is WIRED-BUT-UNREACHABLE.** `drive_run` constructs `ClaudeCodeAdapter` concretely,
@@ -43,17 +66,19 @@ Nothing is owed on criterion (b). What follows is what a slice-B (or slice-C) au
   four spellings. **If that assertion goes red, the cheapest correct fix is to use `//` comments in `runs.rs`
   — do not patch the stripper and do not relax the assertion.**
 
-## Owner decisions owed
-- **Exit class (NEW, from this arc).** A contract-violated run with clean gates **exits 0**. Should it be
-  **exit 3**? The `integrity.alarm` analogy is strong — that earns 3 precisely because a recorded verdict can
-  no longer be trusted, and this is the same species one axis over (the run's *accounting*). A CI caller
-  gating on exit code sees a violated run as clean today. Deliberately left alone; `dr050_contract_violated_debrief.rs`
-  pins exit 0 and **discloses that it pins the status quo, not a ruling** — it goes red the day a DR rules.
-- **Projection widening (NEW).** No projection carries the flag, so `RunRow` (board) and `SubRow`
-  (orchestration graph) render a contract-violated run's **turn-1 totals unmarked**. `SubRow` is the sharper
-  one: it is the closest thing to a scoring view, and consumer (3) is *required* to treat that accounting as
-  untrusted — a collator built on `SubRow` as it stands **cannot comply**. Either `SubRow` carries the flag
-  before slice-C scoring, or slice C reads `AgentRunState` directly and the projection says so. `/subject` or `/dr`.
+## Owner decisions — three RULED this session, two still owed
+- **✔ Exit class — RULED, and LANDED as [DR-054](../../docs/decisions/DR-054-contract-violated-debrief-exit-code.md)
+  (ACCEPTED, `cf44f01`).** `rezidnt debrief` exits **3** for a run carrying a folded `run.contract.violated`
+  record. It joins the EXISTING exit-3 disjunction and **dominates exit 5** — a run that is both
+  contract-violated and gate-failing exits 3, because cannot-certify outranks one-gate-failed, mirroring how
+  `inconclusive` already dominates `fail`. Amends DR-004; back-pointers applied at §20 and in DR-004 itself.
+  `dr050_contract_violated_debrief.rs`'s runner now takes an expected exit class per caller.
+- **✔ Projection widening — DEFERRED to slice-C scoping** (owner, 2026-07-25). `RunRow`/`SubRow` still render
+  a violated run's turn-1 totals **unmarked**. Recorded in DR-054 §Context 6 and §Deferred so it cannot be
+  inherited silently. **The constraint a slice-C author must not miss:** consumer (3) is *required* to treat a
+  violated run's accounting as untrusted, and a collator built on `SubRow` as it stands **cannot comply** —
+  so slice C either widens `SubRow` (via `/subject`) or reads `AgentRunState` directly and says so.
+- **✔ CI lane — RULED (option a) and fixed.** See the section above.
 - **DR-053 is DRAFTED, PROPOSED, and still owed a decision** (carried from session 30, untouched). Its
   back-pointers into DR-050 and DR-051 are deliberately NOT applied while PROPOSED. Apply on acceptance.
 - **`docs/site/`** — untracked, still undecided: ignore, commit, or delete? (Carried, untouched.)
@@ -72,7 +97,17 @@ binary. One residual, recorded so it is not rediscovered: drain-to-EOF turns a p
 socket from a silent pass into a **hang**, and `run_proxy` has no timeout, so that class would wedge `/vet`
 rather than return a verdict.
 
-## ⚠ CI's ubuntu lane has been RED since CI landed — diagnosed, NOT fixed (needs a ruling)
+## ✔ CI's ubuntu lane: FIXED (`77076b2`, verified green)
+Owner ruled option (a). The workflow now grants the capability on the Linux lane only
+(`kernel.apparmor_restrict_unprivileged_userns=0`) and **proves the grant took** with an unprivileged
+`unshare -Ur` rather than trusting it. First run after the fix: **`completed/success`** — the first green
+ubuntu lane this repo has had. Option (b) (degrade a missing sandbox to `inconclusive` per I6's
+`could_not_run`) was deliberately NOT taken and the reason is recorded in the workflow: on this runner the
+capability is available for the asking, and an inconclusive would forfeit a proof we can actually have. It
+remains the right fix for a genuinely capability-less environment. Diagnosis retained below for the next
+time it bites.
+
+<details><summary>Original diagnosis (kept — the failure mode will recur on any runner that restricts userns)</summary>
 `gauntlet (windows-latest)` **passes** on this arc. `gauntlet (ubuntu-latest)` **fails**, and it also failed on
 `bcd0db9` before this session touched anything — **pre-existing, not caused by this arc** (host vet pass, WSL
 `cargo test --workspace` exit 0). A gate that is always red teaches everyone to ignore it, so this needs
@@ -95,6 +130,7 @@ which is why the same tests are green locally.
   be executed, nothing ran" — and I6 says never coerce. There is a real argument that these tests should
   detect the capability and report inconclusive rather than fail.
 - (a) and (b) are not exclusive; (b) is the more principled fix and (a) is the one that restores signal today.
+</details>
 
 ## Named, not closed by this record
 - **`spec/ontology.md` was truth-passed via `/subject`** — the emitter's "NOT wired this session" prose was

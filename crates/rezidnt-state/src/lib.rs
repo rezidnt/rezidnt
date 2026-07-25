@@ -634,31 +634,76 @@ impl AgentRunState {
 /// the graph — the log is truth, the `.rezidnt/worktrees` file is the
 /// adapter's working copy).
 ///
+/// ## DR-049 §Decision 2 — the collapsed `status` field is SPLIT
+///
+/// This entry used to carry one `status` String on which four reducer arms
+/// wrote, so a `worktree.released` folding after a `diff.merged` CLOBBERED
+/// `"merged"` and derived state stopped agreeing with the log about what had
+/// been merged (I3). That collision is why DR-047 §Decision 5 declined to
+/// release a tree at merge at all. It is now gone rather than traded: the
+/// field is replaced by two INDEPENDENT axes, and no fact writes both.
+///
+/// - [`lifecycle`](Self::lifecycle) — the allocate/release axis:
+///   `"allocated"` → `"released"`, plus `"observed"` for a tree rezidnt never
+///   allocated (see below). Written ONLY by the `worktree.*` arms.
+/// - [`outcome`](Self::outcome) — what the tree's work came to:
+///   `"merged"` | `"failed"` | `"abandoned"` | ABSENT. Written ONLY by the
+///   outcome-bearing facts, never by a lifecycle fact.
+///
+/// Because the two arms write disjoint fields, the fold is order-INVARIANT
+/// between them (pinned by `tests/dr049_lifecycle_outcome_split.rs`) — the
+/// rejected alternative, an ordering guard that ignored released-after-merged,
+/// would have made it order-SENSITIVE.
+///
+/// `outcome` is `Option` and ABSENT is honest: a tree that has earned no
+/// outcome carries none, never a sentinel string (DR-012 declared-vs-absent).
+/// `"abandoned"` is named by DR-049 but is UNREACHABLE from the current
+/// taxonomy — no minted fact sets it — and the reducer deliberately does not
+/// invent one; reaching it needs a future ruling.
+///
 /// S2 reducer semantics (pinned by `tests/s2_worktrees.rs` and the
 /// `s2_worktree_conflict` / `s2_diff_ready` golden fixtures). Entries key on
 /// the payload's canonicalized path string:
 /// - `worktree.allocated` `{path, branch?, allocator}` → insert with
-///   `status = "allocated"`, `branch`/`allocator` copied from the payload;
+///   `lifecycle = "allocated"`, `branch`/`allocator` copied from the payload;
 /// - `worktree.observed` `{path, allocator}` → insert with
-///   `status = "observed"`, allocator copied (out-of-band guard, DR-001);
+///   `lifecycle = "observed"`, allocator copied (out-of-band guard, DR-001).
+///   `"observed"` stays on the LIFECYCLE axis rather than becoming an outcome:
+///   it answers "how did this tree come to be tracked", which is the same
+///   question `allocated`/`released` answer, and an observed tree has earned
+///   no outcome — synthesizing one would be the fold inventing a judgement the
+///   log never made (I3);
 /// - `worktree.conflict` `{path}` → `conflicts += 1` on the existing entry
 ///   (first claim's fields untouched — never double-tracked); the
 ///   exactly-once emission obligation is the ADAPTER's, so the reducer counts
 ///   every logged conflict honestly (I3);
-/// - `worktree.released` `{path}` → `status = "released"` (inserted even if
-///   never allocated — the log is truth);
+/// - `worktree.released` `{path}` → `lifecycle = "released"` and NOTHING else
+///   (inserted even if never allocated — the log is truth). It never touches
+///   `outcome`: the outcome a run earned survives its tree's release, which is
+///   the whole point of the split;
 /// - `diff.ready` `{worktree, diff: CasRef}` → `last_diff = Some(diff.hash)`
 ///   on the entry keyed by `worktree`.
 ///
 /// S4 addition (pinned by `tests/s4_gates.rs` and the `s4_verified_run`
 /// fixture; payload shape PENDING warden ratification — `diff.merged` is a
 /// proposed subject, flagged in the S4 work order):
-/// - `diff.merged` `{run, worktree, diff: CasRef}` → `status = "merged"`,
-///   `last_diff = Some(diff.hash)` (inserted even if never allocated — the
-///   log is truth, I3).
+/// - `diff.merged` `{run, worktree, diff: CasRef}` → `outcome =
+///   Some("merged")` and `last_diff = Some(diff.hash)`, leaving `lifecycle`
+///   alone (inserted even if never allocated — the log is truth, I3). A merged
+///   tree is not yet a released one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeState {
-    pub status: String,
+    /// The allocate/release axis: `"allocated"` | `"observed"` |
+    /// `"released"`. Written only by the `worktree.*` arms.
+    pub lifecycle: String,
+    /// What the tree's work came to: `"merged"` | `"failed"` |
+    /// `"abandoned"` | ABSENT. Written only by outcome-bearing facts; a
+    /// lifecycle fact can never clobber it. `#[serde(default)]` so a
+    /// pre-DR-049 serialized graph still parses (I3 rebuild stability), and
+    /// skipped when absent so a tree with no outcome serializes without a
+    /// null placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     pub branch: Option<String>,
     /// The ALLOCATING PRINCIPAL, copied VERBATIM from the payload (`spec/ontology.md`
     /// `worktree.allocated` v1, value vocabulary widened 2026-07-24 by DR-044
@@ -819,7 +864,7 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             if let Some(path) = payload_path(event) {
                 let payload = event.payload();
                 let wt = graph.worktrees.entry(path).or_default();
-                wt.status = "allocated".to_string();
+                wt.lifecycle = "allocated".to_string();
                 wt.branch = payload["branch"].as_str().map(String::from);
                 wt.allocator = payload["allocator"].as_str().map(String::from);
             }
@@ -828,7 +873,9 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             if let Some(path) = payload_path(event) {
                 let payload = event.payload();
                 let wt = graph.worktrees.entry(path).or_default();
-                wt.status = "observed".to_string();
+                // LIFECYCLE, never an outcome: an out-of-band tree has earned
+                // no verdict, and the reducer never synthesizes one (I3).
+                wt.lifecycle = "observed".to_string();
                 wt.branch = payload["branch"].as_str().map(String::from);
                 wt.allocator = payload["allocator"].as_str().map(String::from);
             }
@@ -843,8 +890,15 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         }
         "worktree.released" => {
             // Inserted even if never allocated — the log is truth (I3).
+            //
+            // LIFECYCLE ONLY (DR-049 §Decision 2). This arm used to write the
+            // collapsed `status`, so a release folding after a merge erased
+            // `"merged"` from derived state — the regression that made DR-047
+            // §Decision 5 refuse to release at merge. Writing one axis is what
+            // dissolves that trade: an outcome the run earned survives the
+            // release of the tree it earned it in.
             if let Some(path) = payload_path(event) {
-                graph.worktrees.entry(path).or_default().status = "released".to_string();
+                graph.worktrees.entry(path).or_default().lifecycle = "released".to_string();
             }
         }
         "diff.ready" => {
@@ -859,11 +913,16 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             }
         }
         "diff.merged" => {
-            // Golden-path merge/worktree-lifecycle-close fact; inserted even
-            // if the worktree was never allocated — the log is truth (I3).
+            // Golden-path merge fact; inserted even if the worktree was never
+            // allocated — the log is truth (I3).
+            //
+            // OUTCOME ONLY (DR-049 §Decision 2): a merged tree has not yet
+            // been released, so `lifecycle` stays whatever the worktree facts
+            // made it. The release that follows on the golden path writes the
+            // other axis and the two coexist.
             if let Some(path) = event.payload()["worktree"].as_str() {
                 let wt = graph.worktrees.entry(path.to_string()).or_default();
-                wt.status = "merged".to_string();
+                wt.outcome = Some("merged".to_string());
                 if let Some(hash) = event.payload()["diff"]["hash"].as_str() {
                     wt.last_diff = Some(hash.to_string());
                 }
@@ -1448,11 +1507,21 @@ pub struct RunRow {
 }
 
 /// One worktree's row in the fleet board.
+///
+/// Carries the DR-049 §Decision 2 split VERBATIM (I3: the projection
+/// re-interprets nothing). The collapsed `status` is replaced here too, not
+/// merely in the graph — a row that kept it would re-introduce the clobbered
+/// answer one consumer downstream, which is where the board and the
+/// `board_view` MCP tool both read.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeRow {
     /// The worktree's path key (graph `worktrees` key).
     pub path: String,
-    pub status: String,
+    /// [`WorktreeState::lifecycle`], verbatim.
+    pub lifecycle: String,
+    /// [`WorktreeState::outcome`], verbatim — ABSENT stays absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     pub branch: Option<String>,
     /// Most recent `diff.ready`/`diff.merged` summary hash, if any.
     pub last_diff: Option<String>,
@@ -1512,7 +1581,8 @@ pub fn project(graph: &Graph) -> BoardView {
         .iter()
         .map(|(path, state)| WorktreeRow {
             path: path.clone(),
-            status: state.status.clone(),
+            lifecycle: state.lifecycle.clone(),
+            outcome: state.outcome.clone(),
             branch: state.branch.clone(),
             last_diff: state.last_diff.clone(),
         })

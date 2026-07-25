@@ -26,8 +26,8 @@
 │                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ worktrees (1) ───────────────────────────────────────────────────────────────────────────────────╮
-│path                               status      branch             last diff                       │
-│/tmp/rezidnt-s4/impl               merged      rezidnt/impl       1d50030ca17a                    │
+│path                               lifecycle   outcome   branch             last diff             │
+│/tmp/rezidnt-s4/impl               allocated   merged    rezidnt/impl       1d50030ca17a          │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

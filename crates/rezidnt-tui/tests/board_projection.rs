@@ -94,7 +94,20 @@ fn projects_verified_run_and_merged_worktree_from_state() {
     assert_eq!(view.worktrees.len(), 1, "one worktree in the fixture");
     let wt = &view.worktrees[0];
     assert_eq!(wt.path, "/tmp/rezidnt-s4/impl");
-    assert_eq!(wt.status, "merged", "diff.merged closed the lifecycle");
+    // DR-049 §Decision 2, rewritten to the split and asserting strictly more:
+    // the merge records the OUTCOME and leaves the lifecycle axis to the
+    // `worktree.*` facts. The s4 fixture allocates and never releases, so the
+    // tree reads merged-but-still-allocated — which is the truth the collapsed
+    // `status` could not express.
+    assert_eq!(
+        wt.outcome.as_deref(),
+        Some("merged"),
+        "diff.merged records the outcome"
+    );
+    assert_eq!(
+        wt.lifecycle, "allocated",
+        "the fixture never releases the tree, so its lifecycle is still `allocated`"
+    );
     assert_eq!(
         wt.last_diff.as_deref(),
         Some("1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e")

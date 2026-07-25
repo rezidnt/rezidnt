@@ -274,6 +274,34 @@ impl McpSubstrate for McpBridge {
         })
     }
 
+    /// DR-049 §Decision 3: the EXPLICIT release of a retained worktree — the
+    /// only door that closes a failed run's tree (v1 has no TTL and no
+    /// auto-reap, by decision, so without this the retained trees accumulate
+    /// with no operator recourse).
+    ///
+    /// Drives the EXISTING rails and adds no substrate (I4): the same
+    /// `Daemon::release_worktree_at` the run task calls at merge, which resolves
+    /// the path to its `WorktreeId` and drives `RepoSubstrate::release_worktree`
+    /// on the repo's one adapter. ONE release path, so the automatic and the
+    /// explicit release can never disagree about what releasing means.
+    ///
+    /// This emits NO fact of its own. `worktree.released` is the ADAPTER's
+    /// (sole emitter of `worktree.*`) and lands as part of the release, so a
+    /// successful call is already on the log. The core's §12 door has passed
+    /// before this is reached, and a refusal here still releases nothing and
+    /// writes nothing (I3).
+    ///
+    /// An unknown path is `WORKTREE_UNKNOWN`, not a silent success: "nothing
+    /// was released" must never read as "released".
+    fn release_worktree(&self, path: String) -> BoxFuture<Result<(), ToolRefusal>> {
+        let daemon = Arc::clone(&self.daemon);
+        Box::pin(async move {
+            daemon.release_worktree_at(&path).await.map_err(|e| {
+                ToolRefusal::new(codes::WORKTREE_UNKNOWN, format!("release {path}: {e:#}"))
+            })
+        })
+    }
+
     /// DR-044 §Decision 1/3 (as amended by DR-046 §Decision 4/5): the live
     /// lead→sub fan-out. Drives the EXISTING rails and adds no substrate (I4):
     /// the same `launch_agent` path `spawn_agent` uses, the same per-workspace

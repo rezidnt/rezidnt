@@ -622,8 +622,12 @@ pub async fn merge_worktree(
     )
     .await?;
 
-    // 3. diff.merged — closes the worktree lifecycle (folded to status
-    //    "merged" by the S4 reducer).
+    // 3. diff.merged — the worktree's OUTCOME (folded to `outcome = "merged"`
+    //    by the S4 reducer; DR-049 §Decision 2 split the reducer's single
+    //    `status` field, and this fact writes only the outcome axis). It does
+    //    NOT close the lifecycle: that is `worktree.released`, which the run
+    //    task emits through the adapter immediately after this call returns
+    //    (DR-049 §Decision 1, `runs.rs::run_pre_merge`).
     let merged_id = publish(
         &daemon.fabric,
         Event::new(

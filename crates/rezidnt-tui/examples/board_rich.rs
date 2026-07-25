@@ -320,7 +320,7 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     ))];
     let mut sorted = view.counts_by_subject.clone();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (subject, count) in sorted.iter().take(3) {
         subjects.push(Line::from(vec![
             Span::styled(format!("{count:>5}  "), Style::default().fg(ACCENT)),
@@ -427,7 +427,7 @@ fn draw_runs(f: &mut Frame, area: Rect, app: &mut App) {
 fn draw_worktrees(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Worktrees;
     let header = Row::new(
-        ["path", "status", "branch", "last diff"]
+        ["path", "lifecycle", "outcome", "branch", "last diff"]
             .into_iter()
             .map(|h| {
                 Cell::from(Span::styled(
@@ -441,7 +441,8 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &mut App) {
     let rows = app.view.worktrees.iter().map(|w| {
         Row::new(vec![
             Cell::from(truncate(&w.path, 26).to_string()),
-            status_cell(&w.status),
+            status_cell(&w.lifecycle),
+            status_cell(w.outcome.as_deref().unwrap_or("-")),
             Cell::from(w.branch.clone().unwrap_or_else(|| "-".into())),
             Cell::from(
                 w.last_diff
@@ -455,6 +456,7 @@ fn draw_worktrees(f: &mut Frame, area: Rect, app: &mut App) {
     let widths = [
         Constraint::Length(28),
         Constraint::Length(10),
+        Constraint::Length(9),
         Constraint::Length(14),
         Constraint::Min(12),
     ];
@@ -724,22 +726,34 @@ fn demo_view() -> BoardView {
         },
     ];
 
+    // Demo data on the DR-049 §Decision 2 split. The pre-split rows spelled
+    // `"open"`, which no reducer arm has ever emitted; these use only values
+    // the fold actually produces, so the prototype stops teaching a vocabulary
+    // the daemon does not have. `outcome = "failed"` is deliberately NOT shown:
+    // no minted fact attributes a failure to a tree yet, and demo data
+    // asserting a mechanism the code lacks is the exact silent-wrong this arc
+    // has produced before.
     let worktrees = vec![
+        // The golden path's terminal state, and the whole reason for the split:
+        // released AND merged, neither field clobbering the other.
         WorktreeRow {
             path: "wt/c3-op-secrets".into(),
-            status: "merged".into(),
+            lifecycle: "released".into(),
+            outcome: Some("merged".into()),
             branch: Some("c3-op-secrets".into()),
             last_diff: Some("b3a91f0c22de".into()),
         },
         WorktreeRow {
             path: "wt/board-rich-proto".into(),
-            status: "open".into(),
+            lifecycle: "allocated".into(),
+            outcome: None,
             branch: Some("board-rich".into()),
             last_diff: None,
         },
         WorktreeRow {
             path: "wt/gate-egress".into(),
-            status: "open".into(),
+            lifecycle: "allocated".into(),
+            outcome: None,
             branch: Some("egress-fold".into()),
             last_diff: Some("7fe10a99c401".into()),
         },

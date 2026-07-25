@@ -381,7 +381,8 @@ const POST_MERGE_WATCH: Duration = Duration::from_millis(1500);
 /// 26-byte header and appended a fresh `diff.ready` carrying the finished run's
 /// correlation. `WorktreeState.last_diff` is last-write-wins, so that
 /// header-only summary replaced the merged diff `diff.merged` had set moments
-/// before, on a worktree already folded `status = "merged"`.
+/// before, on a worktree already folded `outcome = "merged"` (one collapsed
+/// `status` field at the time; DR-049 §Decision 2 split it).
 ///
 /// Nothing failed. The log stayed append-only and honest; only the DERIVED
 /// state ended up asserting a diff that was not what was merged — I3's failure
@@ -466,8 +467,16 @@ fn the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact() {
         .get(&worktree)
         .unwrap_or_else(|| panic!("the fold holds a worktree entry for {worktree}"));
     assert_eq!(
-        state.status, "merged",
-        "the worktree stays folded `merged` — its lifecycle closed at `diff.merged`"
+        state.outcome.as_deref(),
+        Some("merged"),
+        "the worktree stays folded `outcome = merged` — the merge is what the run came to"
+    );
+    assert_eq!(
+        state.lifecycle, "released",
+        "and DR-049 §Decision 1 releases a merged tree at merge, so its lifecycle has moved on \
+         while the merged outcome above SURVIVES. Before the DR-049 split these were one \
+         `status` field and the release would have erased `\"merged\"` — the derived-state \
+         regression that made DR-047 §Decision 5 refuse to release here at all"
     );
     assert_eq!(
         state.last_diff.as_deref(),

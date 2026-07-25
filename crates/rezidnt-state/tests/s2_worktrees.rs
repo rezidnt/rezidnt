@@ -6,6 +6,21 @@
 //!
 //! Events are built as raw JSON and parsed with plain serde, matching the
 //! fixture-replay suite: a failure isolates the reducers, not the codec.
+//!
+//! ## DR-049 §Decision 2 — rewritten to the SPLIT shape (disclosed)
+//!
+//! Every assertion here that read the collapsed `status` String now reads
+//! `lifecycle` AND `outcome`. This is a criterion FORM change, and the
+//! replacements assert strictly more: where one field was checked, two
+//! independent fields are, including that the fact under test leaves the OTHER
+//! axis alone. No bar moved. The split's own board is
+//! `tests/dr049_lifecycle_outcome_split.rs`.
+//!
+//! `worktree.observed` reads `lifecycle = "observed"` with NO outcome — the
+//! implementer settlement the DR-049 oracle left open. Rationale on
+//! `WorktreeState`: "observed" answers the same question `allocated`/`released`
+//! answer, and an out-of-band tree has earned no verdict for the fold to
+//! synthesize (I3).
 
 use rezidnt_state::fold;
 use rezidnt_types::Event;
@@ -45,7 +60,11 @@ fn allocated_folds_into_worktrees_keyed_by_path() {
         .worktrees
         .get(WT_A)
         .expect("worktree.allocated must materialize a worktrees entry keyed by payload path");
-    assert_eq!(wt.status, "allocated");
+    assert_eq!(wt.lifecycle, "allocated");
+    assert_eq!(
+        wt.outcome, None,
+        "an allocation earns no outcome — absent, never a sentinel"
+    );
     assert_eq!(wt.branch.as_deref(), Some("feat/s2"));
     assert_eq!(wt.allocator.as_deref(), Some("rezidnt"));
     assert_eq!(wt.conflicts, 0);
@@ -64,7 +83,14 @@ fn observed_folds_with_allocator_human() {
         .worktrees
         .get(WT_B)
         .expect("worktree.observed must materialize an entry (out-of-band guard, DR-001)");
-    assert_eq!(wt.status, "observed");
+    assert_eq!(
+        wt.lifecycle, "observed",
+        "an out-of-band tree's provenance is a LIFECYCLE state, not an outcome"
+    );
+    assert_eq!(
+        wt.outcome, None,
+        "the fold never synthesizes a verdict for a tree rezidnt did not run (I3)"
+    );
     assert_eq!(wt.allocator.as_deref(), Some("human"));
     assert_eq!(wt.conflicts, 0);
 }
@@ -84,8 +110,12 @@ fn conflict_increments_count_without_double_tracking() {
     let wt = graph.worktrees.get(WT_A).unwrap();
     assert_eq!(wt.conflicts, 1, "the collision is counted");
     assert_eq!(
-        wt.status, "allocated",
-        "the first claim's status survives the conflict"
+        wt.lifecycle, "allocated",
+        "the first claim's lifecycle survives the conflict"
+    );
+    assert_eq!(
+        wt.outcome, None,
+        "a conflict is not an outcome; it touches neither axis"
     );
     assert_eq!(
         wt.allocator.as_deref(),
@@ -109,14 +139,19 @@ fn every_logged_conflict_counts_once() {
 }
 
 #[test]
-fn released_sets_status_released() {
+fn released_sets_lifecycle_released() {
     let events = [
         allocated(1, WT_A, "feat/s2"),
         evt(2, "worktree.released", json!({"path": WT_A})),
     ];
     let graph = fold(events.iter());
     let wt = graph.worktrees.get(WT_A).unwrap();
-    assert_eq!(wt.status, "released");
+    assert_eq!(wt.lifecycle, "released");
+    assert_eq!(
+        wt.outcome, None,
+        "a release sets LIFECYCLE only — it never invents an outcome for a tree that \
+         earned none (DR-049 §Decision 2)"
+    );
     assert_eq!(
         wt.branch.as_deref(),
         Some("feat/s2"),
@@ -129,10 +164,9 @@ fn released_without_allocation_still_materializes() {
     // Same rule as workspace.closed: inserted even if never allocated — the
     // log is truth (I3), the reducer never gatekeeps.
     let graph = fold([evt(1, "worktree.released", json!({"path": WT_A}))].iter());
-    assert_eq!(
-        graph.worktrees.get(WT_A).expect("entry must exist").status,
-        "released"
-    );
+    let wt = graph.worktrees.get(WT_A).expect("entry must exist");
+    assert_eq!(wt.lifecycle, "released");
+    assert_eq!(wt.outcome, None);
 }
 
 #[test]
@@ -154,7 +188,11 @@ fn diff_ready_records_last_diff_hash() {
         "diff.ready pins the latest summary ref hash on the worktree entry"
     );
     assert_eq!(
-        wt.status, "allocated",
-        "a diff does not change lifecycle status"
+        wt.lifecycle, "allocated",
+        "a diff does not change the lifecycle"
+    );
+    assert_eq!(
+        wt.outcome, None,
+        "a diff being READY is not an outcome — only the merge that follows is"
     );
 }

@@ -19,6 +19,11 @@ Forcing fact: **clap emits exit 2 for usage errors** (unknown subcommand, bad fl
 
 ## Decision
 
+> **Amended by [DR-054](DR-054-contract-violated-debrief-exit-code.md)** (2026-07-25): the exit-3 class gains
+> one further trigger — a folded `run.contract.violated` record makes `rezidnt debrief` exit **3**. Ordering
+> ruled there: it joins the EXISTING exit-3 disjunction and DOMINATES exit 5, so a run that is both
+> contract-violated and gate-failing exits 3. The sentence below is otherwise unchanged.
+
 **Option C** (owner-ratified 2026-07-17). §9's exit-code sentence is replaced with:
 
 > Global `--json` on every verb; stable exit codes (BINDING once ratified): **0** ok · **1** unexpected internal error · **2** local input/usage error (clap convention; daemon never reached) · **3** substrate fault, including daemon-side refusals · **4** daemon unreachable · **5** gate-fail (`vet`/`debrief`/`pre_merge` verdict `fail`; `inconclusive` is NOT 5 — it is 3, never coerced toward pass or fail, per I6).

@@ -2319,11 +2319,22 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
         .get(run)
         .and_then(|r| r.contract_violated.as_ref());
 
-    // DR-004 exit class: an integrity alarm or any inconclusive is 3 (neither
-    // trusted nor coerced, I6); else any recorded fail is 5; else 0.
+    // DR-004 exit class: an integrity alarm, any inconclusive, or a folded
+    // `run.contract.violated` record is 3 (neither trusted nor coerced, I6);
+    // else any recorded fail is 5; else 0.
+    //
+    // DR-054 added the third disjunct, and its ORDERING is the load-bearing
+    // part: it joins this FIRST branch, so a run that is both contract-violated
+    // and gate-failing exits 3, not 5. "We cannot certify this run at all"
+    // dominates "one of its gates failed" — the same way `inconclusive` already
+    // dominates `fail` here. A gate's `fail` is computed over inputs the
+    // withdrawn stream may itself have fed, so ranking it higher would certify a
+    // specific negative answer while refusing to certify the accounting beside
+    // it. Not 5: a contract violation is not a gate verdict, and coding it 5
+    // would let a caller "fix" it by making gates pass (the I6 miscoercion).
     let has_inconclusive = gates.values().any(|g| g.verdict == "inconclusive");
     let has_fail = gates.values().any(|g| g.verdict == "fail");
-    let code = if !report.alarms.is_empty() || has_inconclusive {
+    let code = if !report.alarms.is_empty() || has_inconclusive || contract_violated.is_some() {
         3
     } else if has_fail {
         5

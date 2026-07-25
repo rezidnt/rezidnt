@@ -36,14 +36,21 @@
 //! able to go red by mutation (human block removed, test red, source
 //! restored) before being reported green.
 //!
-//! EXIT-CLASS DISCLOSURE: every test here asserts exit 0 through the shared
-//! runner. For the clean run that is settled law (DR-004: no alarms, no gate
-//! facts). For the VIOLATED runs it pins the STATUS QUO, not a ruling —
-//! whether a contract-violated run should exit 3 (the `integrity.alarm`
-//! analogy: neither trusted nor coerced) is an OPEN owner-level question for
-//! a decision record. If that ruling lands, the runner's assertion goes red
-//! on purpose and follows the DR: the red is the ruling's judge arriving,
-//! not a regression.
+//! EXIT CLASS: every caller states its expected DR-004 class explicitly. A
+//! CLEAN run exits 0 (DR-004 law: no alarms, no gate facts). A VIOLATED run
+//! exits **3** per **DR-054** (ACCEPTED, owner, 2026-07-25), which rules a
+//! folded `run.contract.violated` record into the exit-3 disjunction on the
+//! `integrity.alarm` analogy — neither trusted nor coerced (I6), and NOT 5,
+//! because a withdrawn premise is not a gate verdict.
+//!
+//! These assertions previously pinned exit 0 for the violated runs and
+//! disclosed themselves as a STATUS-QUO pin on an open question, to be updated
+//! by the DR that ruled it rather than quietly deleted. DR-054 is that ruling
+//! and this is that update — the red it produced was the judge arriving, as
+//! designed. **DR-054 rules the exit code ONLY:** a contract-violated run is
+//! still not refused anywhere else — it still reaps, still chunks its capture,
+//! still runs `pre_merge`, and CAN STILL MERGE. Do not read a green suite here
+//! as evidence that a premise-broken run is stopped.
 
 use std::path::Path;
 use std::process::Command;
@@ -90,9 +97,9 @@ fn seed(db: &Path, events: &[Event]) {
 /// log and return the raw output. `REZIDNT_CAS` is pinned inside the tempdir
 /// so replay never touches ambient state.
 ///
-/// The success assertion pins the STATUS QUO, not a ruling — see the
-/// header's EXIT-CLASS DISCLOSURE.
-fn debrief(dir: &Path, db: &Path, run: &str, json: bool) -> std::process::Output {
+/// `expect_code` is the DR-004 exit class the caller asserts, and every caller
+/// states it explicitly — see the header's EXIT-CLASS block.
+fn debrief(dir: &Path, db: &Path, run: &str, json: bool, expect_code: i32) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rezidnt"));
     cmd.arg("debrief").arg(run);
     if json {
@@ -103,23 +110,24 @@ fn debrief(dir: &Path, db: &Path, run: &str, json: bool) -> std::process::Output
         .env("REZIDNT_CAS", dir.join("cas"))
         .output()
         .expect("run rezidnt debrief");
-    assert!(
-        out.status.success(),
-        "debrief exited {:?}, expected 0. For the clean run this is DR-004 law (no \
-         alarms, no gate facts). For the violated runs it is a STATUS-QUO pin on an \
-         OPEN question — whether a contract-violated run should exit 3 (the \
-         integrity.alarm analogy) has NOT been ruled; this assertion deliberately \
-         goes red the day a DR changes the exit class, and should then be updated \
-         to follow the DR, never quietly deleted. stderr:\n{}",
+    assert_eq!(
+        out.status.code(),
+        Some(expect_code),
+        "debrief exited {:?}, expected {expect_code}. DR-054 rules a folded \
+         `run.contract.violated` record into the exit-3 disjunction: a VIOLATED run \
+         exits 3 (cannot certify — the integrity.alarm class, never coerced, I6), a \
+         CLEAN run exits 0 (DR-004 law, untouched). If this is red on a violated run, \
+         check the third disjunct in `debrief`'s `code` computation before touching \
+         the test. stderr:\n{}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
     out
 }
 
-/// The `--json` form of [`debrief`], parsed.
-fn debrief_json(dir: &Path, db: &Path, run: &str) -> serde_json::Value {
-    let out = debrief(dir, db, run, true);
+/// The `--json` form of [`debrief`], parsed. `expect_code` as in [`debrief`].
+fn debrief_json(dir: &Path, db: &Path, run: &str, expect_code: i32) -> serde_json::Value {
+    let out = debrief(dir, db, run, true, expect_code);
     serde_json::from_slice(&out.stdout)
         .expect("`rezidnt debrief --json` must print the report as JSON on stdout")
 }
@@ -161,7 +169,7 @@ fn debrief_surfaces_the_contract_violation() {
     let db = dir.path().join("events.db");
     seed_violated_run(&db, "run-violated");
 
-    let report = debrief_json(dir.path(), &db, "run-violated");
+    let report = debrief_json(dir.path(), &db, "run-violated", 3);
     let cv = report["contract_violated"].as_object().unwrap_or_else(|| {
         panic!(
             "a run with a run.contract.violated fact on its log must surface a \
@@ -193,7 +201,7 @@ fn surfaced_detail_is_the_structural_field_not_the_display_wrapping() {
     let db = dir.path().join("events.db");
     seed_violated_run(&db, "run-violated");
 
-    let report = debrief_json(dir.path(), &db, "run-violated");
+    let report = debrief_json(dir.path(), &db, "run-violated", 3);
     let detail = report["contract_violated"]["detail"]
         .as_str()
         .unwrap_or_else(|| {
@@ -239,7 +247,7 @@ fn debrief_omits_contract_violated_when_no_fact_folded() {
         ],
     );
 
-    let report = debrief_json(dir.path(), &db, "run-clean");
+    let report = debrief_json(dir.path(), &db, "run-clean", 0);
     let obj = report.as_object().expect("debrief --json prints an object");
     assert!(
         !obj.contains_key("contract_violated"),
@@ -263,7 +271,7 @@ fn debrief_human_output_names_the_violation() {
     let db = dir.path().join("events.db");
     seed_violated_run(&db, "run-violated");
 
-    let out = debrief(dir.path(), &db, "run-violated", false);
+    let out = debrief(dir.path(), &db, "run-violated", false, 3);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("CONTRACT VIOLATED (codex)"),
@@ -297,7 +305,7 @@ fn debrief_human_output_names_the_violation() {
             ),
         ],
     );
-    let out = debrief(clean_dir.path(), &clean_db, "run-clean", false);
+    let out = debrief(clean_dir.path(), &clean_db, "run-clean", false, 0);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("CONTRACT VIOLATED"),

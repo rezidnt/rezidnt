@@ -740,9 +740,18 @@ fn input_summary(input: &Value) -> Option<String> {
 ///
 /// Semantics: text within `cap` bytes rides VERBATIM and unmarked. Longer
 /// text is cut at the last char boundary at or below `cap` bytes and a single
-/// `…` is appended, so a reader can always tell a complete value from an
-/// elided one — the truncation is never silent. The returned string is at most
-/// `cap + 3` bytes (the marker's UTF-8 width).
+/// `…` is appended — the truncation is never silent. The returned string is at
+/// most `cap + 3` bytes (the marker's UTF-8 width).
+///
+/// The complete-vs-elided distinction is by LENGTH, not by the marker alone:
+/// this only fires when `len > cap`, and the cut lands in `[cap - 3, cap]` for
+/// UTF-8, so an elided value always measures `cap..=cap + 3` bytes while a
+/// complete one never exceeds `cap`. A value STRICTLY under `cap` that ends in
+/// `…` is therefore provably the harness's own ellipsis. At exactly `cap` the
+/// two are indistinguishable — a complete `cap`-byte value ending in the marker
+/// and an elided one whose cut landed at `cap - 3` are byte-identical in
+/// length. `spec/ontology.md`'s `agent.completed.error?` entry states the band
+/// and leaves that corner ambiguous rather than over-claiming; so does this.
 fn elide(mut text: String, cap: usize) -> String {
     if text.len() <= cap {
         return text;

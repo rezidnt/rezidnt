@@ -1114,8 +1114,12 @@ impl McpCore {
     ///   DR-032 policy about *terminating someone else's run*; releasing a tree
     ///   the caller's own lead allocated is not that, and narrowing a ratified
     ///   "or" to "only" is not this slice's call to make. The DR-049 e2e board
-    ///   exercises the operator leg; the lead leg is admitted by the same door
-    ///   every other run-scoped mutation uses.
+    ///   exercises the operator leg; the lead leg has its own judge in
+    ///   `tests/release_worktree_macaroon_door.rs` — a lead macaroon carrying
+    ///   `merge` is admitted against an EMPTY `BadgeBook` (so path 1 cannot be
+    ///   what admits it), and the control narrows the same macaroon to
+    ///   `{spawn, open}` and requires `BADGE_INVALID` with nothing released.
+    ///   Ratified as a decided policy, not a described one, in DR-052.
     /// - **Verb `"merge"`, not a new verb.** The macaroon `Caveat::Verb`
     ///   vocabulary is `spawn`/`open`/`merge`. Release is a repo-mutating verb
     ///   in the merge class — literally the step that follows a merge on the

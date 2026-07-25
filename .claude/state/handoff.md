@@ -19,8 +19,19 @@ Boundary BINDING per DR-048 §D6: `crates/rezidnt-run` only. Held all session (v
   two false doc claims, and a single-sourcing claim that was true by neither construction nor test.
 - `51b515d` — oracle red board for the **`turn.failed` arm** + a REAL new fixture
   `spec/fixtures/transcripts/codex_exec_v0.145.0_turn_failed.jsonl` (recorded this session, codex-cli 0.145.0).
-- **IN FLIGHT at close:** the implementer was mapping `turn.failed`. **Check `git log` in that worktree first.**
-  If it committed, it owes a re-`/debrief`; if not, re-send the work order (5 red tests, all assertion-red).
+- **`4ceccb7` — the `turn.failed` arm is GREEN.** 5/5 oracle pins, no oracle assertion touched, 145 crate tests
+  green, clippy `-D warnings` clean, `cargo check --workspace` clean. **Lane 2 is code-complete and OWES ONLY A
+  RE-`/debrief`** (last verdict was on `a559623`; `51b515d` + `4ceccb7` are un-audited).
+  Two calls it settled, both worth reading before auditing: **`num_turns` counts a failed turn (reads 1)** while
+  its tokens stay absent — the distinction is epistemic, absent tokens mean *never measured*, `num_turns: 1`
+  means *we watched one turn begin and end*, and one test asserts both on the same payload so the contrast
+  can't silently collapse. And **`turn.failed` DOES trip the single-shot guard** — it counts run-*terminal*
+  lines, not successes; two terminal lines of different outcomes make the run's verdict ambiguous, not just its
+  cost. Field renamed `completed_turns` → `terminal_turns`; guard pinned in BOTH orders so the policy can't
+  drift into being outcome-sensitive.
+  `Completion` now carries `usage: Option<TokenUsage>` + `error_message: Option<String>`; `into_fact` omits keys
+  rather than nulling them. Tokens are modeled as one present-or-absent unit because that is how the wire
+  carries it. The single-sourcing guard was re-verified green by the implementer, not assumed.
 
 ## Lane 1 — DR-049 release lifecycle (worktree `.claude/worktrees/agent-a01bfc6c4807a2b3b`)
 `a63e580`. **14 of 16 green.** Worktree clean. Both reds are the same assertion: `outcome = failed`.
@@ -66,14 +77,31 @@ carries two, including the same one the successful probe carries), and that **`t
 object at all** — a failed candidate's cost is ABSENT, not zero, which DR-048 slice C must honour or the
 leaderboard reads a failed run as free.
 
-**OWED:** once lane 2's `turn.failed` arm is green, amend DR-050 — flip Decision 3 to resolved-by-recording, strike
-risk item 5, and correct its "residual" claim, which the oracle showed was half wrong: the daemon fallback does
-fire, but it **discards the recorded failure reason**. Then the record can go ACCEPTED.
+**OWED — the arm is now green (`4ceccb7`), so this is unblocked.** Amend DR-050: flip Decision 3 to
+resolved-by-recording, strike risk item 5, and correct its "residual" claim, which the oracle showed was half
+wrong — the daemon fallback does fire, but it **discards the recorded failure reason**, and once `turn.failed`
+maps in-crate the fallback stops firing on this path entirely. Then the record can go ACCEPTED.
+
+**End-to-end absence is verified, not assumed.** The implementer checked the reducer *before* changing the fact
+shape: `rezidnt-state` reads these via `payload["cost"]["input_tokens"].as_u64()`, which yields `None` for a
+missing key, so absent tokens fold to `None` rather than `Some(0)`. The absence survives into derived state
+intact — which is what makes the "a failed candidate's cost is absent, not free" reasoning hold all the way to
+DR-048 slice C's leaderboard, rather than only at the adapter boundary.
+
+## ► ONE `/subject` SESSION NOW OWES FOUR THINGS — batch them, don't drip
+The warden pass is the critical path for the current slice AND the cleanup queue for two arcs. In one session:
+1. **`gate.failed.worktree?`** — additive optional, present iff the gate ran against an allocated tree
+   (**BLOCKING lane 1's last two tests**; rationale and the unsoundness of the alternative are above).
+2. **`agent.completed.error.message?`** — lane 2's `turn.failed` arm now emits it. Additive payload evolution
+   the fabric rules permit, and the oracle pinned its location, but `spec/ontology.md`'s copy of the subject
+   does not describe it. Flagged by the implementer rather than touched (the file is hook-blocked to it).
+3. **`spec/ontology.md:94` and `:349`** — both assert the reducer folds `status = "merged"`. False after DR-049.
+4. **DR-047 §Decision 4's queued pass** — the `diff.ready` emitter cell + `source` attribution. DR-049 §Decision 6
+   already rides it with this slice.
 
 ## NEXT ACTION → in order
-1. Check lane 2's worktree `git log` — resolve the in-flight implementer (re-`/debrief` if it committed).
-2. **`/subject` with the warden** for `gate.failed.worktree?` + the two stale ontology prose lines. This unblocks
-   lane 1's last two tests. It is the critical path for the current slice.
+1. **`/debrief` lane 2** on `4ceccb7` (its `a559623` verdict predates two commits). It is otherwise done.
+2. **`/subject`** — all four items above.
 3. Lane 1 implementer finishes to 16/16, then `/gauntlet`.
 4. **`/vet` ONE LANE AT A TIME** ([[vet-concurrency-flake]]). Merge order: lane 2 first — it is crates-only and
    merges independently; DR-048 §D6 holds daemon wiring for Trials until lane 1 merges.

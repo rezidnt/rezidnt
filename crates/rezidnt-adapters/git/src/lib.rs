@@ -1727,6 +1727,12 @@ mod tests {
     /// not `ReadDirectoryChangesW` — so on Windows it passes vacuously. This
     /// test does not: `Access(Open)` is a value on every platform, so the rule
     /// that the defect turned on is judged in host `/vet` too.
+    ///
+    /// NARROWED, NOT CLOSED — say it that way (the arc's own precedent is the
+    /// DR-046 source guard). What host `/vet` judges is the PREDICATE, never
+    /// the closure's USE of it: delete the guard clause that calls this from
+    /// the watch loop and this test stays green, and only the WSL-only
+    /// behavioral boards go red. The wiring remains outside host `/vet`.
     #[test]
     fn reads_are_not_changes_and_writes_are() {
         // The exact variant the inotify backend produced during `git add -A`

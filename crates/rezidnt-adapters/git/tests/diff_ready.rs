@@ -290,8 +290,9 @@ async fn a_refused_diff_ready_is_retried_not_suppressed_as_a_duplicate() {
 ///
 /// Nothing releases the watch: `release_worktree` has no production caller, so
 /// the watcher outlives the run and is still armed when the merge mutates the
-/// tree. Those two commands change nothing inside a linked worktree (its index,
-/// refs and objects live in the private gitdir) — but they READ every tracked
+/// tree. Those two commands change nothing inside a linked worktree (its index
+/// and refs live in its private gitdir and its objects in the shared repo, so
+/// neither writes a byte under the watched path) — but they READ every tracked
 /// file, and the inotify backend arms `IN_OPEN`, so each read surfaced as
 /// `EventKind::Access(Open)` and woke the debounce loop like a write. 250 ms
 /// later the post-commit tree was clean, summarized to the bare 26-byte header,

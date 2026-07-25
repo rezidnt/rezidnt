@@ -56,9 +56,12 @@ daemon lead→sub path, and the `orchestration_graph` read side now folding a re
 - **OWED: stale caveat in `crates/rezidnt-mcp/tests/gate_explain.rs:10-15`.** It says the ontology "ratifies no v1
   payload baseline" for `gate.entered` / `gate.failed` / `gate.inconclusive` / `gate.explained` and that warden
   ratification is required before a richer shape is frozen. **Confirmed false** — all four are ratified in
-  `spec/ontology.md`, "S3 set (ratified 2026-07-17)", one section each. (`gate.passed` is the one gate subject
-  deliberately left unratified there — S4 scope — so the correction is "these four are ratified", not "all gate
-  subjects are".) Same stale-caveat class the warden already ruled on for
+  `spec/ontology.md`, "S3 set (ratified 2026-07-17)", one section each. The correction to write is **"all FIVE
+  `gate.*` subjects are ratified — four in the S3 set, `gate.passed` in the S4 set"**: the S3 note does defer
+  `gate.passed` ("no S3 emitter or pin … S4 scope"), but the S4 set then ratifies it outright ("the S4 engine is
+  that emitter. Now ratified."). Reading only the S3 deferral and stopping there is how an earlier draft of this
+  very bullet seeded a fresh false caveat inside the correction of a false caveat — the third-order instance of
+  this arc's own defect class. Same stale-caveat class the warden already ruled on for
   `worktree_conflict.rs` and `diff_ready.rs`. Left uncorrected only because the file is outside the
   registry-convergence slice's diff; it is a comment fix, no code or assertion changes.
 

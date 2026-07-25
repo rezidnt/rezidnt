@@ -185,6 +185,20 @@ fn number_or_zero(v: &Value) -> Value {
     }
 }
 
+/// Read a harness's `usage` object into [`TokenUsage`], distinguishing
+/// NOT REPORTED from reported-as-zero.
+///
+/// The whole object present ⇒ the harness reported accounting, and a missing
+/// sub-field inside it is the ordinary zero default. The object absent ⇒ the
+/// harness measured nothing (a failed `codex exec` turn carries no `usage` at
+/// all) ⇒ `None`, and the token keys are omitted from the fact entirely.
+fn reported_usage(usage: &Value) -> Option<TokenUsage> {
+    usage.is_object().then(|| TokenUsage {
+        input: number_or_zero(&usage["input_tokens"]),
+        output: number_or_zero(&usage["output_tokens"]),
+    })
+}
+
 /// The accounting fields of an `agent.completed` fact, before rendering.
 ///
 /// Every substrate renders its completion THROUGH this type, so the fact's key
@@ -193,40 +207,78 @@ fn number_or_zero(v: &Value) -> Value {
 /// construction, and `completion_fact_shape_is_single_sourced` in
 /// `tests/codex_adapter_guards.rs` pins it by test as well.
 ///
-/// A field the harness's format does not carry is an honest `0` supplied by
-/// the caller (codex has no dollar cost and no duration), never a missing key
-/// and never a fabricated number.
+/// # Zero versus absence
+///
+/// A field the harness's format NEVER carries for ANY outcome is an honest `0`
+/// supplied by the caller (codex has no dollar cost and no duration). A field
+/// the harness carries for some outcomes and genuinely did not MEASURE for this
+/// one is ABSENT — see [`TokenUsage`]. The two are different claims: `0` says
+/// "measured, and it was nothing"; absence says "never measured". Collapsing
+/// the second into the first would let a failed run read as a free one on the
+/// DR-048 slice C leaderboard.
 struct Completion {
     run: RunId,
     status: &'static str,
     total_usd: Value,
-    input_tokens: Value,
-    output_tokens: Value,
+    /// `None` when the harness reported NO token accounting for this run — the
+    /// token keys are then omitted entirely rather than emitted as zeros.
+    usage: Option<TokenUsage>,
     num_turns: Value,
     duration_ms: Value,
     session_id: Option<String>,
+    /// The harness's own failure reason, VERBATIM, when it reported one. Kept
+    /// opaque: a harness may put a JSON-encoded upstream response here (codex
+    /// 0.145.0 does) or plain prose, so parsing it would pin structure no
+    /// recording promises.
+    error_message: Option<String>,
+}
+
+/// Token counts a harness reported for a run.
+///
+/// Modeled as one unit, present-or-absent together, because that is how the
+/// wire carries it: codex emits a whole `usage` object or none at all (a failed
+/// turn has none), and claude-code always emits one. There is no recorded case
+/// of a half-reported count.
+struct TokenUsage {
+    input: Value,
+    output: Value,
 }
 
 impl Completion {
-    /// The ONE `agent.completed` payload literal in this crate.
+    /// The ONE `agent.completed` payload builder in this crate: every substrate
+    /// renders through it, so the fact's key set cannot drift between
+    /// harnesses. Optional keys are omitted, never emitted as null — a null key
+    /// would be a present claim of an absent value (DR-012 declared-vs-absent),
+    /// and `tests/codex_adapter_turn_failed.rs` rejects a null token key
+    /// explicitly.
     fn into_fact(self) -> MappedFact {
+        let mut cost = serde_json::Map::new();
+        cost.insert("total_usd".to_string(), self.total_usd);
+        if let Some(usage) = self.usage {
+            cost.insert("input_tokens".to_string(), usage.input);
+            cost.insert("output_tokens".to_string(), usage.output);
+        }
         let mut payload = serde_json::json!({
             "run": self.run,
             "status": self.status,
-            "cost": {
-                "total_usd": self.total_usd,
-                "input_tokens": self.input_tokens,
-                "output_tokens": self.output_tokens,
-            },
+            "cost": Value::Object(cost),
             "num_turns": self.num_turns,
             "duration_ms": self.duration_ms,
         });
-        // `session_id` stays CONDITIONAL (not a null key): absent means the
-        // stream never announced a resume identity — DR-012 declared-vs-absent.
-        if let Some(session) = self.session_id
-            && let Some(obj) = payload.as_object_mut()
-        {
+        let Some(obj) = payload.as_object_mut() else {
+            unreachable!("the payload literal above is a JSON object")
+        };
+        // Both stay CONDITIONAL: absent session means the stream never
+        // announced a resume identity; absent error means it reported no
+        // failure reason.
+        if let Some(session) = self.session_id {
             obj.insert("session_id".to_string(), Value::String(session));
+        }
+        if let Some(message) = self.error_message {
+            obj.insert(
+                "error".to_string(),
+                serde_json::json!({ "message": message }),
+            );
         }
         MappedFact {
             subject: "agent.completed".to_string(),
@@ -354,14 +406,20 @@ impl ClaudeCodeAdapter {
             run: self.run,
             status,
             total_usd: number_or_zero(&value["total_cost_usd"]),
-            input_tokens: number_or_zero(&value["usage"]["input_tokens"]),
-            output_tokens: number_or_zero(&value["usage"]["output_tokens"]),
+            // claude-code's `result` line always carries a usage object, so the
+            // counts are always reported — zeros here mean "reported as zero",
+            // which is the honest reading for this harness.
+            usage: reported_usage(&value["usage"]),
             num_turns: number_or_zero(&value["num_turns"]),
             duration_ms: number_or_zero(&value["duration_ms"]),
             session_id: value["session_id"]
                 .as_str()
                 .map(String::from)
                 .or_else(|| self.session_id.clone()),
+            // The claude-code `result` line's failure detail is not mapped: no
+            // failing claude transcript is recorded, and the shape of its error
+            // reporting is therefore unpinned. Adding it needs a recording.
+            error_message: None,
         }
         .into_fact()
     }
@@ -403,11 +461,18 @@ impl AgentSubstrate for ClaudeCodeAdapter {
 ///   `thread_id` (the `codex exec resume` identity) is captured as the session
 ///   id, mirroring claude-code's `system/init` capture.
 /// - `item.completed` whose item `type` is `agent_message` → `agent.message`.
-/// - `turn.completed` → `agent.completed` in the SAME payload shape
-///   [`ClaudeCodeAdapter::map_result`] emits (both render through
+/// - `turn.completed` → `agent.completed` with `status: "success"`, and
+///   `turn.failed` → `agent.completed` with `status: "error"` carrying the
+///   harness's verbatim failure reason — both in the SAME payload shape
+///   [`ClaudeCodeAdapter::map_result`] emits (all three render through
 ///   [`Completion`]).
-/// - everything else (`turn.started`, the machine-local `error` item, future
-///   additions) → `Ok(vec![])`: tolerated noise, never an error.
+/// - everything else → `Ok(vec![])`: tolerated noise, never an error. That
+///   includes `turn.started`, the machine-local `item.completed` items of type
+///   `error` (the failing recording carries two — a model-metadata warning and
+///   the same skills-context notice the SUCCESSFUL probe carries — which is
+///   what proves they are notices, not outcome signals), and the top-level
+///   `error` line, whose message is subsumed by the `turn.failed` it precedes
+///   rather than minted as a fact of its own.
 ///
 /// # Why `turn.completed` is a RUN-terminal fact (I3)
 ///
@@ -423,28 +488,40 @@ impl AgentSubstrate for ClaudeCodeAdapter {
 /// `turn.started`, closes exactly one `turn.completed`, and the process exits
 /// — stream end IS run end, and the single turn's usage IS the run total.
 ///
-/// That premise is GUARDED, not assumed. A second `turn.completed` on one
-/// stream falsifies it, and the adapter then refuses with
+/// That premise is GUARDED, not assumed. A second TERMINAL line on one stream
+/// — of either outcome — falsifies it, and the adapter then refuses with
 /// [`AdapterError::ContractViolated`] rather than emitting a second "the run
-/// finished" fact or silently dropping the later turn's tokens. `num_turns` is
-/// therefore the honest count of completed turns observed (always 1 while the
-/// premise holds), not decoration.
+/// finished" fact or silently dropping the later turn's accounting. The guard
+/// counts terminal lines, not successes: a stream carrying `turn.completed`
+/// then `turn.failed` would leave the run's OUTCOME as ambiguous as its
+/// totals, which is the same defect.
+///
+/// # `num_turns` counts terminal turns, of either outcome
+///
+/// A failed turn is still a turn the run took: the stream positively shows one
+/// `turn.started` and one terminal line, so the count is OBSERVED, not
+/// inferred. That is what separates it from `usage` below — reporting `0` here
+/// would deny a turn the recording shows happening, whereas reporting `0`
+/// tokens would invent a measurement the harness never made.
 ///
 /// # Deliberate gaps, stated rather than guessed
 ///
-/// The codex event format carries no dollar cost and no duration, so
-/// `cost.total_usd` and `duration_ms` are honest zeros (the house zero-default
-/// convention) — never a fabricated number; cross-vendor cost comparison is
-/// explicitly deferred (DR-048 §Decision 3). No turn-level FAILURE line has
-/// been recorded, so none is mapped: a codex run that fails without emitting
-/// `turn.completed` produces NO completion fact at all, and its failure
-/// surfaces through the child's exit status rather than through a verdict this
-/// adapter invented.
+/// The codex event format carries no dollar cost and no duration for ANY
+/// outcome, so `cost.total_usd` and `duration_ms` are honest zeros (the house
+/// zero-default convention) — never fabricated numbers; cross-vendor cost
+/// comparison is explicitly deferred (DR-048 §Decision 3).
+///
+/// `turn.failed` carries NO `usage` object, so the token keys are OMITTED from
+/// its completion fact rather than emitted as zeros. DR-048 slice C collates
+/// these into a leaderboard, where a zero-token failure would read as a free
+/// run; absence reads as what it is — never measured.
 #[derive(Debug)]
 pub struct CodexAdapter {
     run: RunId,
     thread_id: Option<String>,
-    completed_turns: u64,
+    /// Turns that reached a TERMINAL line, whatever their outcome — both
+    /// `turn.completed` and `turn.failed` count (see the type docs).
+    terminal_turns: u64,
 }
 
 /// Harness name carried on [`AdapterError::ContractViolated`] refusals.
@@ -453,16 +530,21 @@ const CODEX_HARNESS: &str = "codex";
 /// The run outcome as the codex format states it.
 ///
 /// The EVENT TYPE is the only outcome signal the stream carries — there is no
-/// status field on `turn.completed`. `turn.completed` is the harness
-/// POSITIVELY asserting the turn finished, so the status is READ OFF that
-/// assertion; it is not stamped onto an absence. Every other line type returns
-/// `None` and maps to no fact at all, which is the I6-honest handling of an
-/// outcome this adapter has never been shown: an unknown is never coerced into
-/// a pass. When a failing codex transcript is recorded, its terminal line type
-/// gets an arm here — and not before.
+/// status field on either terminal line. Both arms are RECORDED, which is what
+/// makes this a derivation rather than an inference: the successful probe ends
+/// in `turn.completed`, and the failing recording
+/// (`codex_exec_v0.145.0_turn_failed.jsonl`, a bogus `-m` model) ends in
+/// `turn.failed` and contains NO `turn.completed`. A turn that ends badly
+/// therefore cannot reach the success arm.
+///
+/// Every other line type returns `None` and maps to no fact at all — the
+/// I6-honest handling of an outcome this adapter has never been shown. A third
+/// terminal type gets an arm here when a transcript records one, and not
+/// before.
 fn turn_outcome(line_type: &str) -> Option<&'static str> {
     match line_type {
         "turn.completed" => Some("success"),
+        "turn.failed" => Some("error"),
         _ => None,
     }
 }
@@ -472,7 +554,7 @@ impl CodexAdapter {
         Self {
             run,
             thread_id: None,
-            completed_turns: 0,
+            terminal_turns: 0,
         }
     }
 
@@ -532,44 +614,53 @@ impl CodexAdapter {
         }]
     }
 
-    /// A recorded turn-terminal line → `agent.completed` carrying RUN totals.
+    /// A recorded turn-terminal line (`turn.completed` or `turn.failed`) →
+    /// `agent.completed` carrying RUN totals.
     ///
     /// Guards the single-turn premise the run-terminal mapping rests on: see
     /// the type docs for why exec-mode stream end is run end, and why a second
-    /// completed turn must refuse rather than emit.
+    /// terminal line must refuse rather than emit.
     fn map_run_completed(
         &mut self,
         value: &Value,
         status: &'static str,
     ) -> Result<MappedFact, AdapterError> {
-        self.completed_turns += 1;
-        if self.completed_turns > 1 {
+        self.terminal_turns += 1;
+        if self.terminal_turns > 1 {
             return Err(AdapterError::ContractViolated {
                 harness: CODEX_HARNESS,
                 detail: format!(
                     "a second turn-terminal line arrived on one `codex exec --json` stream \
-                     (completed turn {}), falsifying the single-shot premise the recorded \
+                     (terminal turn {}), falsifying the single-shot premise the recorded \
                      contract rests on. `agent.completed` was already emitted as this run's \
-                     terminal fact carrying turn 1's usage as the RUN total, so the run's true \
-                     totals are no longer derivable from the log — re-record the transcript \
-                     contract for multi-turn exec before these numbers are trusted",
-                    self.completed_turns
+                     terminal fact carrying turn 1's accounting as the RUN total, so the run's \
+                     true totals and its OUTCOME are no longer derivable from the log — \
+                     re-record the transcript contract for multi-turn exec before these \
+                     numbers are trusted",
+                    self.terminal_turns
                 ),
             });
         }
         Ok(Completion {
             run: self.run,
             status,
-            // The codex format carries neither of these — honest zeros, never
-            // fabricated numbers (DR-048 §Decision 3 defers cross-vendor cost).
+            // The codex format carries neither of these for ANY outcome —
+            // honest zeros, never fabricated numbers (DR-048 §Decision 3 defers
+            // cross-vendor cost).
             total_usd: Value::from(0),
             duration_ms: Value::from(0),
-            input_tokens: number_or_zero(&value["usage"]["input_tokens"]),
-            output_tokens: number_or_zero(&value["usage"]["output_tokens"]),
-            // No aggregate turn count on the wire: the observed count, which
-            // the guard above holds at 1 for as long as the premise holds.
-            num_turns: Value::from(self.completed_turns),
+            // Present on `turn.completed`, ABSENT on `turn.failed` — a failed
+            // turn measured no tokens, and absence is the honest way to say so.
+            usage: reported_usage(&value["usage"]),
+            // Terminal turns OBSERVED, whatever their outcome (see the type
+            // docs); the guard above holds this at 1 while the premise holds.
+            num_turns: Value::from(self.terminal_turns),
             session_id: self.thread_id.clone(),
+            // Read from THIS line's own `error.message`, not from the preceding
+            // top-level `error` line: the two carry identical strings in the
+            // recording, and sourcing it locally keeps the mapping free of
+            // cross-line state and leaves that line as unmapped noise.
+            error_message: value["error"]["message"].as_str().map(String::from),
         }
         .into_fact())
     }

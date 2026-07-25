@@ -1802,8 +1802,13 @@ async fn drive_run(
     // text the daemon has, and it is harness-authored (DR-051 §Decision 4;
     // §Context finding 3 named it "discarded, not carried").
     let mut last_line: Option<String> = None;
-    // Set once the adapter REFUSES the stream (see the error arm below).
-    let mut contract_violation: Option<String> = None;
+    // Set once the adapter REFUSES the stream AND the refusal is durably on the
+    // fabric as a `run.contract.violated` fact (see the error arm below). A
+    // FLAG, not the refusal text: the text is not the daemon's to carry forward
+    // any more — it rides the fact (DR-050 set), and nothing downstream of the
+    // publish reads it. What survives here is the one thing the loop still
+    // needs: "stop mapping, keep draining".
+    let mut contract_refused = false;
 
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -1822,13 +1827,39 @@ async fn drive_run(
         if line.trim().is_empty() {
             continue;
         }
+        // ABOVE the refusal short-circuit deliberately: post-refusal lines
+        // KEEP updating this datum, and that is the ratified behavior, not an
+        // oversight. `last_line` is not inert — the fallback below publishes it
+        // as `agent.completed.error.message` — so the question is which text
+        // rides that field once the adapter has withdrawn the stream's premise.
+        // The ontology's `run.contract.violated` Timing bullet answers it: on a
+        // future pre-completion refusal "the DR-051 fallback fires independently
+        // (carrying the last stream line, per its own criterion) and this fact
+        // still records the refusal." The two facts PARTITION the failure text
+        // by AUTHOR — the harness's own last word here, the adapter's refusal on
+        // `run.contract.violated.detail` — and a post-refusal line is still
+        // harness-authored, so it remains eligible for this field and this field
+        // only. Moving this below the short-circuit would narrow the field to
+        // the REFUSING line (this assignment already precedes `map_line`, so the
+        // refusing line is captured either way — what the move drops is every
+        // line after it). That is a change to ratified semantics and belongs in
+        // a `/dr`, not in this assignment.
         last_line = Some(line.clone());
 
         // Once the adapter has refused the stream, keep DRAINING stdout into
         // the capture — the bytes stay evidence, and an unread pipe would
         // block the child and hang the reap below — but stop MAPPING: every
         // later fact would rest on the premise the adapter just refused (I3).
-        if contract_violation.is_some() {
+        // Scope note: "fact" here means an ADAPTER-MAPPED fact, and the guard's
+        // reach ENDS AT THIS LOOP — `contract_refused` is read here and nowhere
+        // else. Deliberately outside it: the fallback's `error.message` (per the
+        // bullet cited above), the `artifact.captured` capture manifest, and the
+        // whole `run_pre_merge` chain — so a premise-broken run still reaps,
+        // still chunks its capture, still runs the gate, and can still MERGE.
+        // Whether a withdrawn stream premise should block a merge is UNRULED —
+        // no DR or ontology bullet says — and is the sharper form of "nothing in
+        // the tree yet refuses a premise-broken run" (DR-048 slice-C territory).
+        if contract_refused {
             continue;
         }
         let facts = match adapter.map_line(&line) {
@@ -1842,24 +1873,73 @@ async fn drive_run(
                 // the stream does not support (I3). Whispering that through the
                 // garbage-line branch would let the daemon keep folding facts
                 // off a stream whose premise the substrate just withdrew. It
-                // surfaces instead as a fact-worthy failure: the run stops
-                // mapping and terminates through the failure-shaped completion
-                // below, carrying this refusal as its reason.
+                // surfaces instead as a fact-worthy failure: the ratified
+                // `run.contract.violated` v1 fact (`spec/ontology.md`, the
+                // "DR-050 set" block), which names this arm as its emitter.
+                // Tracing alone was the defect the mint exists to fix — a
+                // refusal that reached the logger and nothing else is a
+                // write-only variable, not a fact.
                 //
                 // Every OTHER adapter error stays tolerated. "A harness
                 // emitting a garbage line must not kill the run" is deliberate
                 // design, not an oversight — the byte stream already captured
                 // the evidence verbatim (pinned by
                 // `tests/dr050_badline_tolerated_e2e.rs`).
-                if matches!(e, AdapterError::ContractViolated { .. }) {
-                    tracing::error!(
-                        error = %e,
-                        "adapter refused the stream: recorded contract violated; \
-                         no further facts will be mapped from this run"
-                    );
-                    contract_violation = Some(e.to_string());
-                } else {
-                    tracing::warn!(error = %e, "unmappable stream line tolerated");
+                match e {
+                    AdapterError::ContractViolated { harness, detail } => {
+                        tracing::error!(
+                            harness = %harness,
+                            detail = %detail,
+                            "adapter refused the stream: recorded contract violated; \
+                             no further facts will be mapped from this run"
+                        );
+                        // `harness` and `detail` ride the fact STRUCTURALLY —
+                        // lifted from the variant's own fields, never
+                        // `e.to_string()`, whose `#[error(...)]` rendering wraps
+                        // `detail` in prose ("{harness}: recorded stream
+                        // contract violated — {detail}; refusing …"). The
+                        // ontology forbids re-parsing that prose back apart, and
+                        // the debrief oracle asserts the surfaced detail
+                        // byte-for-byte. No length bound is applied: rezidnt
+                        // AUTHORS this text, so an over-cap detail is an emitter
+                        // bug to fix, not an elision protocol to mint (contrast
+                        // the harness-authored `agent.completed.error?`).
+                        //
+                        // Causation is the run's published `agent.completed`
+                        // when the daemon holds one — that is the fact whose
+                        // premise this refusal withdraws, and the ontology's
+                        // envelope ruling pins it there (the `diff.ready`
+                        // gate-time-pin precedent). It is deliberately NOT
+                        // `ctx.spawned_id` like the mapped-fact publishes above:
+                        // those facts were CAUSED by the spawn, this one is
+                        // caused by the completion it discredits. The spawn id
+                        // is the honest fallback for a future adapter that
+                        // refuses before any completion was published.
+                        let event = Event::new(
+                            SourceId::new("rezidnt-run"),
+                            Some(ctx.workspace),
+                            Subject::new("run.contract.violated"),
+                            ctx.correlation,
+                            Some(completed_id.unwrap_or(ctx.spawned_id)),
+                            1,
+                            json!({
+                                "run": ctx.run,
+                                "harness": harness,
+                                "detail": detail,
+                            }),
+                        )?;
+                        // `?` exactly as every other publish in this function:
+                        // an unpublishable fact fails the run task loudly. The
+                        // refusal must never be swallowed by a failed append —
+                        // a silent drop here would leave the daemon mapping
+                        // nothing and recording nothing, the very state the
+                        // DR-050 mint exists to make impossible.
+                        publish(&ctx.daemon.fabric, event).await?;
+                        contract_refused = true;
+                    }
+                    other => {
+                        tracing::warn!(error = %other, "unmappable stream line tolerated");
+                    }
                 }
                 continue;
             }
@@ -1906,13 +1986,25 @@ async fn drive_run(
     // the same bullet requires of it. (The literal here previously zeroed all
     // three — DR-051 §Context finding 3.)
     //
-    // THE REASON IS CARRIED, NOT DISCARDED. `error.message` is the adapter's
-    // refusal text when the substrate withdrew the stream's premise above,
-    // otherwise the child's last stream line VERBATIM — harness-authored text,
-    // kept opaque and merely length-bounded, exactly as the ontology's
-    // `error?` clause describes the field. ABSENT when the child died silently
-    // with neither: a failure whose harness gave no reason omits the key rather
-    // than synthesizing one (DR-012 declared-vs-absent).
+    // THE REASON IS CARRIED, NOT DISCARDED — AND IT IS HARNESS-AUTHORED ONLY.
+    // `error.message` is the child's last stream line VERBATIM: harness-authored
+    // text, kept opaque and merely length-bounded, exactly as the ontology's
+    // `error?` clause describes the field. ABSENT when the child died silently:
+    // a failure whose harness gave no reason omits the key rather than
+    // synthesizing one (DR-012 declared-vs-absent).
+    //
+    // The adapter's own refusal text is NOT eligible for this field and no
+    // longer routes here — the refusal-preferring fallback that once won this
+    // slot over the last stream line is REMOVED. `agent.completed.error?` is
+    // ratified as harness-authored ONLY, and the
+    // rezidnt-AUTHORED refusal has its own home: `run.contract.violated.detail`,
+    // published at the exclusion arm above. The two fields partition failure
+    // text by AUTHOR, so a consumer of `error.message` may rely on harness
+    // authorship unconditionally (`spec/ontology.md`, the `error?` clause's
+    // authorship boundary + the DR-050 set). The removed routing was also
+    // unreachable on every constructible path — `ContractViolated` implies a
+    // completion was already published, so this arm's `completed_id.is_none()`
+    // guard never admitted it.
     if completed_id.is_none() {
         let mut payload = json!({
             "run": ctx.run,
@@ -1924,10 +2016,7 @@ async fn drive_run(
         if let (Some(session), Some(obj)) = (adapter.session_id(), payload.as_object_mut()) {
             obj.insert("session_id".to_string(), json!(session));
         }
-        // The refusal wins over the last line: when the adapter withdrew the
-        // contract, THAT is why this run has no completion of its own.
-        let reason = contract_violation.or(last_line);
-        if let (Some(reason), Some(obj)) = (reason, payload.as_object_mut()) {
+        if let (Some(reason), Some(obj)) = (last_line, payload.as_object_mut()) {
             obj.insert(
                 "error".to_string(),
                 json!({ "message": bounded_reason(reason) }),

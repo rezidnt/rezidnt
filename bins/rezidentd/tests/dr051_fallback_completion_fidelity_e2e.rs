@@ -25,7 +25,7 @@
 //! crates cannot drift apart by coincidence again (DR-050 §Context finding 2,
 //! third trap).
 //!
-//! ## STATE (truth pass, session 31 — the stale RED MODE header retired)
+//! ## STATE (truth pass, session 32)
 //!
 //! All three tests were ASSERT-RED when written and are GREEN PINS since the
 //! fallback literal in `bins/rezidentd/src/runs.rs` (`drive_run`, the
@@ -33,16 +33,16 @@
 //! absent together, `error.message` carried, key set matching the adapter's
 //! failure rendering. They stay as the regression board for that arm.
 //!
-//! DR-050-set NOTE for the next touch of the arm (the surfacing work order):
-//! the fallback's `contract_violation.or(last_line)` routing is ratified for
-//! REMOVAL — `agent.completed.error?` is harness-authored ONLY, and the
-//! adapter-composed refusal moves to `run.contract.violated.detail`
-//! (`spec/ontology.md` "### DR-050 set"; removal guard:
+//! DR-050-set NOTE (the "next touch" has happened): the fallback's
+//! `contract_violation.or(last_line)` routing is REMOVED, as ratified —
+//! `agent.completed.error?` is harness-authored ONLY, and the
+//! adapter-composed refusal rides `run.contract.violated.detail` instead
+//! (`spec/ontology.md` "### DR-050 set"; removed-and-stays-removed guard:
 //! `tests/dr050_contract_violated_surfacing.rs`). The SURVIVOR half of that
 //! routing — the dying child's LAST STREAM LINE still rides `error.message` —
 //! is exactly what `fallback_completion_carries_the_dying_childs_error_text`
-//! pins behaviorally (its stub dies with no contract violation in play), so
-//! this suite must stay green through the removal.
+//! pins behaviorally (its stub dies with no contract violation in play), and
+//! this suite stayed green through the removal, as required.
 #![cfg(unix)]
 
 mod common;
@@ -178,7 +178,8 @@ fn sorted_keys(v: &Value) -> Vec<String> {
 /// — `0` would be a present claim of a measurement that never happened, and a
 /// zero-token failure reads as a free run on the slice-C leaderboard.
 ///
-/// ASSERT-RED today: the fallback literal hardcodes both keys as `0`.
+/// GREEN pin since 462dee1 (ASSERT-RED when written: the fallback literal
+/// hardcoded both keys as `0`).
 #[test]
 fn fallback_completion_reports_usage_as_absent_not_zero() {
     let payload = fallback_completion();
@@ -205,7 +206,8 @@ fn fallback_completion_reports_usage_as_absent_not_zero() {
 /// the failure reason (DR-051 §Context finding 3: the reason is proven to
 /// exist and is "discarded, not carried").
 ///
-/// ASSERT-RED today: the fallback publishes no `error` key at all.
+/// GREEN pin since 462dee1 (ASSERT-RED when written: the fallback published
+/// no `error` key at all).
 #[test]
 fn fallback_completion_carries_the_dying_childs_error_text() {
     let payload = fallback_completion();
@@ -232,8 +234,9 @@ fn fallback_completion_carries_the_dying_childs_error_text() {
 /// dying, an axis orthogonal to the failure shape (both sides here happen to
 /// carry one; the normalization keeps this pin from freezing that accident).
 ///
-/// ASSERT-RED today: the reference carries `error` and no token keys; the
-/// fallback carries token keys and no `error`.
+/// GREEN pin since 462dee1 (ASSERT-RED when written: the reference carried
+/// `error` and no token keys; the fallback carried token keys and no
+/// `error`).
 #[test]
 fn fallback_completion_matches_the_adapters_failure_shape() {
     let mut fallback = fallback_completion();

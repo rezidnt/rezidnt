@@ -7,9 +7,10 @@
 //! Every event advances the envelope-level counters (`events_folded`,
 //! `last_event`, `counts_by_subject`). On top of that, [`apply`] folds the
 //! `workspace.*`, `worktree.*`, `agent.*`, `diff.*`, `gate.*`, `permit.*`,
-//! `egress.*`, `credential.*`, `integrity.alarm`, `run.intent.declared` and
-//! `action.metered` subjects into the three keyed maps [`Graph::workspaces`],
-//! [`Graph::worktrees`] and [`Graph::agent_runs`]. Dossier-level accounting —
+//! `egress.*`, `credential.*`, `integrity.alarm`, `run.intent.declared`,
+//! `run.contract.violated` and `action.metered` subjects into the three keyed
+//! maps [`Graph::workspaces`], [`Graph::worktrees`] and
+//! [`Graph::agent_runs`]. Dossier-level accounting —
 //! gate verdicts, the permit ledger, delegation edges, egress posture, spend
 //! and risk — hangs off [`AgentRunState`] rather than a separate entity. Each
 //! reducer arm documents its own semantics on the type it folds into; the
@@ -90,6 +91,42 @@ pub struct IntegrityAlarmRecord {
     pub recorded: String,
     /// Replayed verdict, verbatim — divergence means `recorded != replayed`.
     pub replayed: String,
+}
+
+/// DR-050 set: one folded `run.contract.violated` fact — a substrate adapter's
+/// REFUSAL of a run's live stream because the recorded transcript contract its
+/// mapped facts rest on was falsified (`AdapterError::ContractViolated`). The
+/// withdrawal of trust in the run's already-published accounting.
+///
+/// Reducer semantics (pinned by `tests/dr050_contract_violated_fold.rs` and the
+/// `dr050_contract_violated_first_wins` golden fixture; subject ratified in
+/// `spec/ontology.md` "### DR-050 set", minted at `v = 1`):
+/// `run.contract.violated` `{run, harness, detail}` folds onto
+/// [`AgentRunState::contract_violated`], keyed by the payload `run`, MINTING the
+/// run entry if absent (the `integrity.alarm` precedent — a violation fact on a
+/// run the log never spawned still creates the entry; the log is truth, I3).
+/// FIRST FACT WINS: the emitter is at-most-once per run by construction (after
+/// the first refusal the daemon drains without mapping), and the reducer dedups
+/// regardless — a duplicate fact, even one naming a DIFFERENT harness, never
+/// rewrites the recorded refusal. The raw log still holds every fact.
+///
+/// The published `agent.completed` is NEVER retracted or rewritten: the log is
+/// append-only (I3), so this record folds ALONGSIDE the run's status and
+/// accounting, not over them. Both fields fold VERBATIM — the emitter lifts them
+/// STRUCTURALLY from `AdapterError::ContractViolated { harness, detail }`, so
+/// the reducer never re-parses (or re-wraps) the variant's prose `Display` text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContractViolationRecord {
+    /// The harness whose recorded contract was falsified (e.g. `"codex"`),
+    /// verbatim from `ContractViolated { harness, .. }`. Names which adapter's
+    /// contract needs re-recording — a contract claim is per harness per
+    /// recorded version.
+    pub harness: String,
+    /// The adapter's refusal GROUND, verbatim from `ContractViolated { detail,
+    /// .. }`. rezidnt-authored text (contrast `agent.completed.error?`, which
+    /// the ontology's authorship boundary reserves for harness-authored
+    /// reasons) — the two fields partition failure text by author.
+    pub detail: String,
 }
 
 /// DR-017 §Decision 2 (SP4b): one folded `permit.delegated` fact — a capability
@@ -541,6 +578,20 @@ pub struct AgentRunState {
     /// `permit_ledger` already use (I3).
     #[serde(default)]
     pub resolutions: Vec<PermitResolution>,
+    /// DR-050 set: this run's recorded-contract violation (see
+    /// [`ContractViolationRecord`]), folded from a `run.contract.violated` fact
+    /// — the durable record that a substrate adapter refused this run's live
+    /// stream, so its already-published accounting (`total_usd`,
+    /// `input_tokens`, `output_tokens`, `status`) is premise-broken and MUST
+    /// NOT be scored silently (ontology consumer (3), the DR-048 slice-C
+    /// collator). `None` = no refusal was ever recorded — ABSENT, never
+    /// synthesized (DR-012 declared-vs-absent); absence is a claim of nothing,
+    /// not a claim of soundness. FIRST FACT WINS (see the record type).
+    /// `#[serde(default)]` keeps every pre-DR-050 golden fixture parsing (and
+    /// comparing equal) unedited — I3 rebuild-stability, the exact discipline
+    /// `integrity_alarms` / `intent` / `role` already use.
+    #[serde(default)]
+    pub contract_violated: Option<ContractViolationRecord>,
 }
 
 /// DR-035 §Decision 2 — the action-axis match predicate shared by the applied
@@ -1103,6 +1154,59 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                             .unwrap_or_else(|e| e);
                         alarms.insert(pos, record);
                     }
+                }
+            }
+        }
+        // DR-050 set: the adapter's stream REFUSAL, folded onto the run's
+        // dossier (see [`ContractViolationRecord`]). Keyed on the payload `run`;
+        // a payload without one folds as counters-only (never guesses a key,
+        // I3). MINTS the run entry if absent — the `integrity.alarm` precedent
+        // directly above. FIRST FACT WINS: `or_insert_with` leaves an existing
+        // record untouched, so a duplicate fact (even one naming a different
+        // harness) cannot rewrite the recorded refusal, and a malformed log
+        // cannot fold twice. Folds ALONGSIDE the completion's state — the
+        // published completion is never retracted (I3, append-only).
+        "run.contract.violated" => {
+            // `harness` and `detail` are both REQUIRED by the ratified payload,
+            // and both are GUARDED rather than defaulted — the `integrity.alarm`
+            // arm's discipline for its required discriminator. The reason is
+            // first-fact-wins below: an `unwrap_or_default()` would let a
+            // malformed fact mint an EMPTY record that then permanently wins the
+            // slot against the well-formed fact behind it, turning a garbled log
+            // line into a durable claim that the adapter refused for no stated
+            // ground. A fact missing either key folds as counters only and does
+            // not mint the run entry — reducers never choke and never guess (I3).
+            //
+            // The RESIDUAL this buys, named because it cuts the other way: when
+            // the run entry already exists (from its spawn), a malformed
+            // violation fact leaves `contract_violated` at `None`, so consumers
+            // (2) `rezidnt debrief` and (3) the slice-C collator see a CLEAN run
+            // — fail-OPEN on the exact axis this subject exists to close. The
+            // trade is deliberate and matches the `integrity.alarm` arm above:
+            // a malformed fact is refused the slot rather than allowed to squat
+            // it, and the raw log plus `counts_by_subject` remain the record, so
+            // nothing is lost — only the queryable projection declines to guess.
+            if let Some(run) = payload_run(event) {
+                let payload = event.payload();
+                if let (Some(harness), Some(detail)) =
+                    (payload["harness"].as_str(), payload["detail"].as_str())
+                {
+                    graph
+                        .agent_runs
+                        .entry(run)
+                        .or_default()
+                        .contract_violated
+                        // FIRST FACT WINS (the ontology's Timing bullet): the
+                        // emitter is at-most-once per run by construction, so a
+                        // second fact means a malformed log, and the earlier
+                        // record is the one the run's other facts were folded
+                        // against. Verbatim from the fact — the emitter lifted
+                        // both from the variant's fields, so the reducer
+                        // re-parses nothing.
+                        .get_or_insert_with(|| ContractViolationRecord {
+                            harness: harness.to_string(),
+                            detail: detail.to_string(),
+                        });
                 }
             }
         }

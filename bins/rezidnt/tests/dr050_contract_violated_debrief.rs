@@ -18,17 +18,32 @@
 //! block's per-key absence discipline (omit when None, NEVER null; DR-051
 //! §Decision 5) applied to this key.
 //!
-//! ## RED MODE (stated plainly, per test)
+//! ## STATE (truth pass, session 32)
 //!
-//! - `debrief_surfaces_the_contract_violation` and
-//!   `surfaced_detail_is_the_structural_field_not_the_display_wrapping` are
-//!   ASSERT-RED today: the report json carries no `contract_violated` key.
-//!   (They stay red through the reducer landing until the CLI surfaces the
-//!   fold — two implementation steps, one judge at the surface.)
-//! - `debrief_omits_contract_violated_when_no_fact_folded` is
-//!   GREEN-BY-ABSENCE today (no such key exists at all) — retained, per the
-//!   dr006 green-by-absence precedent, as the guard that the key stays
-//!   ABSENT-not-null once the surfacing lands. Flagged for the auditor.
+//! ASSERT-RED when written; the fold arm and the CLI surfacing have since
+//! landed, and every test here is a GREEN regression pin.
+//! `debrief_omits_contract_violated_when_no_fact_folded` was
+//! GREEN-BY-ABSENCE at introduction (flagged then, per the dr006 precedent);
+//! with the key now real it is the live guard that the surfacing stays
+//! per-key-on-presence — an implementer who serializes `None` as `null`
+//! turns it red.
+//!
+//! The session-32 remediation adds the HUMAN (non-`--json`) surface pin —
+//! consumer (2)'s load-bearing half, previously unjudged: the default form
+//! is what a human reads at the done gate, and the JSON report alone
+//! satisfies the letter of consumer (2) and none of its point (the surface's
+//! own comment says exactly this). Added AFTER the surface landed; proven
+//! able to go red by mutation (human block removed, test red, source
+//! restored) before being reported green.
+//!
+//! EXIT-CLASS DISCLOSURE: every test here asserts exit 0 through the shared
+//! runner. For the clean run that is settled law (DR-004: no alarms, no gate
+//! facts). For the VIOLATED runs it pins the STATUS QUO, not a ruling —
+//! whether a contract-violated run should exit 3 (the `integrity.alarm`
+//! analogy: neither trusted nor coerced) is an OPEN owner-level question for
+//! a decision record. If that ruling lands, the runner's assertion goes red
+//! on purpose and follows the DR: the red is the ruling's judge arriving,
+//! not a regression.
 
 use std::path::Path;
 use std::process::Command;
@@ -71,24 +86,40 @@ fn seed(db: &Path, events: &[Event]) {
     }
 }
 
-/// Run `rezidnt debrief <run> --json` against a seeded log and return the
-/// parsed report. `REZIDNT_CAS` is pinned inside the tempdir so replay never
-/// touches ambient state.
-fn debrief_json(dir: &Path, db: &Path, run: &str) -> serde_json::Value {
-    let out = Command::new(env!("CARGO_BIN_EXE_rezidnt"))
-        .arg("debrief")
-        .arg(run)
-        .arg("--json")
+/// Run `rezidnt debrief <run>` (with or without `--json`) against a seeded
+/// log and return the raw output. `REZIDNT_CAS` is pinned inside the tempdir
+/// so replay never touches ambient state.
+///
+/// The success assertion pins the STATUS QUO, not a ruling — see the
+/// header's EXIT-CLASS DISCLOSURE.
+fn debrief(dir: &Path, db: &Path, run: &str, json: bool) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rezidnt"));
+    cmd.arg("debrief").arg(run);
+    if json {
+        cmd.arg("--json");
+    }
+    let out = cmd
         .env("REZIDNT_DB", db)
         .env("REZIDNT_CAS", dir.join("cas"))
         .output()
         .expect("run rezidnt debrief");
     assert!(
         out.status.success(),
-        "debrief with no alarms and no gate facts must exit 0 (DR-004), got {:?}; stderr:\n{}",
+        "debrief exited {:?}, expected 0. For the clean run this is DR-004 law (no \
+         alarms, no gate facts). For the violated runs it is a STATUS-QUO pin on an \
+         OPEN question — whether a contract-violated run should exit 3 (the \
+         integrity.alarm analogy) has NOT been ruled; this assertion deliberately \
+         goes red the day a DR changes the exit class, and should then be updated \
+         to follow the DR, never quietly deleted. stderr:\n{}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+    out
+}
+
+/// The `--json` form of [`debrief`], parsed.
+fn debrief_json(dir: &Path, db: &Path, run: &str) -> serde_json::Value {
+    let out = debrief(dir, db, run, true);
     serde_json::from_slice(&out.stdout)
         .expect("`rezidnt debrief --json` must print the report as JSON on stdout")
 }
@@ -185,11 +216,13 @@ fn surfaced_detail_is_the_structural_field_not_the_display_wrapping() {
 /// key — omitted, never null. `null` would claim "we looked and there is
 /// nothing" where the truth is "no fact was ever folded".
 ///
-/// ORACLE HONESTY NOTE (GREEN-BY-ABSENCE today): the report carries no such
-/// key for ANY run yet, so this holds trivially pre-implementation. Retained
-/// as the guard that the surfacing lands per-key-on-presence, not
-/// unconditionally — an implementer who serializes `None` as `null` turns
-/// this red. Flagged for the auditor, per the dr006 precedent.
+/// ORACLE HONESTY NOTE: introduced GREEN-BY-ABSENCE (the report carried no
+/// such key for any run, so it held trivially), and flagged as such for the
+/// auditor per the dr006 precedent. It is now a REAL per-key guard — the
+/// surfacing has landed and `debrief_surfaces_the_contract_violation` proves
+/// the key exists, so this test discriminates omitted-on-absence from
+/// emitted-unconditionally. An implementer who serializes `None` as `null`
+/// turns it red.
 #[test]
 fn debrief_omits_contract_violated_when_no_fact_folded() {
     let dir = tempfile::tempdir().unwrap();
@@ -214,5 +247,61 @@ fn debrief_omits_contract_violated_when_no_fact_folded() {
          not null (the debrief cost block's per-key discipline, DR-051 §Decision 5). \
          Got {:?}",
         obj.get("contract_violated")
+    );
+}
+
+/// Consumer (2)'s LOAD-BEARING half (session-32 auditor finding): the
+/// DEFAULT (non-`--json`) form is the done-gate surface a human actually
+/// reads — the JSON report alone satisfies the letter of consumer (2) and
+/// none of its point. Pins what the surface actually prints: the
+/// `CONTRACT VIOLATED (<harness>)` block, its do-not-score consequence, and
+/// the refusal ground verbatim — plus the absence direction: a clean run
+/// prints no block, mirroring the JSON key's per-key discipline.
+#[test]
+fn debrief_human_output_names_the_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("events.db");
+    seed_violated_run(&db, "run-violated");
+
+    let out = debrief(dir.path(), &db, "run-violated", false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CONTRACT VIOLATED (codex)"),
+        "a premise-broken run must say so on the HUMAN surface: the default form \
+         prints a `CONTRACT VIOLATED (<harness>)` block (ontology DR-050 set, \
+         consumer (2): \"must say so at the done-gate surface\" — the surface a \
+         human reads, not only the JSON report). Got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("do not score"),
+        "the block carries its consequence — the run's recorded totals rest on a \
+         premise the substrate withdrew and must not be scored. Got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(DETAIL),
+        "the refusal ground rides the human surface verbatim, exactly as it rides \
+         the JSON report — a violation the reader cannot interrogate is a verdict \
+         without evidence (I6). Got stdout:\n{stdout}"
+    );
+
+    let clean_dir = tempfile::tempdir().unwrap();
+    let clean_db = clean_dir.path().join("events.db");
+    seed(
+        &clean_db,
+        &[
+            evt(0, "agent.spawned", json!({"run": "run-clean"})),
+            evt(
+                1,
+                "agent.completed",
+                json!({"run": "run-clean", "status": "completed", "cost": {"total_usd": 0.19}}),
+            ),
+        ],
+    );
+    let out = debrief(clean_dir.path(), &clean_db, "run-clean", false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("CONTRACT VIOLATED"),
+        "a run with no folded violation prints no block — absence stays absence on \
+         the human surface too. Got stdout:\n{stdout}"
     );
 }

@@ -2301,6 +2301,24 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| serde_json::json!({}));
 
+    // DR-050 set, named consumer (2): "a run whose recorded totals are
+    // premise-broken must say so at the done-gate surface." The folded
+    // `run.contract.violated` record — a substrate adapter's refusal of this
+    // run's stream — rides the report VERBATIM (`harness` and `detail` are the
+    // variant's own fields; this surface re-wraps nothing, exactly as the
+    // emitter re-parses nothing).
+    //
+    // Per-key absence discipline, as the `cost` block above documents it: the
+    // key is emitted ONLY when a record actually folded. A `null` would be a
+    // present claim of an absent value — "we looked and this run's premises are
+    // sound" — where the truth is "no refusal fact was ever folded". The
+    // difference matters most here: absence of a violation is not evidence of
+    // soundness, and a null would quietly assert that it is.
+    let contract_violated = graph
+        .agent_runs
+        .get(run)
+        .and_then(|r| r.contract_violated.as_ref());
+
     // DR-004 exit class: an integrity alarm or any inconclusive is 3 (neither
     // trusted nor coerced, I6); else any recorded fail is 5; else 0.
     let has_inconclusive = gates.values().any(|g| g.verdict == "inconclusive");
@@ -2332,15 +2350,37 @@ fn debrief(run: &str, as_json: bool) -> anyhow::Result<()> {
     // complement): the additive audit improvement must never destroy the
     // finding it decorates.
     if as_json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "run": run,
             "alarms": alarms,
             "gates": gates,
             "cost": cost,
         });
+        if let (Some(record), Some(obj)) = (contract_violated, out.as_object_mut()) {
+            obj.insert(
+                "contract_violated".to_string(),
+                serde_json::json!({
+                    "harness": record.harness,
+                    "detail": record.detail,
+                }),
+            );
+        }
         println!("{out}");
     } else {
         println!("debrief {run}: {} alarm(s)", alarms.len());
+        // The DEFAULT (non-`--json`) form is the done-gate surface a human
+        // actually reads. A premise-broken run that says nothing here has not
+        // "said so at the done-gate surface" — the JSON report alone would
+        // satisfy the letter of consumer (2) and none of its point.
+        if let Some(record) = contract_violated {
+            println!(
+                "debrief {run}: CONTRACT VIOLATED ({}) — this run's recorded totals \
+                 (cost, turns, status) rest on a premise the substrate withdrew; do not \
+                 score them",
+                record.harness
+            );
+            println!("debrief {run}:   refusal: {}", record.detail);
+        }
     }
 
     // DR-006: a divergence must land a DURABLE `integrity.alarm` fact on the
@@ -2762,13 +2802,13 @@ fn loopback_post(port: u16, body: &str) -> anyhow::Result<String> {
     );
     stream
         .write_all(request.as_bytes())
-        .context("write kill_run request")?;
-    stream.flush().context("flush kill_run request")?;
+        .context("write MCP request to daemon")?;
+    stream.flush().context("flush MCP request to daemon")?;
 
     let mut raw = String::new();
     stream
         .read_to_string(&mut raw)
-        .context("read kill_run response")?;
+        .context("read MCP response from daemon")?;
     // Split off the HTTP head; the body is the JSON-RPC response. A response
     // with no head/body split is a malformed daemon reply (surfaced by the
     // caller as a refusal).

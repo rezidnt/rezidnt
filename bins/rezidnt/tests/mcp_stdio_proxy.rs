@@ -153,6 +153,21 @@ fn fake_mcp_server_dropping(serve_ok: usize) -> u16 {
                 );
                 let _ = stream.write_all(http.as_bytes());
                 let _ = stream.flush();
+                // Close GRACEFULLY, not abruptly. `write_all` only hands the
+                // bytes to the kernel; dropping the socket straight afterwards
+                // lets Winsock answer the client's next read with an RST
+                // (`os error 10054`), which DISCARDS the response still in
+                // flight — the client then sees a dead daemon where the fake
+                // one in fact replied. That is a defect in this harness, not in
+                // the proxy: it fired ~7% of the time when all five tests in
+                // this binary run concurrently (the `/vet` condition) and never
+                // on a filtered re-run, which is exactly the profile of the
+                // "unexplained vet flake" carried in the session handoffs.
+                // Half-closing and then draining to EOF sends FIN, and blocks
+                // until the client has read the response and closed its end.
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut drain = Vec::new();
+                let _ = reader.read_to_end(&mut drain);
                 served += 1;
             } else {
                 // The daemon "dies": drop the connection with no response.

@@ -140,8 +140,8 @@ const INPUT_SUMMARY_CAP: usize = 256;
 ///
 /// Truncation, not a CAS ref, because this mapper is PURE (it holds no CAS,
 /// by design — the daemon owns that swap) and because a reason is a short
-/// string by nature: 1 KiB carries the whole of every reason in the recorded
-/// transcripts with three orders of magnitude of headroom. The bulk-body
+/// string by nature: the one reason in the recorded transcripts measures 215
+/// bytes, so 1 KiB carries it whole with ~4.8x headroom. The bulk-body
 /// escape hatch stays [`MESSAGE_INLINE_CAP`]'s, for `agent.message`, where
 /// the bytes are genuinely the payload.
 pub const ERROR_MESSAGE_CAP: usize = 1024;

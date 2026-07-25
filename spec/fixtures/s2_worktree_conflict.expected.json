@@ -10,14 +10,14 @@
   "agent_runs": {},
   "worktrees": {
     "/repos/demo/wt-feat": {
-      "status": "allocated",
+      "lifecycle": "allocated",
       "branch": "feat/s2",
       "allocator": "rezidnt",
       "conflicts": 1,
       "last_diff": null
     },
     "/repos/demo/wt-human": {
-      "status": "observed",
+      "lifecycle": "observed",
       "branch": null,
       "allocator": "human",
       "conflicts": 0,

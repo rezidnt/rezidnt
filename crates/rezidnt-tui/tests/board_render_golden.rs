@@ -20,8 +20,13 @@
 //! (events_folded, workspaces open/closed, counts_by_subject), the runs table
 //! (run id, status, cost usd, in/out tokens, integrity alarms), the permit
 //! section (granted/denied/escalated, pending, delegated) that appears ONLY
-//! when at least one run has permit activity, and the worktrees table (path,
-//! status, branch?, last_diff?).
+//! when at least one run has permit activity, and the worktrees table.
+//!
+//! DR-049 §Decision 2 moved the worktrees table onto the SPLIT: its columns are
+//! `path, lifecycle, outcome, branch, last diff`, replacing the single collapsed
+//! `status` column. One column could show only one of the two axes, which is
+//! the derived-state clobber the split removes. Both goldens were re-blessed
+//! with `REZIDNT_BLESS_GOLDEN=1` against the real render — never edited by hand.
 //!
 //! Colored status cells are ALLOWED in the real `draw` but are NEVER asserted:
 //! the golden is a TestBackend TEXT dump (`buffer_to_text` below drops style),
@@ -182,7 +187,12 @@ fn rendered_buffer_names_the_run_and_its_status() {
     );
     assert!(
         text.contains("merged"),
-        "the board must render the merged worktree status; got:\n{text}"
+        "the board must render the worktree's merged OUTCOME (DR-049 §Decision 2); got:\n{text}"
+    );
+    assert!(
+        text.contains("allocated"),
+        "and its LIFECYCLE alongside — the split's whole point is that the board shows both \
+         axes truthfully, not whichever fact folded last; got:\n{text}"
     );
 }
 
@@ -228,7 +238,7 @@ fn board_render_is_bordered_and_tabular() {
             "runs table must carry a `{header}` column header; got:\n{text}"
         );
     }
-    for header in ["path", "branch"] {
+    for header in ["path", "lifecycle", "outcome", "branch"] {
         assert!(
             lower.contains(header),
             "worktrees table must carry a `{header}` column header; got:\n{text}"

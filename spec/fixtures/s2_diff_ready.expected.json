@@ -10,7 +10,7 @@
   "agent_runs": {},
   "worktrees": {
     "/repos/demo/wt-diff": {
-      "status": "released",
+      "lifecycle": "released",
       "branch": "feat/diff",
       "allocator": "rezidnt",
       "conflicts": 0,

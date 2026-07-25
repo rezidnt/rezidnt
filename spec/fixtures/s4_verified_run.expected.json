@@ -37,7 +37,8 @@
   },
   "worktrees": {
     "/tmp/rezidnt-s4/impl": {
-      "status": "merged",
+      "lifecycle": "allocated",
+      "outcome": "merged",
       "branch": "rezidnt/impl",
       "allocator": "rezidnt",
       "conflicts": 0,

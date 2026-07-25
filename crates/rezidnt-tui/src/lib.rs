@@ -50,9 +50,17 @@ pub use rezidnt_state::{BoardView, RunRow, WorktreeRow, project};
 /// single summary line), a runs `Table` (run id, status, cost usd, tokens,
 /// alarms), a permit `Table` rendered ONLY when at least one run has permit
 /// activity ([`run_has_permit_activity`]) so a permit-free fleet shows NO permit
-/// panel, and a worktrees `Table` (path, status, branch, last diff). Colored
-/// status cells are allowed but never asserted — the golden is a text-only
-/// `TestBackend` dump.
+/// panel, and a worktrees `Table` (path, lifecycle, outcome, branch, last
+/// diff). Colored status cells are allowed but never asserted — the golden is a
+/// text-only `TestBackend` dump.
+///
+/// DR-049 §Decision 2: the worktrees table shows the SPLIT — `lifecycle`
+/// (allocate/release) and `outcome` (merged/failed/…) as two columns, replacing
+/// the single collapsed `status`. One column could only show one of the two,
+/// which is exactly the derived-state clobber the split removes; the exit demo
+/// asks the board to show a merged-then-released tree TRUTHFULLY. An absent
+/// outcome renders `-`, the same honest-absence spelling `branch`/`last diff`
+/// already use — never a synthesized word.
 ///
 /// This is a PURE, NON-INTERACTIVE function of ONE `BoardView` snapshot: no
 /// selection, cursor, focus, or detail pane (interactivity is Phase 3 /
@@ -210,15 +218,19 @@ pub fn draw(frame: &mut ratatui::Frame, view: &BoardView) {
     // --- Worktrees table -----------------------------------------------------
     let wt_widths = [
         Constraint::Length(34), // path
-        Constraint::Length(11), // status
+        Constraint::Length(11), // lifecycle
+        Constraint::Length(9),  // outcome
         Constraint::Length(18), // branch
         Constraint::Min(14),    // last diff
     ];
-    let wt_header = Row::new(["path", "status", "branch", "last diff"]);
+    let wt_header = Row::new(["path", "lifecycle", "outcome", "branch", "last diff"]);
     let wt_rows = view.worktrees.iter().map(|wt| {
         Row::new([
             Cell::from(truncate(&wt.path, 32).to_string()),
-            status_cell(&wt.status),
+            status_cell(&wt.lifecycle),
+            // ABSENT renders `-`: the board never invents an outcome the fold
+            // does not hold (I3).
+            status_cell(wt.outcome.as_deref().unwrap_or("-")),
             Cell::from(wt.branch.clone().unwrap_or_else(|| "-".to_string())),
             Cell::from(
                 wt.last_diff

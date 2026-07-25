@@ -71,6 +71,30 @@ pub struct KillRunArgs {
     pub reason: Option<String>,
 }
 
+/// `release_worktree` — DR-049 §Decision 3: the EXPLICIT release that closes a
+/// retained worktree. A failed run's tree survives for triage until someone
+/// acts (v1 is explicit-only: no TTL, no timer, no auto-reap), and this is the
+/// door they act through — MCP-first (I5) on the write-capable operator
+/// surface, never on the read-only board (DR-031).
+///
+/// Mutating, so a badge is required (doc §12), checked before any side effect.
+/// The door is the DUAL path (`check_badge`), not `kill_run`'s operator-only
+/// one, because DR-049 §Decision 3 says "operator **or** lead": a lead run that
+/// allocated trees is entitled to close one, and narrowing the record to
+/// operator-only would be a decision this slice has no authority to make.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReleaseWorktreeArgs {
+    /// Operator badge token or agent macaroon (doc §12). Never logged — the
+    /// verified id is loggable, the token never (§12/I2).
+    pub badge: String,
+    /// The worktree's path, spelled EXACTLY as the allocation minted it — the
+    /// canonicalized string that is already the identity every consumer keys
+    /// on: the fold's `worktrees` map key, the sole-allocator registry line,
+    /// and the `worktree.released` v1 payload. A caller reads it off
+    /// `worktree.allocated` / `board_view`, never types it.
+    pub path: String,
+}
+
 /// `resolve_permit` — DR-033 §Decision 1 (slice 2): the OPERATOR-ONLY mutating
 /// tool by which a human resolves a previously-escalated permit. Mutating:
 /// requires an operator badge (doc §12 / DR-033 §Design), checked before any

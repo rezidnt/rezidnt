@@ -84,6 +84,18 @@ pub mod codes {
     /// peers tolerate an unknown refusal code (the `scope.requires_ttl`
     /// precedent, I5).
     pub const WORKTREE_CONFLICT: &str = "worktree.conflict";
+    /// DR-049 §Decision 3 — `release_worktree` named a path this daemon holds
+    /// no live allocation for: never allocated here, already released, or
+    /// allocated before a restart (the daemon's allocation handle table is
+    /// process-lifetime, disclosed on `Daemon::allocations`).
+    ///
+    /// Distinct from a silent success on purpose. "Nothing was released" and
+    /// "released" are different outcomes, and answering the first with the
+    /// second would let an operator believe a leaked watcher and an open
+    /// registry claim had been closed when they had not (I6). Additive code —
+    /// older peers tolerate an unknown refusal code (the `scope.requires_ttl`
+    /// precedent, I5).
+    pub const WORKTREE_UNKNOWN: &str = "worktree.unknown";
     /// DR-035 §Decision 3 — `resolve_permit` was called with a broad scope
     /// (`scope="run_tool"`) but no `ttl_ms`. Broad OR permanent, never both: a
     /// broad grant MUST be time-boxed so the dangerous quadrant (broad AND
@@ -456,6 +468,36 @@ pub trait McpSubstrate: Send + Sync {
             ))
         })
     }
+
+    /// DR-049 §Decision 3: EXPLICITLY release the worktree at `path` — the
+    /// only way a failed run's retained tree is ever closed (v1 has no TTL and
+    /// no auto-reap, by decision).
+    ///
+    /// The daemon resolves the path to the [`WorktreeId`] its allocation
+    /// minted and drives `RepoSubstrate::release_worktree`, which drops the
+    /// notify watcher and its debounce task, removes the tree, closes the
+    /// registry claim, and emits `worktree.released`. The core drives this
+    /// ONLY after the §12 door admits the caller, so a refused release has no
+    /// effect and writes no fact (I3).
+    ///
+    /// The core emits NOTHING itself here — unlike `kill_run`, whose
+    /// `agent.signaled` fact the core mints. The release fact is the ADAPTER's
+    /// (it is the sole emitter of `worktree.*`, and two emitters for one
+    /// release would fold it twice). This method's success is the adapter
+    /// having appended.
+    ///
+    /// DEFAULTED so every existing implementation compiles untouched (the
+    /// `fan_out` precedent): a substrate without this path answers
+    /// `SUBSTRATE_UNAVAILABLE` — honest absence, never a synthesized success.
+    fn release_worktree(&self, path: String) -> BoxFuture<Result<(), ToolRefusal>> {
+        let _ = path;
+        Box::pin(async {
+            Err(ToolRefusal::new(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "this substrate implements no release_worktree path",
+            ))
+        })
+    }
 }
 
 /// The transport-agnostic MCP core: one JSON-RPC request in, one response
@@ -641,6 +683,7 @@ impl McpCore {
             "open_project" => self.call_open_project(args).await,
             "spawn_agent" => self.call_spawn_agent(args).await,
             "kill_run" => self.call_kill_run(args).await,
+            "release_worktree" => self.call_release_worktree(args).await,
             "resolve_permit" => self.call_resolve_permit(args).await,
             "request_permission" => self.call_request_permission(args).await,
             "gate_explain" => self.call_gate_explain(args).await,
@@ -1053,6 +1096,69 @@ impl McpCore {
             obj.insert("escalation".to_string(), json!(escalation));
         }
         Ok(tool_ok(result))
+    }
+
+    /// `release_worktree` — DR-049 §Decision 3. The mutating tool that closes a
+    /// worktree the daemon retained. A merged tree releases itself at merge
+    /// (§Decision 1, run-task side); a FAILED run's tree survives for triage
+    /// and is closed only by an explicit call — this one. There is no TTL and
+    /// no auto-reap in v1, so without this door the retained trees the risk
+    /// register accepts would accumulate with no operator recourse at all.
+    ///
+    /// Door discipline (§12), refusal BEFORE any effect: [`Self::check_badge`]'s
+    /// DUAL path, verb `"merge"`. Two settlements the DR left to the slice,
+    /// stated rather than buried:
+    ///
+    /// - **DUAL, not operator-only.** DR-049 §Decision 3 says "operator **or**
+    ///   lead calls the release verb". `kill_run`'s operator-only door is a
+    ///   DR-032 policy about *terminating someone else's run*; releasing a tree
+    ///   the caller's own lead allocated is not that, and narrowing a ratified
+    ///   "or" to "only" is not this slice's call to make. The DR-049 e2e board
+    ///   exercises the operator leg; the lead leg has its own judge in
+    ///   `tests/release_worktree_macaroon_door.rs` — a lead macaroon carrying
+    ///   `merge` is admitted against an EMPTY `BadgeBook` (so path 1 cannot be
+    ///   what admits it), and the control narrows the same macaroon to
+    ///   `{spawn, open}` and requires `BADGE_INVALID` with nothing released.
+    ///   Ratified as a decided policy, not a described one, in DR-052.
+    /// - **Verb `"merge"`, not a new verb.** The macaroon `Caveat::Verb`
+    ///   vocabulary is `spawn`/`open`/`merge`. Release is a repo-mutating verb
+    ///   in the merge class — literally the step that follows a merge on the
+    ///   golden path — so it reuses an existing value rather than minting one.
+    ///   A base badge carries no `Verb` caveat and is unaffected either way;
+    ///   this only decides what a NARROWED badge may still do.
+    ///
+    /// The core emits NO fact of its own: `worktree.released` is the adapter's,
+    /// appended by the substrate's release (I3 — one emitter per occurrence).
+    async fn call_release_worktree(&self, args: Value) -> RpcOutcome {
+        // 1. The §12 door FIRST. A refusal returns before any effect.
+        let _badge_id = match self.check_badge(&args, "merge") {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
+        // 2. Deserialize THROUGH the advertised shape so the served
+        //    `inputSchema` and the accepted args cannot diverge (doc §9).
+        let parsed: rezidnt_types::mcp::ReleaseWorktreeArgs =
+            match serde_json::from_value(args.clone()) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Ok(tool_refused(
+                        codes::ARGS_INVALID,
+                        "release_worktree requires path",
+                    ));
+                }
+            };
+        // 3. The substrate. A refusal here (unknown path, adapter failure) is a
+        //    machine-readable tool error and releases nothing.
+        let Some(substrate) = &self.substrate else {
+            return Ok(tool_refused(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "no run substrate is wired to this MCP core",
+            ));
+        };
+        match substrate.release_worktree(parsed.path.clone()).await {
+            Ok(()) => Ok(tool_ok(json!({"path": parsed.path}))),
+            Err(refusal) => Ok(tool_refused(&refusal.code, &refusal.message)),
+        }
     }
 
     /// `resolve_permit` — DR-033 §Decision 1 (slice 2). The OPERATOR-ONLY
@@ -2077,6 +2183,11 @@ fn tools_list() -> RpcOutcome {
                 "name": "kill_run",
                 "description": "Terminate a run: OPERATOR-ONLY (DR-032 §1). Requires an operator badge; an agent macaroon is refused. Emits one attributed agent.signaled fact.",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::KillRunArgs))?,
+            },
+            {
+                "name": "release_worktree",
+                "description": "Explicitly release a retained worktree (DR-049 §3): drops its watcher, removes the tree, closes the sole-allocator registry claim, and appends worktree.released. A merged run's tree releases itself at merge; a failed run's tree survives for triage until this is called. Mutating: badge required (operator or lead).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::ReleaseWorktreeArgs))?,
             },
             {
                 "name": "resolve_permit",

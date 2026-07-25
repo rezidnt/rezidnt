@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rezidnt_adapter_git::{
-    Allocator, DynRepoSubstrate, FactSink, GitAdapter, GitError, WorktreeReq,
+    Allocator, DynRepoSubstrate, FactSink, GitAdapter, GitError, WorktreeId, WorktreeReq,
 };
 use rezidnt_cas::Cas;
 use rezidnt_fabric::Fabric;
@@ -196,6 +196,40 @@ pub struct Daemon {
     /// ([`Daemon::with_repo_substrate`]) — the allocation seam DR-046 Item 3(a)
     /// names. `None` in production.
     repo_substrate: Option<Arc<dyn DynRepoSubstrate>>,
+    /// LIVE allocations this daemon made, keyed by the canonical path spelling
+    /// the allocation minted (DR-049 §Decision 3/5).
+    ///
+    /// Why it exists: `RepoSubstrate::release_worktree` is keyed by
+    /// [`WorktreeId`], the MCP release door is keyed by PATH (the identity
+    /// every consumer already has — the fold's map key, the registry line, the
+    /// `worktree.released` payload), and the trait has no path→id lookup. It
+    /// does not get one: `RepoSubstrate` keeps DR-007's three methods, and
+    /// DR-049 adds none to IT. (DR-049 does mint a trait method — but on
+    /// `McpSubstrate`, the MCP core's seam onto the daemon, which is where the
+    /// path→id resolution below is performed. The repo trait stays keyed by
+    /// [`WorktreeId`].) So the daemon remembers what it allocated.
+    ///
+    /// NOT derived state pretending to be truth (I3): this is a handle table
+    /// for a runtime resource — the same class as `repo_adapters` and the run
+    /// `registry` — and holds nothing the log does not. Every question about
+    /// what a worktree IS is answered by folding the log; this answers only
+    /// "which live adapter object can close this one".
+    ///
+    /// Restart degradation, stated rather than hidden: the map is
+    /// process-lifetime, so a tree allocated before a restart is not
+    /// releasable through the MCP door until the adapter's own reload path
+    /// grows a way to hand its ids back. The failure is a REFUSAL naming the
+    /// path, never a silent success.
+    allocations: tokio::sync::Mutex<HashMap<String, Allocation>>,
+}
+
+/// One live allocation's release handle: which repo's adapter owns it and
+/// under which [`WorktreeId`] (see [`Daemon::allocations`]).
+#[derive(Debug, Clone)]
+struct Allocation {
+    /// Canonicalized repo root — the `repo_adapters` cache key.
+    repo: PathBuf,
+    id: WorktreeId,
 }
 
 impl Daemon {
@@ -207,6 +241,7 @@ impl Daemon {
             workspaces: tokio::sync::Mutex::new(HashMap::new()),
             repo_adapters: tokio::sync::Mutex::new(HashMap::new()),
             repo_substrate: None,
+            allocations: tokio::sync::Mutex::new(HashMap::new()),
             // One key per Daemon instance = process-lifetime (a test that builds
             // a fresh Daemon gets its own key; the production daemon builds one).
             root_key: RootKey::mint(),
@@ -292,6 +327,55 @@ impl Daemon {
         let adapter: Arc<dyn DynRepoSubstrate> = Arc::new(adapter);
         cache.insert(key, Arc::clone(&adapter));
         Ok(adapter)
+    }
+
+    /// Remember a live allocation so it can be released later by PATH
+    /// (DR-049 §Decision 3/5). See [`Daemon::allocations`] for why the daemon
+    /// holds this rather than the trait growing a lookup.
+    async fn remember_allocation(&self, path: &Path, repo: &Path, id: WorktreeId) {
+        self.allocations.lock().await.insert(
+            path.display().to_string(),
+            Allocation {
+                repo: repo.to_path_buf(),
+                id,
+            },
+        );
+    }
+
+    /// Release the worktree at `path` — the ONE release path, driven both by
+    /// the run task at merge (DR-049 §Decision 1) and by the explicit MCP door
+    /// (§Decision 3). One path so the two can never disagree about what
+    /// releasing means, and so the handle table is forgotten exactly when the
+    /// adapter closes the claim.
+    ///
+    /// `path` is matched on the canonical spelling the allocation minted —
+    /// byte-identical to the `worktree.allocated` payload, the registry key,
+    /// and the fold's map key. An unknown path is an ERROR naming it, never a
+    /// silent no-op: "nothing was released" must not read as success.
+    ///
+    /// The adapter emits `worktree.released` (it is the sole emitter of
+    /// `worktree.*`; the daemon publishes none of its own — two records of one
+    /// occurrence would fold it twice). The handle is forgotten only AFTER the
+    /// adapter reports success, so a failed release stays retryable.
+    pub async fn release_worktree_at(&self, path: &str) -> anyhow::Result<()> {
+        let allocation = {
+            let allocations = self.allocations.lock().await;
+            allocations.get(path).cloned()
+        };
+        let Some(allocation) = allocation else {
+            anyhow::bail!(
+                "no live allocation for worktree {path} on this daemon — it was never \
+                 allocated here, is already released, or was allocated before a restart \
+                 (the allocation handle table is process-lifetime)"
+            );
+        };
+        let substrate = self.repo_adapter(&allocation.repo).await?;
+        substrate
+            .release_worktree(&allocation.id)
+            .await
+            .with_context(|| format!("release worktree {path}"))?;
+        self.allocations.lock().await.remove(path);
+        Ok(())
     }
 }
 
@@ -959,6 +1043,16 @@ pub async fn launch_agent(
     // The allocation fact's id — minted by the adapter and returned so the
     // causal chain survives the repoint: `agent.spawned` below chains to it.
     let allocated_id = allocated.allocated_event;
+    // DR-049 §Decision 5: the release verb is `WorktreeId`-keyed, so the id has
+    // to travel with the allocation or the daemon cannot release what it just
+    // allocated. It goes two places, deliberately: onto `RunTaskContext` (the
+    // run task releases at merge, §Decision 1) and into the daemon's
+    // path-keyed handle table (the explicit MCP door releases by path,
+    // §Decision 3). Both end up in `release_worktree_at`.
+    let worktree_id: WorktreeId = allocated.id;
+    daemon
+        .remember_allocation(&worktree, repo, worktree_id)
+        .await;
 
     // 4. agent.spawned — badge minted, env scrubbed, badge injected (§12).
     //    A permit-gated agent (its spec declares a `[gates.permit]` gate) also
@@ -1320,6 +1414,7 @@ pub async fn launch_agent(
         spawned_id,
         capture,
         worktree: worktree.clone(),
+        worktree_id,
         pre_merge,
     };
     let span = tracing::info_span!("run", run = %run.ulid(), agent = %agent.name);
@@ -1622,6 +1717,15 @@ struct RunTaskContext {
     /// The agent's allocated worktree — the pre_merge chain summarizes and
     /// merges it after the run completes.
     worktree: PathBuf,
+    /// The allocation's identity (DR-049 §Decision 5). The context carried
+    /// only the PATH before this slice, and `RepoSubstrate::release_worktree`
+    /// is `WorktreeId`-keyed, so the run task could not release what it had
+    /// allocated — DR-047 risk-register ADD 1, mechanically.
+    ///
+    /// Held here rather than looked up: it is a property of THIS run's
+    /// allocation, fixed at spawn, and the task that owns the tree should not
+    /// have to consult a map to name it.
+    worktree_id: WorktreeId,
     /// Present when the agent's gates include `pre_merge` (the golden path).
     pre_merge: Option<PreMergePlan>,
 }
@@ -1765,28 +1869,21 @@ async fn drive_run(
         publish(&ctx.daemon.fabric, event).await?;
     }
 
-    // OWED: the allocation is never RELEASED — recorded here because this is
-    // where the release would go (2026-07-24, registry-convergence
-    // remediation).
+    // CLOSED (DR-049, 2026-07-25). The "OWED: the allocation is never
+    // RELEASED" note stood here from the registry-convergence remediation, and
+    // this is deliberately NOT where the release landed.
     //
-    // The run is over. DR-007's ratified worktree lifecycle is allocate → use →
-    // release, and `RepoSubstrate::release_worktree` is implemented and tested
-    // — but nothing in production calls it, so the third step never runs. Per
-    // completed run that leaks a `notify` watcher plus its detached debounce
-    // task (both live for the daemon's lifetime), leaves the tree on disk, and
-    // leaves the sole-allocator registry entry open, so the registry's live
-    // claims only ever grow. The watch outliving the run is not academic: the
-    // adapter's `is_change_event` filter exists because merge activity in a
-    // still-watched tree was appending a `diff.ready` over the merged one.
+    // It named three blockers and DR-049 settled all three: the fold's
+    // collapsed `status` (split into `lifecycle` + `outcome`, so a release can
+    // no longer clobber a merge — §Decision 2), the missing `WorktreeId` on
+    // `RunTaskContext` (threaded — §Decision 5), and whether a FAILED run's
+    // tree should survive (it does, until an explicit `release_worktree` call —
+    // §Decision 3).
     //
-    // Not closed here because releasing is a design call, not a line of code:
-    // `release_worktree` removes the tree and emits `worktree.released`, which
-    // the S4 reducer folds to `status = "released"` OVER the `"merged"` that
-    // `diff.merged` just set — so wiring it in without deciding what a merged-
-    // then-released worktree reads as would trade one derived-state regression
-    // for another. It also needs the `WorktreeId` threaded into
-    // `RunTaskContext` (which carries only the path today) and an answer for
-    // whether a FAILED run's tree should survive for triage.
+    // That last answer is why the call is in `run_pre_merge`'s verified-pass
+    // arm and not here. Releasing at the end of `drive_run` would reap every
+    // tree, including the failed ones retention exists for. Only a MERGED tree
+    // releases itself; everything else waits for an operator or a lead.
     Ok(())
 }
 
@@ -1888,6 +1985,48 @@ async fn run_pre_merge(
             &cas_ref,
         )
         .await?;
+
+        // 4. RELEASE — DR-049 §Decision 1: a merged worktree is released at
+        //    merge, completing DR-007's allocate → use → release lifecycle in
+        //    production for the first time. This is the call the "OWED" note
+        //    that used to sit at the end of `drive_run` was waiting for.
+        //
+        //    Placed HERE, inside the verified-pass arm, and that placement is
+        //    the whole semantics: only a MERGED tree is released. A failed
+        //    gate never reaches this line, so the failed run's tree survives on
+        //    disk with its registry claim open, for triage, until an explicit
+        //    release closes it (§Decision 3 — explicit-only, no TTL, no
+        //    auto-reap). Releasing on the way out of `drive_run` instead would
+        //    have reaped both.
+        //
+        //    AFTER the merge, never before: the merge reads the tree, and a
+        //    release that preceded it would remove what it was about to read.
+        //    The adapter then drops the notify watcher (closing the debounce
+        //    mpsc and ending its loop) BEFORE removing the tree, so removal
+        //    churn cannot surface as a late `diff.ready` over the merged one.
+        //
+        //    Why this no longer trades one derived-state regression for
+        //    another (the reason DR-047 §Decision 5 declined to do it):
+        //    `worktree.released` now folds `lifecycle` ONLY, and `diff.merged`
+        //    folds `outcome` ONLY, so the release cannot clobber the merge.
+        //
+        //    A release failure does not fail the run: the merge already
+        //    happened and is on the log. It is traced loudly — an unreleased
+        //    tree is a leaked watcher plus an open registry claim, which is a
+        //    real defect, just not one that retroactively unmerges anything.
+        if let Err(e) = ctx
+            .daemon
+            .release_worktree_at(&ctx.worktree.display().to_string())
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                worktree = %ctx.worktree.display(),
+                worktree_id = %ctx.worktree_id.ulid(),
+                "release after merge failed; the tree and its watcher LEAK until an explicit \
+                 release_worktree call closes them"
+            );
+        }
     }
     Ok(())
 }

@@ -1509,17 +1509,23 @@ impl RepoSubstrate for GitAdapter {
 /// either):
 ///
 /// 1. **The golden-path clobber.** `gates::merge_worktree` runs `git add -A`
-///    plus `git commit` INSIDE the still-watched tree (nothing releases the
-///    watch — see [`RepoSubstrate::release_worktree`], which has no production
-///    caller). Those commands modify nothing INSIDE the worktree: a linked
+///    plus `git commit` INSIDE the still-watched tree. (At the time nothing
+///    released the watch — [`RepoSubstrate::release_worktree`] had no
+///    production caller. DR-049 §Decision 1 gave it one: the run task releases
+///    at merge, so the watch no longer outlives the run. The filter below stays
+///    the narrower fix and is still load-bearing — it holds for every OTHER
+///    reader of a watched tree, and for the whole pre-merge window before the
+///    release.) Those commands modify nothing INSIDE the worktree: a linked
 ///    tree's index and refs live in its private gitdir and its objects in the
 ///    shared repo, so neither `add` nor `commit` writes a byte under the
 ///    watched path (measured — nothing in the tree is newer afterwards). They
 ///    only READ the tracked files, and those reads woke the loop. 250 ms later
 ///    the now-clean tree summarized to the header-only string and appended a
 ///    fresh `diff.ready`, overwriting `WorktreeState.last_diff` on a worktree
-///    `diff.merged` had just folded to `status = "merged"` with the merged
-///    diff. Derived state then disagreed with the log about what was merged
+///    `diff.merged` had just folded to merged with the merged diff (one
+///    collapsed `status` field at the time; DR-049 §Decision 2 split it into
+///    `lifecycle` + `outcome`). Derived state then disagreed with the log about
+///    what was merged
 ///    (I3). Measured: 1 post-merge `diff.ready` of 26 bytes (the bare header)
 ///    under WSL, 0 under Windows.
 /// 2. **A self-feeding treadmill.** [`summarize_to_cas`] reads the tree to hash

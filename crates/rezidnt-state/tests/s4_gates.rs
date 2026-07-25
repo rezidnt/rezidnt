@@ -129,9 +129,15 @@ fn passed_overwrites_entered_and_flattens_verifier_evidence() {
     );
 }
 
-/// Proposed `diff.merged` v1 closes the worktree lifecycle: status
-/// `"merged"`, `last_diff` pinned to the merged diff's hash — inserted even
+/// Proposed `diff.merged` v1 records the worktree's OUTCOME: `outcome =
+/// "merged"`, `last_diff` pinned to the merged diff's hash — inserted even
 /// if never allocated (the log is truth, I3).
+///
+/// DR-049 §Decision 2 rewrote this from the collapsed `status` to the split,
+/// and it asserts strictly more than it did: the merge sets the outcome axis
+/// AND leaves the lifecycle axis untouched. On a log with no `worktree.*` fact
+/// at all, "untouched" is the `Default` empty string — the fold does not
+/// synthesize an allocation that never happened.
 #[test]
 fn diff_merged_marks_the_worktree() {
     let events = [ev(
@@ -147,7 +153,12 @@ fn diff_merged_marks_the_worktree() {
         .worktrees
         .get("/tmp/rezidnt-s4/impl")
         .expect("diff.merged inserts the entry — the log is truth");
-    assert_eq!(wt.status, "merged");
+    assert_eq!(wt.outcome.as_deref(), Some("merged"));
+    assert_eq!(
+        wt.lifecycle, "",
+        "`diff.merged` writes the OUTCOME axis only; with no allocation on this log the \
+         lifecycle stays unset rather than being invented (I3)"
+    );
     assert_eq!(
         wt.last_diff.as_deref(),
         Some("1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e")

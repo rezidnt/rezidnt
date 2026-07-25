@@ -13,7 +13,7 @@ description: >-
   user: "Does this state change look right?"
   assistant: "I'll have the auditor agent check it — that pattern smells like an I3 violation."
   <commentary>Invariant adjudication requires the read-only checker, not the maker.</commentary></example>
-model: fable
+model: sonnet
 color: red
 tools: ["Read", "Grep", "Glob"]
 skills: ["rezidnt-constitution", "gate-authoring", "slice-discipline"]

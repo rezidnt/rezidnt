@@ -33,20 +33,55 @@ impl SpawnPlan {
     /// The env seam is unchanged; only the token VALUE flips from a DR-005
     /// opaque hex token to a serialized agent macaroon
     /// ([`crate::badge::Macaroon::to_wire`]) — inline under the 32 KiB cap (I2).
+    /// DR-048: a DECLARED `model` appends `--model <value>` AFTER the pinned
+    /// base invocation; an absent model leaves the argv byte-identical to the
+    /// pre-DR-048 plan (the harness picks its own default — never synthesized).
     pub fn for_claude_code(
         agent: &AgentSpec,
         badge_token: &str,
         parent_env: impl Iterator<Item = (String, String)>,
     ) -> Self {
+        let mut args: Vec<String> = ["-p", "--output-format", "stream-json", "--verbose"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        push_model_flag(&mut args, agent);
         Self {
             bin: agent
                 .bin_override
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("claude")),
-            args: ["-p", "--output-format", "stream-json", "--verbose"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            args,
+            env: crate::badge::scrubbed_env(parent_env, badge_token),
+            permit_hook_config: None,
+        }
+    }
+
+    /// Build the codex headless invocation for one agent (DR-048 slice A, the
+    /// second [`crate::adapter::AgentSubstrate`]): `codex exec --json` — JSONL
+    /// events on stdout, prompt over stdin, mirroring the claude-code
+    /// stdin-prompt shape. `bin_override` redirects the executable only (the
+    /// pinned-version / contract-test seam), env is scrubbed with the badge
+    /// injected, and a declared `model` appends `--model <value>` (the real
+    /// `codex exec` flag, long form).
+    ///
+    /// No PEP wiring: the permit hook config is claude-code's
+    /// `.claude/settings.json` `PreToolUse` shape and has no codex equivalent
+    /// recorded, so a codex plan carries `None` rather than a guessed
+    /// interception mechanism.
+    pub fn for_codex(
+        agent: &AgentSpec,
+        badge_token: &str,
+        parent_env: impl Iterator<Item = (String, String)>,
+    ) -> Self {
+        let mut args: Vec<String> = ["exec", "--json"].into_iter().map(String::from).collect();
+        push_model_flag(&mut args, agent);
+        Self {
+            bin: agent
+                .bin_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("codex")),
+            args,
             env: crate::badge::scrubbed_env(parent_env, badge_token),
             permit_hook_config: None,
         }
@@ -109,6 +144,18 @@ impl SpawnPlan {
             env: Vec::new(),
             permit_hook_config: None,
         }
+    }
+}
+
+/// Append the DR-048 model selector to an argv when the spec declares one.
+/// Both harnesses spell it `--model <value>` in long form (claude-code
+/// `--model`; codex `-m, --model <MODEL>` per `codex exec --help`, codex-cli
+/// 0.145.0), so the one helper serves both and the flag cannot drift apart.
+/// An absent model appends NOTHING — the byte-identical pre-DR-048 argv.
+fn push_model_flag(args: &mut Vec<String>, agent: &AgentSpec) {
+    if let Some(model) = &agent.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
     }
 }
 

@@ -83,7 +83,7 @@ fn version_gate_is_interrogable_through_the_trait_object() {
         .version_gate("2.1.191")
         .expect("the recorded claude-code major must pass through the seam");
     match adapter.version_gate("999.0.0") {
-        Err(AdapterError::UntestedMajor { major: 999 }) => {}
+        Err(AdapterError::UntestedMajor { major: 999, .. }) => {}
         other => panic!("untested major must refuse through the seam, got {other:?}"),
     }
     match adapter.version_gate("not-a-version") {

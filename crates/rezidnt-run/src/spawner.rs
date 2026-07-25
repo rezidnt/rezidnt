@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use crate::RunError;
 use crate::spec::AgentSpec;
 
 /// A fully resolved spawn: argv + scrubbed env, ready for `tokio::process`.
@@ -65,18 +66,33 @@ impl SpawnPlan {
     /// injected, and a declared `model` appends `--model <value>` (the real
     /// `codex exec` flag, long form).
     ///
-    /// No PEP wiring: the permit hook config is claude-code's
-    /// `.claude/settings.json` `PreToolUse` shape and has no codex equivalent
-    /// recorded, so a codex plan carries `None` rather than a guessed
-    /// interception mechanism.
+    /// # A declared `[gates.permit]` is REFUSED, not ignored
+    ///
+    /// The PEP is claude-code's `.claude/settings.json` `PreToolUse` hook and
+    /// has no recorded codex equivalent, so a codex plan can carry no
+    /// interception mechanism. Returning a plan anyway would leave a spec that
+    /// ASKED to be permit-governed spawning unintercepted — and the daemon
+    /// stamps `agent.spawned.pep = "enforced"` off the spec's gates list rather
+    /// than off the plan, so such a run would record itself as governed while
+    /// running ungoverned. Refusing here means that trap cannot be sprung from
+    /// this side of the seam, whatever the caller does.
     pub fn for_codex(
         agent: &AgentSpec,
         badge_token: &str,
         parent_env: impl Iterator<Item = (String, String)>,
-    ) -> Self {
+    ) -> Result<Self, RunError> {
+        if agent.gates.iter().any(|g| g == "permit") {
+            return Err(RunError::Spawn(format!(
+                "agent {:?}: [gates.permit] is declared but harness `codex` has no recorded PEP \
+                 mechanism (claude-code's PreToolUse hook has no codex equivalent in this tree). \
+                 Refusing rather than spawning a run that would be recorded as permit-governed \
+                 while running unintercepted",
+                agent.name
+            )));
+        }
         let mut args: Vec<String> = ["exec", "--json"].into_iter().map(String::from).collect();
         push_model_flag(&mut args, agent);
-        Self {
+        Ok(Self {
             bin: agent
                 .bin_override
                 .clone()
@@ -84,7 +100,7 @@ impl SpawnPlan {
             args,
             env: crate::badge::scrubbed_env(parent_env, badge_token),
             permit_hook_config: None,
-        }
+        })
     }
 
     /// Build the claude-code invocation for a permit-gated agent (DR-014

@@ -166,7 +166,7 @@ fn codex_version_gate_accepts_recorded_refuses_untested() {
         .version_gate("0.145.0")
         .expect("the recorded codex-cli version must pass");
     match adapter.version_gate("9.0.0") {
-        Err(AdapterError::UntestedMajor { major: 9 }) => {}
+        Err(AdapterError::UntestedMajor { major: 9, .. }) => {}
         other => panic!("untested major must refuse, got {other:?}"),
     }
     match adapter.version_gate("not-a-version") {

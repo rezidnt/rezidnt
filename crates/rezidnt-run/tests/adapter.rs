@@ -128,7 +128,7 @@ fn unknown_line_types_tolerated_malformed_json_errors() {
 fn version_gate_accepts_tested_major_refuses_untested() {
     version_gate("2.1.191").expect("recorded major must pass");
     match version_gate("3.0.0") {
-        Err(AdapterError::UntestedMajor { major: 3 }) => {}
+        Err(AdapterError::UntestedMajor { major: 3, .. }) => {}
         other => panic!("untested major must refuse, got {other:?}"),
     }
     match version_gate("not-a-version") {

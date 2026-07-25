@@ -128,7 +128,8 @@ fn codex_argv_is_pinned_and_env_is_scrubbed_with_badge() {
         &agent("codex", None),
         &badge.token_hex(),
         parent.into_iter(),
-    );
+    )
+    .expect("a codex spec declaring no permit gate plans cleanly");
     assert_eq!(plan.bin, std::path::Path::new("codex"));
     assert_eq!(plan.args, ["exec", "--json"]);
     assert!(plan.env.iter().any(|(k, _)| k == "PATH"));
@@ -149,7 +150,8 @@ fn model_appends_model_flag_to_codex_argv() {
         &agent("codex", Some("gpt-5-codex")),
         &badge.token_hex(),
         std::iter::empty(),
-    );
+    )
+    .expect("a codex spec declaring no permit gate plans cleanly");
     assert_eq!(plan.args, ["exec", "--json", "--model", "gpt-5-codex"]);
 }
 
@@ -160,7 +162,8 @@ fn codex_bin_override_redirects_executable_only() {
     let badge = Badge::mint().expect("mint");
     let mut spec = agent("codex", None);
     spec.bin_override = Some("/opt/harness/codex-0.145.0".into());
-    let plan = SpawnPlan::for_codex(&spec, &badge.token_hex(), std::iter::empty());
+    let plan = SpawnPlan::for_codex(&spec, &badge.token_hex(), std::iter::empty())
+        .expect("a codex spec declaring no permit gate plans cleanly");
     assert_eq!(plan.bin, std::path::Path::new("/opt/harness/codex-0.145.0"));
     assert_eq!(plan.args, ["exec", "--json"]);
 }

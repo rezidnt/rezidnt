@@ -1,0 +1,37 @@
+# rezidnt — project memory
+
+Rust workspace implementing the rezidnt daemon: event fabric, run substrate, gate engine, MCP surface.
+Canonical design: `docs/rezidnt-architecture.md` (the plan; §20 indexes the decision records). Decision records live one-per-file in `docs/decisions/`, indexed by the plan's §20. BINDING items change only via `/dr`.
+
+## Non-negotiable invariants (full text: rezidnt-constitution skill)
+I1 zero pixels in core · I2 control/data plane never mix (payload ≤32KiB, bytes→CAS) · I3 log is truth, state derived ·
+I4 substrates behind traits · I5 MCP-first · I6 verifiers deterministic+interrogable (pass/fail/inconclusive, never coerce) ·
+I7 one static binary, no telemetry · I8 clean-room (AGPL never read; permissive read-only via /intel; nothing ported).
+
+## Team (agents)
+implementer (maker, green) · auditor (checker, read-only, red) · oracle (failing-tests-first, cyan) ·
+warden (ontology custodian, yellow) · analyst (DR-002 intel, magenta) · scribe (decision records, blue).
+Maker and checker are different agents on purpose: a checker that can edit is a rubber stamp.
+
+## Commands (the workflow)
+/slice show current slice + acceptance criteria · /oracle write failing tests from criteria · /vet run the gauntlet ·
+/debrief auditor verdict on the diff · /gauntlet vet ∥ debrief concurrently (the done gate, halves the tail) ·
+/lanes parallel-lane build for disjoint work items · /subject change the ontology (warden-gated) ·
+/intel scoped competitor read (memo) · /dr draft a decision record · /handoff write session state for the next run.
+
+## The loop (per slice)
+/slice → /oracle <component> → implementer builds to green (≥2 disjoint items → /lanes, in parallel) → /gauntlet →
+(fix with `vet.sh --fast` inner loops, then re-/gauntlet) or advance. Definition of done = slice criteria pass /vet and
+/debrief — /gauntlet is those two gates run concurrently, not a third gate. Nothing else counts as done.
+
+## Guardrails (hooks, enforced)
+- `spec/ontology.md` edits are blocked outside a /subject session (ontology-gate).
+- herdr/AGPL sources are blocked from Read/Fetch/clone everywhere (firewall, DR-002).
+- edited .rs files are auto-rustfmt'd (fmt, PostToolUse).
+
+## Style (full text: rust-conventions skill)
+Rust edition 2024. thiserror in libs, anyhow in bins, no unwrap/expect outside tests, no blocking in async,
+tracing span on every adapter task. Lore vocabulary capped at vet/debrief/dossier.
+
+## Build
+cargo per crate; workspace layout in docs §4. The verifier gauntlet is `bash .Codex/hooks/vet.sh`.

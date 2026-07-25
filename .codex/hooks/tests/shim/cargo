@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Scripted stand-in for cargo, so vet-selftest.sh can drive vet.sh's test lane through every
+# control-flow branch in seconds without compiling anything. Modes marked SYNTHETIC assert a
+# libtest shape that is expensive or impossible to provoke on demand; the shapes that must be
+# real are checked against tests/logs/real-multicrate.log and the fixture-ws instead.
+case "$1" in
+  fmt | clippy) exit 0 ;;
+esac
+case "$MODE" in
+green)
+  echo "running 3 tests"
+  echo "..."
+  echo
+  echo "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+  exit 0
+  ;;
+red)
+  # SYNTHETIC. Ordinary failure: detail block (with the stdout header) plus trailing roster.
+  echo "running 2 tests"
+  echo "t."
+  echo
+  echo "failures:"
+  echo
+  echo "---- fabric::chain_verifies stdout ----"
+  echo "thread 'fabric::chain_verifies' panicked at crates/x/src/lib.rs:9:5:"
+  echo "assertion failed"
+  echo
+  echo "failures:"
+  echo "    fabric::chain_verifies"
+  echo "    state::fold_equals_snapshot"
+  echo
+  echo "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+  exit 101
+  ;;
+red-empty-capture)
+  # SYNTHETIC. A failing test whose capture buffer was empty: libtest emits the roster but no
+  # `---- <name> stdout ----` header. This is the case the first parser got wrong.
+  echo "running 1 test"
+  echo "t"
+  echo
+  echo "failures:"
+  echo "    gate::inconclusive_never_coerced"
+  echo
+  echo "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  exit 101
+  ;;
+leak)
+  # The cited scenario: the command exits promptly but leaves a child holding the inherited
+  # stdio (cf. bins/rezidentd/tests/s3_exit_demo_e2e.rs `.stderr(Stdio::inherit())`), so tee
+  # never sees EOF. Costs the leak grace, not the outer bound.
+  sleep 600 &
+  echo "running 1 test"
+  echo "."
+  echo
+  echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  exit 0
+  ;;
+wedged-partial)
+  # Emits real output, then never returns: the timeout case whose partial evidence must survive.
+  echo "running 4 tests"
+  echo "test suite::a ... ok"
+  echo "test suite::b ... ok"
+  sleep 600
+  exit 0
+  ;;
+esac
+exit 0

@@ -4,7 +4,7 @@
 
 **Date:** 2026-07-26
 **Status:** PROPOSED.
-**Amends:** §9 (adds two READ-class, unbadged MCP tools, no-drift generated like `board_view`/`get_escalations`). Reaffirms — does not touch — I1, I5, I6. Clarifies, does not amend, I2 (see Context). Mints NO ontology subject or field. Adds a §20 index row.
+**Amends:** §9 (adds two READ-class, unbadged MCP tools, no-drift generated like `board_view`/`get_escalations`). Reaffirms — does not touch — I1, I5, I6. **Rules NOTHING about I2's scope** (see Context; an earlier draft did, and was narrowed). Mints NO ontology subject or field. Adds a §20 index row.
 
 ## Context
 
@@ -16,7 +16,9 @@ Diff bytes are already CAS-pinned: `runs.rs:2136/2148` puts `gates::summarize_wo
 
 **Keying, settled against the tree, not assumed.** `RunRow` carries no worktree reference; `WorktreeState.allocator` on the ordinary (non-fan-out) path is the bare string `"rezidnt"` — no run named at all. A run-keyed resource has nothing sound to join on, and DR-049 already ruled the obvious alternative (a correlation join) UNSOUND — one correlation spans N runs and N trees. The worktree path is the one entity both `diff.ready` and the existing fold already key on (`WorktreeState.last_diff`; `gate.failed.worktree?`'s attribution precedent, `spec/ontology.md` ~349).
 
-**The crux: does I2 govern this response?** Plan text scopes I2 explicitly to "the event fabric" (32 KiB cap, CAS-ref rule) — a bus-design constraint, not a general MCP-response rule; `board_view`/`orchestration_graph` already return uncapped whole-log JSON. I2 does not literally bind this surface. The ref-not-bytes discipline is adopted anyway as existing HOUSE PRACTICE (`gate.failed.evidence`/`inputs.refs` are refs-only by convention, not by I2's letter) — the crux is settled as: I2 is fabric-scoped; refs-over-bytes survives here by precedent.
+**Does I2 govern this response? DELIBERATELY NOT RULED HERE.** The question is real: I2's text names "the event fabric," its rationale is bus throughput ("≤ ~10³ events/min"), and its only enforcement is on event payloads (`rezidnt-types/src/lib.rs:221`) — all of which point fabric-scoped. But [DR-034](DR-034-operator-client-live-unblock.md) already invoked I2 against an MCP *transport* choice ("unbounded I2 coupling"), so the house has not read it as fabric-only. **This record does not need the answer:** DR-034's concern was an unbounded held-open channel, whereas `cas_read` is one-shot and REFUSES over-bound content rather than streaming it — I2-consistent under either scope. The scope question is left OPEN and named, not settled in passing by a record that can proceed without it.
+
+**The open question this surfaced, owed its own record:** `board_view` and `orchestration_graph` return whole-log JSON with no size bound at all (verified: no cap, limit, or truncation in either call path). If I2 does reach MCP responses, those predate and exceed anything here — `cas_read` would be the only bounded read tool on the surface. That is a question about shipped tools ([DR-039](DR-039-board-view-mcp-resource.md) onward), not about this one.
 
 **Strongest counterargument, recorded.** A bounded byte-reader generalizes past "diff review" into a generic CAS-read capability, inviting scope creep toward paging arbitrary evidence blobs. Accepted anyway: a diff without its bytes isn't review, DR-038 §Decision 4 already forecloses the local-disk-read shortcut (no new backchannel; the client is not privileged to know `~/…/cas/<hash>`, wherever the daemon actually roots it — `cas_path()` is `<log-dir>/cas`, not a fixed path), and a single-shot bounded reader is the narrowest thing that satisfies both diff review and I2's spirit.
 
@@ -29,7 +31,7 @@ Diff bytes are already CAS-pinned: `runs.rs:2136/2148` puts `gates::summarize_wo
 
 ## Ledger
 
-Invariant: NONE (I2 clarified fabric-scoped, not amended). Subject: NONE. Field: NONE (ontology unchanged; only an internal `rezidnt-state` struct widens). Trait method: NONE (pure read via existing `replay`/`fold` + `Cas::get`). Dep: NONE.
+Invariant: NONE (I2's scope left OPEN and named, not ruled — see Context). Subject: NONE. Field: NONE (ontology unchanged; only an internal `rezidnt-state` struct widens). Trait method: NONE (pure read via existing `replay`/`fold` + `Cas::get`). Dep: NONE.
 
 ## Consequences
 

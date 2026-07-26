@@ -1,0 +1,25 @@
+{
+  "events_folded": 3,
+  "last_event": "01DR057D1FF0000000000000E3",
+  "counts_by_subject": {
+    "diff.merged": 1,
+    "diff.ready": 1,
+    "worktree.allocated": 1
+  },
+  "workspaces": {},
+  "agent_runs": {},
+  "worktrees": {
+    "/repos/demo/wt-review": {
+      "lifecycle": "allocated",
+      "outcome": "merged",
+      "branch": "feat/review",
+      "allocator": "rezidnt",
+      "conflicts": 0,
+      "last_diff": {
+        "hash": "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
+        "bytes": 34,
+        "mime": "text/x-diff"
+      }
+    }
+  }
+}

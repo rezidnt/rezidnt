@@ -47,10 +47,11 @@ removals, no context, also not reviewable.
 **So the Review panel renders a list of filenames.** It cannot close an IDE. Both gates passed, two audit
 rounds hardened it, and none of that could catch this — only running it did.
 
-**THE WORK IS SCOPED AND DRAFTED — [DR-059](../../docs/decisions/DR-059-real-diff-sibling-ref.md) is PROPOSED
-(`5f6b12b`).** Run it in this order; the first step is not optional:
+**THE WORK IS SCOPED AND RATIFIED — [DR-059](../../docs/decisions/DR-059-real-diff-sibling-ref.md) is
+ACCEPTED (owner, 2026-07-26).** Step 1 is DONE. **Start at step 2**, and it is not optional:
 
-1. **Owner ratifies DR-059.** It AUTHORIZES but does not mint the field — that is deliberate.
+1. ~~Owner ratifies DR-059.~~ **DONE.** The record AUTHORIZES but does not mint the field — deliberate, so
+   step 2 cannot be skipped.
 2. **`/subject` (warden)** mints `patch?: CasRef` on `diff.ready` v1 and `diff.merged` v1, plus the mime
    correction. `v` stays 1. **An implementer landing the payload key before this session runs is working
    outside the record's authorization.**

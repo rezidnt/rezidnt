@@ -20,8 +20,16 @@
 //!   — the caller's own ref, echoed and verified; never a bare hash the
 //!   daemon would have to invent metadata for (mime lives only in event
 //!   payloads; the CAS at rest is content-only, `crates/rezidnt-cas`).
-//! - NEITHER schema carries a `badge` property: read-class, unbadged
-//!   (DR-057 §Decision 4; DR-005/DR-039 precedent).
+//! - `diff_view` carries NO `badge` property: read-class, unbadged (DR-057
+//!   §Decision 4 as amended — the leg DR-058 leaves UNCHANGED).
+//! - `cas_read` REQUIRES a `badge` property, declared FIRST like every other
+//!   badged tool on this surface. RE-CUT under the owner's in-place DR-058
+//!   correction (`81f437c`, 2026-07-26): the record's "shape is unchanged"
+//!   clause was struck — a door invisible to the schema is one clients learn
+//!   about by being refused (I5), so `CasReadArgs` gains `pub badge: String`
+//!   on the house pattern (`OpenProjectArgs`..`FanOutArgs`). The golden
+//!   states this RULED target, so the golden leg is RED until the field
+//!   lands — oracle-first, the DR-045 re-cut precedent.
 //!
 //! ## AUDITOR-DIRECTED CORRECTION (DR-057 debrief, finding F2)
 //!
@@ -159,7 +167,9 @@ async fn dr057_served_schemas_carry_field_descriptions() {
 
     for (name, fields) in [
         ("diff_view", &["worktree"][..]),
-        ("cas_read", &["hash", "bytes", "mime"][..]),
+        // `badge` per the DR-058 in-place correction (`81f437c`): a served
+        // field carries prose like every other badged tool's badge does.
+        ("cas_read", &["badge", "hash", "bytes", "mime"][..]),
     ] {
         let schema = &util::find_tool(&tools, name)["inputSchema"];
         for field in fields {
@@ -206,10 +216,14 @@ async fn diff_view_schema_is_worktree_keyed_and_unbadged() {
 }
 
 /// `cas_read` takes the FULL ref — hash AND bytes AND mime, all required —
-/// and no badge. A bare-hash schema would force the daemon to invent metadata
-/// the CAS never persists at rest (DR-057 §Decision 2).
+/// AND a required `badge`, declared first (the house pattern every badged
+/// tool follows). A bare-hash schema would force the daemon to invent
+/// metadata the CAS never persists at rest (DR-057 §Decision 2); a badge the
+/// schema does not declare would be a door clients only discover by being
+/// refused (I5 — the DR-058 in-place correction `81f437c` that re-cut this
+/// test's original no-badge pin).
 #[tokio::test]
-async fn cas_read_schema_requires_the_full_ref_and_no_badge() {
+async fn cas_read_schema_requires_the_full_ref_and_its_badge() {
     let (_dir, core) = util::core();
     let tools = util::list_tools(&core).await;
     let schema = &util::find_tool(&tools, "cas_read")["inputSchema"];
@@ -220,18 +234,20 @@ async fn cas_read_schema_requires_the_full_ref_and_no_badge() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    for field in ["hash", "bytes", "mime"] {
+    for field in ["badge", "hash", "bytes", "mime"] {
         assert!(
             required.contains(&field),
-            "cas_read must REQUIRE {field} — the caller presents its own full \
-             ref, never a bare hash (DR-057 §Decision 2): {schema:#}"
+            "cas_read must REQUIRE {field} — the full ref (DR-057 §Decision 2) \
+             plus the badge the DR-058 door demands, DECLARED so a schema-only \
+             client can discover it (`81f437c`): {schema:#}"
         );
     }
     let props = schema["properties"]
         .as_object()
         .unwrap_or_else(|| panic!("cas_read schema has properties: {schema:#}"));
     assert!(
-        !props.contains_key("badge"),
-        "cas_read is read-class, unbadged (DR-057 §Decision 4): {schema:#}"
+        props.contains_key("badge"),
+        "cas_read's badge is a DECLARED property, not door-level folklore — \
+         the house pattern every badged args struct follows: {schema:#}"
     );
 }

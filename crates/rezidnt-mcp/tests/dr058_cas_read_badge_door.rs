@@ -31,9 +31,12 @@
 //!   a garbage token, which refuse under every derivation. When a verb is
 //!   ruled, a narrowed-verb control tightens here.
 //! - The refusal MESSAGE text. Only code + byte-identity across states.
-//! - The args SCHEMA. DR-058 §Consequences: "`cas_read`'s shape is unchanged,
-//!   only its door" — the badge rides as a door-level argument, and
-//!   `dr057_surface.rs`'s no-badge-property schema pin stays standing.
+//! - The args SCHEMA — that is `dr057_surface.rs`'s job, RE-CUT under the
+//!   owner's in-place DR-058 correction (`81f437c`): the "shape is unchanged"
+//!   clause was struck and `CasReadArgs` gains a declared, required `badge`
+//!   (house pattern). This board's calls already present the badge at the
+//!   TOP LEVEL of `arguments`, exactly where a declared field rides — the
+//!   same wire shape `fan_out`/`kill_run` calls use.
 //!
 //! ## RED MODE (against the tree at cut time)
 //!

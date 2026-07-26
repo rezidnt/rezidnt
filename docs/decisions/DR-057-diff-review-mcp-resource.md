@@ -35,7 +35,7 @@ Invariant: NONE (I2's scope left OPEN and named, not ruled — see Context). Sub
 
 ## Consequences
 
-**Roadmap.** §9 gains two rows; §19 gains Review as a closed cockpit verb, unblocking `rezidnt-operator`'s diff panel per DR-038 §Decision 4/5. §20 owes TWO index bumps on acceptance — DR-056's withheld "next record is DR-057" and this record's own "next record is DR-058" — land both together.
+**Roadmap.** §9 gains two rows; §19 gains Review as a closed cockpit verb, unblocking `rezidnt-operator`'s diff panel per DR-038 §Decision 4/5. ~~§20 owes TWO index bumps on acceptance — DR-056's withheld "next record is DR-057" and this record's own "next record is DR-058" — land both together.~~ **CORRECTED 2026-07-26 (in place, per DR-056 §Decision 1):** both landed 2026-07-26 with both records still PROPOSED, and the withhold-until-acceptance convention was itself corrected at §20. It did not scale: three PROPOSED records left the pointer three stale, still naming DR-056 while DR-056 and DR-057 were on disk — a fresh session would have minted DR-056 a second time. Rows and pointer now follow the FILE, not the status.
 
 **Risk register.** ADDS: `cas_read` generalizes past diff bytes; a second consumer (e.g., gate evidence) should get its own DR, not be assumed free. RETIRES the "Review has no surface" gap.
 

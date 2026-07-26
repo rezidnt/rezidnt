@@ -31,7 +31,13 @@ Rust edition 2024. These are enforced by `/vet` (clippy -D warnings) and the aud
 ## Dependencies (approved set; additions via a note in the PR)
 tokio, serde/serde_json, rusqlite (WAL), ulid, schemars, gix (reads), notify, blake3, tracing/tracing-subscriber, clap, thiserror/anyhow. Phase-gated: portable-pty (run substrate), rmcp (MCP — verify at S3; fallback hand-rolled JSON-RPC), ratatui (S5 board). Prefer std and these over novel crates; every new dependency is attack surface against I7.
 
+## Doc comments (DR-056 §Decision 2, ACCEPTED 2026-07-26)
+- A doc comment that **asserts another module's behavior**, or cites a **`file:line`**, must be pinned by a source-text guard — proven red by deleting the code and keeping the prose — **or it must not be written**. An unpinned claim is a liability with no verifier: the gauntlet checks code, nothing checks prose, so it drifts silently and the arc pays for it later. This is the corollary to the standing prove-your-guard-by-mutation rule.
+- Write what the code in front of you does. If you want to say what a *neighbour* does, either pin it or link to the neighbour and let it speak for itself.
+- A doc comment on a `schemars`-derived public type is **served over the wire** to every MCP client (`tools/list`) — it is product surface, not internal notes. Do not name private symbols an external reader cannot resolve.
+
 ## Forbidden
 - `localStorage`/browser-storage assumptions (N/A here but flagged for any bundled artifact HTML).
 - Panicking error handling in library code. Silent `let _ =` on a Result that carries a real failure.
 - Reaching for a crate to avoid writing 20 lines — but equally, NIH-ing a syscall wrapper (I8 component clause).
+- An unpinned doc-comment claim about another module (see Doc comments above).

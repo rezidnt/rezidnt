@@ -1,0 +1,54 @@
+{
+  "events_folded": 8,
+  "last_event": "01DR055F1X0000000000000E07",
+  "counts_by_subject": {
+    "agent.spawned": 7,
+    "trial.opened": 1
+  },
+  "workspaces": {},
+  "agent_runs": {
+    "01DR055F1XRVN0000000000R01": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T"
+    },
+    "01DR055F1XRVN0000000000R02": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T"
+    },
+    "01DR055F1XRVN0000000000R03": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T"
+    },
+    "01DR055F1XRVN0000000000R11": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T",
+      "model": "model-alpha"
+    },
+    "01DR055F1XRVN0000000000R12": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T",
+      "model": "model-alpha"
+    },
+    "01DR055F1XRVN0000000000R13": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T",
+      "model": "model-alpha"
+    },
+    "01DR055F1XRVN0000000000R21": {
+      "status": "spawning",
+      "trial": "01DR055F1XTR1A00000000000T",
+      "model": "model-beta"
+    }
+  },
+  "trials": {
+    "01DR055F1XTR1A00000000000T": {
+      "idempotency_key": "dr055-matrix-key",
+      "variants": [
+        { "agent": "impl", "harness": "claude-code", "model": null },
+        { "agent": "impl", "harness": "claude-code", "model": "model-alpha" },
+        { "agent": "impl", "harness": "claude-code", "model": "model-beta" }
+      ],
+      "samples": 3
+    }
+  }
+}

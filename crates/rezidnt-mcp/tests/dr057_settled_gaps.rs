@@ -23,6 +23,12 @@
 //!     rather than duplicated. The oracle board pinned this only negatively
 //!     (`dr057_diff_view.rs`: "not a badge code"); here it is pinned exactly.
 
+//! RE-CUT under DR-058 §Decision 2 (ACCEPTED, owner, 2026-07-26): `cas_read`
+//! moved behind the badge door, so the three `cas_read` tests present an
+//! ADMITTED operator badge (the DR-045 `fan_out_door_and_width_cap.rs`
+//! precedent, disclosed by the record itself). Every assertion survives
+//! intact; `diff_view`'s test is UNTOUCHED — that tool stays unbadged.
+
 mod util;
 
 use std::sync::Arc;
@@ -30,17 +36,21 @@ use std::sync::Arc;
 use rezidnt_cas::Cas;
 use rezidnt_fabric::{EventLog, Fabric};
 use rezidnt_mcp::{BadgeBook, MAX_CAS_READ_BYTES_DEFAULT, McpCore, codes};
+use rezidnt_run::badge::Badge;
 use serde_json::json;
 
-/// A core with a WIRED CAS, an empty badge book and no substrate — every call
-/// below is unbadged read-class.
-fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Arc<McpCore>) {
+/// A core with a WIRED CAS, ONE admitted operator badge (DR-058 door, path 1)
+/// and no substrate.
+fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Badge, Arc<McpCore>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = EventLog::open(&dir.path().join("events.db")).expect("open log");
     let fabric = Fabric::new(log, 1024);
     let cas = Arc::new(Cas::open(&dir.path().join("cas")).expect("open cas"));
-    let core = McpCore::new(fabric, BadgeBook::new()).with_cas(Arc::clone(&cas));
-    (dir, cas, Arc::new(core))
+    let badge = Badge::mint().expect("mint badge");
+    let mut book = BadgeBook::new();
+    book.admit(&badge);
+    let core = McpCore::new(fabric, book).with_cas(Arc::clone(&cas));
+    (dir, cas, badge, Arc::new(core))
 }
 
 /// (a) An OVER-CLAIMING ref is SERVED, not refused — and `bytes_returned` tells
@@ -54,7 +64,7 @@ fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Arc<McpCore>) {
 /// must not smuggle over-bound content); this is the leg it left open.
 #[tokio::test]
 async fn an_over_claiming_bytes_is_served_the_actual_blob() {
-    let (_dir, cas, core) = core_with_cas();
+    let (_dir, cas, badge, core) = core_with_cas();
     let text = "--- a/small.rs\n+++ b/small.rs\n@@ -1 +1 @@\n-a\n+b\n";
     let stored = cas.put(text.as_bytes(), "text/x-diff").expect("put diff");
 
@@ -66,6 +76,7 @@ async fn an_over_claiming_bytes_is_served_the_actual_blob() {
             "hash": stored.hash,
             "bytes": MAX_CAS_READ_BYTES_DEFAULT + 1,
             "mime": "text/x-diff",
+            "badge": badge.token_hex(),
         }),
     )
     .await;
@@ -96,7 +107,7 @@ async fn an_over_claiming_bytes_is_served_the_actual_blob() {
 /// break callers, so v1 refuses.
 #[tokio::test]
 async fn application_json_is_not_text_in_v1() {
-    let (_dir, cas, core) = core_with_cas();
+    let (_dir, cas, badge, core) = core_with_cas();
     let body = r#"{"verdict":"pass"}"#;
     let stored = cas
         .put(body.as_bytes(), "application/json")
@@ -106,7 +117,12 @@ async fn application_json_is_not_text_in_v1() {
         &core,
         1,
         "cas_read",
-        json!({"hash": stored.hash, "bytes": stored.bytes, "mime": "application/json"}),
+        json!({
+            "hash": stored.hash,
+            "bytes": stored.bytes,
+            "mime": "application/json",
+            "badge": badge.token_hex(),
+        }),
     )
     .await;
     util::assert_tool_refusal(&result, codes::CAS_NOT_TEXT);
@@ -123,7 +139,7 @@ async fn application_json_is_not_text_in_v1() {
 /// too, because media types are case-insensitive.
 #[tokio::test]
 async fn a_parameterised_text_mime_is_text() {
-    let (_dir, cas, core) = core_with_cas();
+    let (_dir, cas, badge, core) = core_with_cas();
     let text = "a bulk agent message that overflowed the inline cap\n";
     let stored = cas
         .put(text.as_bytes(), "text/plain; charset=utf-8")
@@ -134,7 +150,12 @@ async fn a_parameterised_text_mime_is_text() {
             &core,
             1,
             "cas_read",
-            json!({"hash": stored.hash, "bytes": stored.bytes, "mime": mime}),
+            json!({
+                "hash": stored.hash,
+                "bytes": stored.bytes,
+                "mime": mime,
+                "badge": badge.token_hex(),
+            }),
         )
         .await;
         assert_ne!(

@@ -1,6 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "badge": {
+      "type": "string"
+    },
     "bytes": {
       "format": "uint64",
       "minimum": 0,
@@ -14,6 +17,7 @@
     }
   },
   "required": [
+    "badge",
     "hash",
     "bytes",
     "mime"

@@ -29,6 +29,16 @@
 //! the first two tests red with the leak in the failure text (`cas.too_large`
 //! naming the exact byte count, `cas.corrupt` vs `cas.not_found` separating
 //! present from absent). This is a behavioral board, not a source-text guard.
+//!
+//! RE-CUT under DR-058 §Decision 2 (ACCEPTED, owner, 2026-07-26): `cas_read`
+//! moved behind the badge door, so every call below presents an ADMITTED
+//! operator badge (the DR-045 re-cut precedent, disclosed by the record).
+//! What this board judges therefore SHIFTS in meaning without any assertion
+//! moving: the shape gate is no longer the only line an unauthenticated
+//! caller meets (the door is — `dr058_cas_read_badge_door.rs`), it is the
+//! MCP-layer half of §Decision 4's defence-in-depth, KEPT and still judged
+//! byte-identical behind the door. The unbadged-caller history in the prose
+//! above describes the pre-DR-058 threat this gate was cut against.
 
 mod util;
 
@@ -37,24 +47,32 @@ use std::sync::Arc;
 use rezidnt_cas::Cas;
 use rezidnt_fabric::{EventLog, Fabric};
 use rezidnt_mcp::{BadgeBook, MAX_CAS_READ_BYTES_DEFAULT, McpCore, codes};
+use rezidnt_run::badge::Badge;
 use serde_json::{Value, json};
 
-/// A core with a WIRED CAS rooted at `<tmp>/cas`, an EMPTY badge book, no
-/// substrate and no root key. The empty badge book is the point: every call
-/// below is unbadged, which is the trust tier the oracle was reachable from.
-fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Arc<McpCore>) {
+/// A core with a WIRED CAS rooted at `<tmp>/cas`, ONE admitted operator badge
+/// (DR-058 door, path 1), no substrate and no root key.
+fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Badge, Arc<McpCore>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = EventLog::open(&dir.path().join("events.db")).expect("open log");
     let fabric = Fabric::new(log, 1024);
     let cas = Arc::new(Cas::open(&dir.path().join("cas")).expect("open cas"));
-    let core = McpCore::new(fabric, BadgeBook::new()).with_cas(Arc::clone(&cas));
-    (dir, cas, Arc::new(core))
+    let badge = Badge::mint().expect("mint badge");
+    let mut book = BadgeBook::new();
+    book.admit(&badge);
+    let core = McpCore::new(fabric, book).with_cas(Arc::clone(&cas));
+    (dir, cas, badge, Arc::new(core))
 }
 
-/// Args with an arbitrary `hash` and an otherwise VALID text ref, so nothing
-/// but the address shape can be what refuses.
-fn args(hash: &str) -> Value {
-    json!({"hash": hash, "bytes": 21, "mime": "text/x-diff"})
+/// Args with an arbitrary `hash` and an otherwise VALID text ref (badge
+/// admitted), so nothing but the address shape can be what refuses.
+fn args(hash: &str, badge: &Badge) -> Value {
+    json!({
+        "hash": hash,
+        "bytes": 21,
+        "mime": "text/x-diff",
+        "badge": badge.token_hex(),
+    })
 }
 
 /// A deterministic ASCII blob of exactly `len` bytes.
@@ -80,7 +98,7 @@ const ABSENT: &str = "aa11bb22cc33dd44ee55ff660718293a4b5c6d7e8f90a1b2c3d4e5f607
 /// and prints the exact byte count; with it, all five answers are one answer.
 #[tokio::test]
 async fn every_malformed_address_refuses_identically() {
-    let (dir, _cas, core) = core_with_cas();
+    let (dir, _cas, badge, core) = core_with_cas();
 
     // Plant real files at both escape targets, deliberately over the read bound
     // so the pre-guard behavior would have leaked their exact size.
@@ -100,7 +118,7 @@ async fn every_malformed_address_refuses_identically() {
 
     let mut payloads: Vec<(&str, Value)> = Vec::new();
     for (label, hash) in shapes {
-        let result = util::tool_call(&core, 1, "cas_read", args(hash)).await;
+        let result = util::tool_call(&core, 1, "cas_read", args(hash, &badge)).await;
         assert_eq!(
             result["isError"],
             json!(true),
@@ -151,17 +169,20 @@ async fn every_malformed_address_refuses_identically() {
 /// answers `cas.too_large` (naming its exact length).
 #[tokio::test]
 async fn the_refusal_does_not_move_when_the_filesystem_does() {
-    let (dir, _cas, core) = core_with_cas();
+    let (dir, _cas, badge, core) = core_with_cas();
     let target = dir.path().join("probe.txt");
 
-    let absent = util::tool_payload(&util::tool_call(&core, 1, "cas_read", args(TRAVERSAL)).await);
+    let absent =
+        util::tool_payload(&util::tool_call(&core, 1, "cas_read", args(TRAVERSAL, &badge)).await);
 
     std::fs::write(&target, b"a small secret").expect("plant small target");
-    let small = util::tool_payload(&util::tool_call(&core, 2, "cas_read", args(TRAVERSAL)).await);
+    let small =
+        util::tool_payload(&util::tool_call(&core, 2, "cas_read", args(TRAVERSAL, &badge)).await);
 
     std::fs::write(&target, text_of(MAX_CAS_READ_BYTES_DEFAULT as usize + 1))
         .expect("plant over-bound target");
-    let large = util::tool_payload(&util::tool_call(&core, 3, "cas_read", args(TRAVERSAL)).await);
+    let large =
+        util::tool_payload(&util::tool_call(&core, 3, "cas_read", args(TRAVERSAL, &badge)).await);
 
     assert_eq!(
         absent, small,
@@ -187,7 +208,7 @@ async fn the_refusal_does_not_move_when_the_filesystem_does() {
 /// tests above.
 #[tokio::test]
 async fn a_well_formed_address_still_reaches_the_store() {
-    let (_dir, cas, core) = core_with_cas();
+    let (_dir, cas, badge, core) = core_with_cas();
     let text = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
     let stored = cas.put(text.as_bytes(), "text/x-diff").expect("put diff");
 
@@ -195,7 +216,12 @@ async fn a_well_formed_address_still_reaches_the_store() {
         &core,
         1,
         "cas_read",
-        json!({"hash": stored.hash, "bytes": stored.bytes, "mime": stored.mime}),
+        json!({
+            "hash": stored.hash,
+            "bytes": stored.bytes,
+            "mime": stored.mime,
+            "badge": badge.token_hex(),
+        }),
     )
     .await;
     assert_ne!(
@@ -205,6 +231,6 @@ async fn a_well_formed_address_still_reaches_the_store() {
     );
     assert_eq!(util::tool_payload(&served)["content"], json!(text));
 
-    let missing = util::tool_call(&core, 2, "cas_read", args(ABSENT)).await;
+    let missing = util::tool_call(&core, 2, "cas_read", args(ABSENT, &badge)).await;
     util::assert_tool_refusal(&missing, codes::CAS_NOT_FOUND);
 }

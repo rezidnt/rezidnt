@@ -64,8 +64,12 @@ pub mod codes {
     /// pin but the surface needs to stay machine-readable everywhere.
     /// A required tool argument is missing or of the wrong type.
     pub const ARGS_INVALID: &str = "args.invalid";
-    /// A mutating tool was called on a core with no substrate wired (a bare
-    /// [`McpCore`] outside the daemon).
+    /// A tool was called on a core that has no backing for it wired: a mutating
+    /// tool on a core with no substrate (a bare [`McpCore`] outside the daemon),
+    /// or — DR-057 — `cas_read` on a core with no CAS. Deliberately reused for
+    /// the CAS case rather than minting a code: "this core has no store wired"
+    /// is the same answer, and answering `cas.not_found` would misstate why (I6)
+    /// by blaming the blob for the daemon's own missing wiring.
     pub const SUBSTRATE_UNAVAILABLE: &str = "substrate.unavailable";
     /// `spawn_agent` named a workspace this daemon has not opened.
     pub const WORKSPACE_UNKNOWN: &str = "workspace.unknown";
@@ -116,6 +120,37 @@ pub mod codes {
     /// caller its badge is bad would be false, an honesty regression (I6,
     /// DR-045 §Invariant posture). Refused on POLICY, before any effect.
     pub const FAN_OUT_LEAD_ONLY: &str = "fan_out.lead_only";
+    /// DR-057 §Decision 2 — `cas_read` addressed a blob this daemon's CAS does
+    /// not hold. An honest refusal, never an empty success: a
+    /// `{content: "", truncated: false}` for an absent blob would fabricate a
+    /// zero-byte diff the log never pinned (I6, and the sibling of `diff_view`'s
+    /// null-vs-fabricated-ref leg). Additive code — older peers tolerate an
+    /// unknown refusal code (the `scope.requires_ttl` precedent, I5).
+    pub const CAS_NOT_FOUND: &str = "cas.not_found";
+    /// DR-057 §Decision 2 — the bytes at the addressed path do not hash to the
+    /// address. [`rezidnt_cas::Cas::get`] refuses this already and the tool does
+    /// not route around it: content that fails its own address is served to
+    /// nobody. Distinct from [`CAS_NOT_FOUND`] because the operator action
+    /// differs — a corrupt store is an integrity incident, a missing blob is not.
+    pub const CAS_CORRUPT: &str = "cas.corrupt";
+    /// DR-057 §Decision 2 — the ACTUAL blob is larger than
+    /// [`crate::MAX_CAS_READ_BYTES_DEFAULT`]. Refused WHOLE and bytes-free: v1
+    /// serves no partial reads, because a client that cannot tell a partial diff
+    /// from a whole one is worse off than one with no review surface at all.
+    /// Judged against the blob, never against the caller's claimed `bytes` — an
+    /// under-claiming ref cannot smuggle over-bound content through.
+    pub const CAS_TOO_LARGE: &str = "cas.too_large";
+    /// DR-057 §Decision 2 — the ref's CLAIMED mime is not a text type, and v1
+    /// serves text only. Refused plainly rather than mangled into a JSON string.
+    pub const CAS_NOT_TEXT: &str = "cas.not_text";
+    /// DR-057 §Decision 2 — the ref claimed a text mime but the bytes are not
+    /// valid UTF-8. Deliberately NOT [`CAS_NOT_TEXT`]: that one is a fact about
+    /// the caller's own ref (visible to the caller before it calls), this one is
+    /// a fact about the stored content (only the daemon can see it), and telling
+    /// a caller its mime is wrong when the STORE is what disagrees would misstate
+    /// why (I6). Never served through `from_utf8_lossy`: U+FFFD substitution
+    /// would hand back content that hashes to something other than the address.
+    pub const CAS_NOT_UTF8: &str = "cas.not_utf8";
 }
 
 /// DR-044 §Decision 4 — the DEFAULT width cap: at most this many tasks ride one
@@ -126,6 +161,22 @@ pub mod codes {
 /// circuit-breaker does not exist in this tree, so this cap is the only
 /// backpressure the fan-out path has.
 pub const MAX_FAN_OUT_DEFAULT: usize = 8;
+
+/// DR-057 §Decision 2 — the DEFAULT bound on one `cas_read`: 256 KiB. One number
+/// in one place, named after [`MAX_FAN_OUT_DEFAULT`]; `u64` because it bounds
+/// bytes, which is `CasRef::bytes`' own type. A blob of EXACTLY this many bytes
+/// is admitted (the check is a strict `>`, the fan-out cap's own semantics); one
+/// byte over is REFUSED WHOLE ([`codes::CAS_TOO_LARGE`]) and never chopped.
+///
+/// A DEFAULT, cheap to revisit and not BINDING: it is a response-size guard, not
+/// a security boundary. The value is deliberately unpinned by the DR-057 board —
+/// every test there derives its blob from this const, so revising it moves no
+/// test. 256 KiB comfortably holds a review-sized diff while keeping one
+/// loopback response well inside what a client can hold in memory.
+///
+/// The bound is enforced against the ACTUAL blob, never against the caller's
+/// claimed `CasReadArgs::bytes` (see [`McpCore::call_cas_read`]).
+pub const MAX_CAS_READ_BYTES_DEFAULT: u64 = 256 * 1024;
 
 /// MCP protocol version this server speaks (DEFAULT: the current spec rev).
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -689,6 +740,8 @@ impl McpCore {
             "gate_explain" => self.call_gate_explain(args).await,
             "tail_events" => self.call_tail_events(args).await,
             "board_view" => self.call_board_view(args).await,
+            "diff_view" => self.call_diff_view(args).await,
+            "cas_read" => self.call_cas_read(args).await,
             "get_escalations" => self.call_get_escalations(args).await,
             "orchestration_graph" => self.call_orchestration_graph(args).await,
             "fan_out" => self.call_fan_out(args).await,
@@ -2043,6 +2096,144 @@ impl McpCore {
         Ok(tool_ok(payload))
     }
 
+    /// `diff_view` — DR-057 §Decision 1/3/4: the READ-ONLY Review row for ONE
+    /// worktree. In the `board_view`/`get_escalations` read class (unbadged, doc
+    /// §12 as amended by DR-005): same pure `replay(None)` → `rezidnt_state::fold`
+    /// path, then a VERBATIM read of the one already-folded entry (I3 — nothing
+    /// here re-derives, re-interprets, or re-canonicalizes anything).
+    ///
+    /// Keyed by worktree and only by worktree (DR-057 §Decision 3): a run has
+    /// nothing sound to join on and DR-049 ruled the correlation join UNSOUND. A
+    /// call with no `worktree` is refused at args (-32602) by the typed parse, so
+    /// a `{"run": …}` call cannot be silently read as an unfiltered request.
+    ///
+    /// `diff` is the FULL `CasRef` the fold retained, or JSON `null` when no
+    /// `diff.ready`/`diff.merged` has folded for that tree — NEVER a fabricated
+    /// `{hash: "", bytes: 0, mime: ""}`, which would address a blob the log never
+    /// pinned and hand `cas_read` a lie to resolve. `outcome` is `null` when the
+    /// tree has earned none: absence surfaces as absence (DR-012).
+    ///
+    /// UNKNOWN TREE — a DR-057 gap, settled here: refused with the EXISTING
+    /// [`codes::WORKTREE_UNKNOWN`], not answered with a miss BODY. Both mechanisms
+    /// live on this surface, and the split is by CLASS, not by taste: the miss-body
+    /// precedent is the dossier RESOURCE (`resources/read` has no `isError` channel
+    /// to refuse through), while every TOOL that cannot answer refuses —
+    /// `gate_explain` with `gate.no_verdict`, `release_worktree` with
+    /// `worktree.unknown`. `diff_view` is a tool, so it refuses, and it reuses the
+    /// code minted for exactly this fact ("a worktree path this daemon's log does
+    /// not know") rather than minting a second name for one condition.
+    async fn call_diff_view(&self, args: Value) -> RpcOutcome {
+        let parsed: rezidnt_types::mcp::DiffViewArgs =
+            serde_json::from_value(args).map_err(|e| (-32602, format!("diff_view args: {e}")))?;
+        let events = self.replay(None).await?;
+        let graph = rezidnt_state::fold(events.iter());
+        let Some(state) = graph.worktrees.get(&parsed.worktree) else {
+            return Ok(tool_refused(
+                codes::WORKTREE_UNKNOWN,
+                format!(
+                    "no worktree {} on the log — honest absence, not an empty row",
+                    parsed.worktree
+                ),
+            ));
+        };
+        // Every field VERBATIM from the folded entry. No projection type is
+        // minted in rezidnt-state (the DR-039 hoist earned its keep by having a
+        // second consumer, the tui board; a second consumer here would earn the
+        // same hoist).
+        let diff = match &state.last_diff {
+            Some(r) => {
+                serde_json::to_value(r).map_err(|e| (-32603, format!("encode diff ref: {e}")))?
+            }
+            None => Value::Null,
+        };
+        Ok(tool_ok(json!({
+            "worktree": parsed.worktree,
+            "lifecycle": state.lifecycle,
+            "outcome": state.outcome,
+            "diff": diff,
+        })))
+    }
+
+    /// `cas_read` — DR-057 §Decision 2/4: resolve ONE `CasRef` to its text
+    /// content, bounded, from THIS daemon's CAS. Read class, unbadged, same tier
+    /// as `diff_view`. Reads the wired store only ([`McpCore::with_cas`], which
+    /// the daemon already wires) — never the ephemeral permit fallback, which
+    /// holds no diff any operator ever wants and would answer `cas.not_found` for
+    /// every real one.
+    ///
+    /// REFUSES, NEVER CHOPS. Over-bound content is refused WHOLE and bytes-free:
+    /// no prefix, no partial, not even inside the refusal payload. `truncated` is
+    /// on the success shape because DR-057 pins it, and in v1 it is always
+    /// `false` — there are no partial reads to report. A review surface that
+    /// silently truncates is worse than none, because it manufactures confidence.
+    ///
+    /// Three DR-057 gaps settled here, each the narrow reading:
+    ///
+    /// 1. **The bound governs CONTENT, not the caller's claim.** `bytes` is
+    ///    advisory and never authorizes anything. The hash alone addresses the
+    ///    blob, so trusting the claim could only do harm in one of two
+    ///    directions: an UNDER-claim would smuggle over-bound content through
+    ///    (the board pins this shut), and an OVER-claim would deny a perfectly
+    ///    in-bound read over the caller's own bad metadata. A ref that overstates
+    ///    therefore gets served the actual blob, and `bytes_returned` reports what
+    ///    was actually served — so a caller can always detect the disagreement
+    ///    itself. No mismatch code is minted: the response already tells the truth.
+    /// 2. **`text/*` only in v1** — `application/json` is NOT text here. DR-057
+    ///    §Decision 2 says "text mimes only"; `text/*` is exactly the set the diff
+    ///    path produces (`text/x-diff`, `text/plain`), and admitting structured
+    ///    `application/*` would quietly widen this into the generic evidence
+    ///    reader the record's own counterargument declines to bless (a second
+    ///    consumer "should get its own DR, not be assumed free"). Widening later
+    ///    is additive; narrowing later would break callers.
+    /// 3. **Mime parameters are ignored** (`text/plain; charset=utf-8` — a mime
+    ///    this tree actually writes — is text). The type/subtype is what carries
+    ///    the text/binary distinction.
+    ///
+    /// The two checks compose: the CLAIMED mime gates admission, and the ACTUAL
+    /// bytes must then decode as UTF-8 ([`codes::CAS_NOT_UTF8`]) — so claiming
+    /// `text/plain` over a binary blob buys nothing. Nothing is ever served
+    /// through `from_utf8_lossy`.
+    async fn call_cas_read(&self, args: Value) -> RpcOutcome {
+        let parsed: rezidnt_types::mcp::CasReadArgs =
+            serde_json::from_value(args).map_err(|e| (-32602, format!("cas_read args: {e}")))?;
+        if !is_text_mime(&parsed.mime) {
+            return Ok(tool_refused(
+                codes::CAS_NOT_TEXT,
+                format!(
+                    "mime {} is not a text type; cas_read v1 serves text/* only, \
+                     and refuses rather than mangling",
+                    parsed.mime
+                ),
+            ));
+        }
+        // The WIRED store, deliberately — not `permit_cas`'s ephemeral fallback.
+        let Some(cas) = self.cas.as_ref().map(Arc::clone) else {
+            return Ok(tool_refused(
+                codes::SUBSTRATE_UNAVAILABLE,
+                "this core has no CAS wired — no blob can be resolved here",
+            ));
+        };
+        let addressed = rezidnt_types::refs::CasRef {
+            hash: parsed.hash,
+            bytes: parsed.bytes,
+            mime: parsed.mime,
+        };
+        // Filesystem work off the async threads (rust-conventions: no blocking
+        // in async). One hop covers the size gate, the read and the verify.
+        let outcome = tokio::task::spawn_blocking(move || read_bounded(&cas, &addressed))
+            .await
+            .map_err(|e| (-32603, format!("cas read task panicked: {e}")))?;
+        match outcome {
+            CasReadOutcome::Served(text) => Ok(tool_ok(json!({
+                "content": text,
+                "bytes_returned": text.len() as u64,
+                "truncated": false,
+            }))),
+            CasReadOutcome::Refused(code, message) => Ok(tool_refused(code, message)),
+            CasReadOutcome::Internal(message) => Err((-32603, message)),
+        }
+    }
+
     /// `get_escalations` — DR-040: the READ-ONLY outstanding-escalations
     /// projection (the drill-down detail behind `board_view`'s
     /// `permit_escalated` count). In the `tail_events`/`board_view` read class
@@ -2215,6 +2406,16 @@ fn tools_list() -> RpcOutcome {
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::BoardViewArgs))?,
             },
             {
+                "name": "diff_view",
+                "description": "Read one worktree's Review row: its lifecycle, its outcome, and the FULL CasRef of the last diff.ready/diff.merged folded for it — hash, bytes and mime, ready to hand straight to cas_read. `diff` is null when no diff has folded for that tree, never a fabricated empty ref. Keyed by the worktree path (the same key board_view's worktree rows carry); there is no run key. An unknown tree is refused worktree.unknown. Read-class, no badge (DR-057).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::DiffViewArgs))?,
+            },
+            {
+                "name": "cas_read",
+                "description": "Resolve one CasRef to its text content, bounded. Arguments are the full ref triple {hash, bytes, mime} exactly as diff_view served it. Returns {content, bytes_returned, truncated}; v1 serves whole blobs only, so truncated is always false. Content larger than the read bound is REFUSED whole (cas.too_large), never truncated — the bound is judged against the stored blob, not the claimed bytes. v1 serves text/* only: a non-text mime is refused cas.not_text, a text-claimed blob that is not valid UTF-8 cas.not_utf8, a missing blob cas.not_found, and a blob that fails its own hash cas.corrupt. Read-class, no badge (DR-057).",
+                "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::CasReadArgs))?,
+            },
+            {
                 "name": "get_escalations",
                 "description": "Read the outstanding permit escalations (the drill-down detail behind board_view's permit_escalated count): one row per outstanding escalation with run, request_id, action, target, reason, policy_ref. Optional `run` filters to one run. Read-class, no badge (DR-040).",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::GetEscalationsArgs))?,
@@ -2231,6 +2432,112 @@ fn tools_list() -> RpcOutcome {
             },
         ]
     }))
+}
+
+/// Is this ref's CLAIMED media type one `cas_read` serves in v1?
+///
+/// `text/<something>` and nothing else (DR-057 §Decision 2, settled narrow — see
+/// [`McpCore::call_cas_read`]). Parameters are ignored, so the
+/// `text/plain; charset=utf-8` this tree writes at `runs.rs` is text; matching is
+/// ASCII-case-insensitive, because media types are.
+fn is_text_mime(mime: &str) -> bool {
+    let essence = mime.split(';').next().unwrap_or(mime).trim();
+    essence
+        .to_ascii_lowercase()
+        .strip_prefix("text/")
+        .is_some_and(|subtype| !subtype.is_empty())
+}
+
+/// One bounded CAS read's outcome. Separated from the JSON shaping so the
+/// blocking half is a pure function of (store, ref) and carries no transport.
+enum CasReadOutcome {
+    /// The WHOLE blob, decoded as UTF-8. v1 has no partial success.
+    Served(String),
+    /// A machine-readable refusal — bytes-free by construction: this variant
+    /// cannot carry content, so no refusal path can leak a prefix.
+    Refused(&'static str, String),
+    /// An infrastructure failure (a JSON-RPC -32603). Deliberately NOT a
+    /// refusal: "the daemon could not look" is not a statement about the blob,
+    /// and collapsing the two would tell a caller something false (I6).
+    Internal(String),
+}
+
+/// Read one blob under [`MAX_CAS_READ_BYTES_DEFAULT`], or refuse with a reason.
+///
+/// Blocking (filesystem); called only from `spawn_blocking`. Order is chosen so
+/// each refusal names the FIRST thing actually wrong:
+///
+/// 1. size of the blob AS STORED, before anything is read into memory — so an
+///    over-bound blob is never even materialized, let alone partially served;
+/// 2. read + hash-verify through [`Cas::get`], the store's own door, which
+///    refuses a corrupt blob (this tool does not route around it);
+/// 3. the bound again, against the bytes actually in hand — the gate belongs on
+///    what is served, and a blob that grew between the stat and the read must not
+///    slip past on the strength of a stale measurement;
+/// 4. UTF-8 decode, whole or not at all.
+fn read_bounded(cas: &Cas, addressed: &rezidnt_types::refs::CasRef) -> CasReadOutcome {
+    let stored = match std::fs::metadata(cas.path_for(&addressed.hash)) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CasReadOutcome::Refused(
+                codes::CAS_NOT_FOUND,
+                format!("no blob {} in this daemon's CAS", addressed.hash),
+            );
+        }
+        Err(e) => {
+            return CasReadOutcome::Internal(format!("stat blob {}: {e}", addressed.hash));
+        }
+    };
+    if stored > MAX_CAS_READ_BYTES_DEFAULT {
+        return CasReadOutcome::Refused(codes::CAS_TOO_LARGE, too_large_message(stored));
+    }
+    let content = match cas.get(addressed) {
+        Ok(content) => content,
+        Err(rezidnt_cas::CasError::NotFound { hash }) => {
+            return CasReadOutcome::Refused(
+                codes::CAS_NOT_FOUND,
+                format!("no blob {hash} in this daemon's CAS"),
+            );
+        }
+        Err(rezidnt_cas::CasError::Corrupt { addressed, actual }) => {
+            return CasReadOutcome::Refused(
+                codes::CAS_CORRUPT,
+                format!(
+                    "blob {addressed} is corrupt: the stored bytes hash to {actual}. \
+                     Content that fails its own address is served to nobody"
+                ),
+            );
+        }
+        Err(rezidnt_cas::CasError::Io(e)) => {
+            return CasReadOutcome::Internal(format!("read blob {}: {e}", addressed.hash));
+        }
+    };
+    let served = content.len() as u64;
+    if served > MAX_CAS_READ_BYTES_DEFAULT {
+        return CasReadOutcome::Refused(codes::CAS_TOO_LARGE, too_large_message(served));
+    }
+    match String::from_utf8(content) {
+        Ok(text) => CasReadOutcome::Served(text),
+        Err(_) => CasReadOutcome::Refused(
+            codes::CAS_NOT_UTF8,
+            format!(
+                "blob {} claims a text mime but its bytes are not valid UTF-8; \
+                 serving it lossily would return content that hashes to something \
+                 other than the address",
+                addressed.hash
+            ),
+        ),
+    }
+}
+
+/// The over-bound refusal message. Carries SIZES only — never a byte of the
+/// content, not even a prefix: a partial diff inside a refusal is still a chop.
+fn too_large_message(actual: u64) -> String {
+    format!(
+        "blob is {actual} bytes; cas_read's bound is {MAX_CAS_READ_BYTES_DEFAULT}. \
+         Refused whole — v1 never truncates, so a client can never mistake a \
+         partial diff for a complete one"
+    )
 }
 
 /// A successful tool result: machine-readable JSON in `content[0].text`.

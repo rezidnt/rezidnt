@@ -305,6 +305,78 @@ pub struct FanOutTask {
     pub idempotency_key: String,
 }
 
+/// `diff_view` — DR-057 §Decision 1/3: read one worktree's Review row
+/// (`{worktree, lifecycle, outcome, diff: CasRef | null}`). Read-only,
+/// idempotent, no badge — in the `board_view`/`get_escalations` read class (doc
+/// §12 as amended by DR-005).
+///
+/// KEYED BY WORKTREE, and only by worktree (DR-057 §Decision 3): there is
+/// deliberately NO `run` field. `RunRow` carries no worktree reference and the
+/// ordinary allocator is the bare string `"rezidnt"`, so a run key has nothing
+/// sound to join on — and DR-049 already ruled the obvious alternative (a
+/// correlation join) UNSOUND, one correlation spanning N runs and N trees.
+/// Adding a `run` property here would put that unsound join back on the surface.
+///
+/// The value is the graph's own worktree key — the canonicalized path string
+/// `board_view`'s `WorktreeRow.path` serves and `gate.failed.worktree?` attributes
+/// against. A caller passes back the key it was served; the tool re-canonicalizes
+/// nothing (I3).
+///
+/// SCHEMA PROSE, deliberately suppressed: `#[schemars(description = "")]` keeps
+/// the doc-comment above out of the generated schema (schemars drops an empty
+/// description rather than emitting one), so the rustdoc a human reads and the
+/// wire schema a client reads evolve independently. The DR-057 board compares
+/// `schema_for!` to its committed golden VERBATIM — unlike the DR-044 golden pin,
+/// which strips `description` keys before comparing — so a doc-comment reword
+/// would otherwise flip a structural golden red. The guidance a client needs
+/// rides the tool's own `description` in `tools/list`, not the arg schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "")]
+pub struct DiffViewArgs {
+    /// The worktree path key (graph `worktrees` key / `WorktreeRow.path`).
+    #[schemars(description = "")]
+    pub worktree: String,
+}
+
+/// `cas_read` — DR-057 §Decision 2: resolve ONE `CasRef` to its text content,
+/// bounded. Read-only, idempotent, no badge — same read class as `diff_view`.
+///
+/// The args ARE the ref triple, all three required: the caller presents its own
+/// ref (the value `diff_view` served, verbatim) and the daemon echoes and
+/// VERIFIES it. Not a bare hash, because the CAS at rest is content-only — mime
+/// lives on the event payload, never in the store — so a bare-hash tool would
+/// force the daemon to invent metadata it does not have (DR-057 §Decision 2).
+///
+/// What the daemon actually trusts, stated because the shape does not say it:
+/// the HASH addresses and verifies the content, so it is authoritative. The
+/// `bytes` and `mime` fields are the CALLER'S CLAIM. `mime` gates admission
+/// (v1 serves text only) and `bytes` is not trusted at all — the read bound is
+/// enforced against the ACTUAL blob, and the response's `bytes_returned` reports
+/// what was actually served. See `rezidnt_mcp::MAX_CAS_READ_BYTES_DEFAULT`.
+///
+/// Field ORDER is load-bearing for the doc §9 no-drift pin: it fixes the
+/// generated `required` array against
+/// `spec/fixtures/dr057_cas_read_args.schema.golden.json`. Schema prose is
+/// suppressed for the reason given on [`DiffViewArgs`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(description = "")]
+pub struct CasReadArgs {
+    /// Lowercase blake3 hex (64 chars) of the blob — the address, and the only
+    /// field the daemon can verify content against.
+    #[schemars(description = "")]
+    pub hash: String,
+    /// The caller's claimed blob length. Advisory: never used to authorize or
+    /// to bound the read (a claim that could widen the bound would be a
+    /// smuggling channel; one that could narrow it would deny an in-bound read
+    /// over the caller's own bad metadata).
+    #[schemars(description = "")]
+    pub bytes: u64,
+    /// The caller's claimed media type, from the event payload the ref rode on.
+    /// v1 admits text only; a non-text claim is refused rather than mangled.
+    #[schemars(description = "")]
+    pub mime: String,
+}
+
 /// `tail_events` — read a range of event envelopes from the log.
 /// Read-only, idempotent, no badge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

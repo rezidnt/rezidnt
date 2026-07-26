@@ -24,6 +24,7 @@
 
 use rezidnt_state::fold;
 use rezidnt_types::Event;
+use rezidnt_types::refs::CasRef;
 use serde_json::json;
 use ulid::Ulid;
 
@@ -169,8 +170,12 @@ fn released_without_allocation_still_materializes() {
     assert_eq!(wt.outcome, None);
 }
 
+/// DR-057 §Decision 1 widened `last_diff` from the bare hash to the WHOLE
+/// `CasRef`. This test reads the widened field and asserts strictly more than it
+/// did: all three wire fields are retained, not just the hash. No bar moved —
+/// the hash assertion it always made is still made, inside the ref.
 #[test]
-fn diff_ready_records_last_diff_hash() {
+fn diff_ready_records_last_diff_ref() {
     let hash = "a3f1c0de5b9a4e7d8c2b6f0a1d4e7c8b9a0f1e2d3c4b5a69788796a5b4c3d2e1";
     let events = [
         allocated(1, WT_A, "feat/s2"),
@@ -183,9 +188,13 @@ fn diff_ready_records_last_diff_hash() {
     let graph = fold(events.iter());
     let wt = graph.worktrees.get(WT_A).unwrap();
     assert_eq!(
-        wt.last_diff.as_deref(),
-        Some(hash),
-        "diff.ready pins the latest summary ref hash on the worktree entry"
+        wt.last_diff,
+        Some(CasRef {
+            hash: hash.to_string(),
+            bytes: 412,
+            mime: "text/x-diff".to_string(),
+        }),
+        "diff.ready pins the latest summary ref — the WHOLE triple — on the worktree entry"
     );
     assert_eq!(
         wt.lifecycle, "allocated",

@@ -584,8 +584,10 @@ fn the_merged_diff_is_not_clobbered_by_a_post_merge_watcher_fact() {
          `status` field and the release would have erased `\"merged\"` — the derived-state \
          regression that made DR-047 §Decision 5 refuse to release here at all"
     );
+    // DR-057 §Decision 1 widened `last_diff` from the bare hash to the whole
+    // `CasRef`; this reads the hash out of the ref and asserts the same fact.
     assert_eq!(
-        state.last_diff.as_deref(),
+        state.last_diff.as_ref().map(|r| r.hash.as_str()),
         Some(merged_hash.as_str()),
         "derived state records the diff that was MERGED. Any other value means the log's last \
          word about this tree is not the merge — and since the log is truth (I3), a `last_diff` \

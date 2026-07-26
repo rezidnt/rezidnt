@@ -42,7 +42,11 @@
       "branch": "rezidnt/impl",
       "allocator": "rezidnt",
       "conflicts": 0,
-      "last_diff": "1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e"
+      "last_diff": {
+        "hash": "1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e",
+        "bytes": 23,
+        "mime": "text/plain"
+      }
     }
   }
 }

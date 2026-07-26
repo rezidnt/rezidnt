@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 
+use rezidnt_types::refs::CasRef;
 use rezidnt_types::{Event, Subject, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -735,13 +736,15 @@ impl AgentRunState {
 ///   (inserted even if never allocated — the log is truth). It never touches
 ///   `outcome`: the outcome a run earned survives its tree's release, which is
 ///   the whole point of the split;
-/// - `diff.ready` `{worktree, diff: CasRef}` → `last_diff = Some(diff.hash)`
-///   on the entry keyed by `worktree`.
+/// - `diff.ready` `{worktree, diff: CasRef}` → `last_diff = Some(diff)` — the
+///   WHOLE `{hash, bytes, mime}` ref (DR-057 §Decision 1) — on the entry keyed
+///   by `worktree`. A `diff` that does not parse as a full ref folds NOTHING on
+///   that field: the reducer never part-fills a ref it was not given (I3).
 ///
 /// S4 addition (pinned by `tests/s4_gates.rs` and the `s4_verified_run`
 /// fixture; `diff.merged` is ratified in `spec/ontology.md` at `v = 1`):
 /// - `diff.merged` `{run, worktree, diff: CasRef}` → `outcome =
-///   Some("merged")` and `last_diff = Some(diff.hash)`, leaving `lifecycle`
+///   Some("merged")` and `last_diff = Some(diff)` (the whole ref), leaving `lifecycle`
 ///   alone (inserted even if never allocated — the log is truth, I3). A merged
 ///   tree is not yet a released one.
 ///
@@ -788,8 +791,27 @@ pub struct WorktreeState {
     pub allocator: Option<String>,
     #[serde(default)]
     pub conflicts: u64,
-    /// blake3 hex of the most recent `diff.ready` summary ref.
-    pub last_diff: Option<String>,
+    /// The most recent `diff.ready` / `diff.merged` summary ref, WHOLE —
+    /// `{hash, bytes, mime}` (DR-057 §Decision 1).
+    ///
+    /// Widened from the bare hash `String` by DR-057: all three fields were
+    /// always on the wire (ontology v1 pins `diff` as a full [`CasRef`] on both
+    /// facts) and the fold used to discard two of them, leaving no path able to
+    /// resolve a diff's bytes without inventing the metadata the CAS never
+    /// persists at rest. Carried VERBATIM — the reducer copies the ref and
+    /// parses nothing (I3).
+    ///
+    /// ABSENT means no diff-bearing fact has folded for this tree. Never a
+    /// `Default`-fabricated `{hash: "", bytes: 0, mime: ""}`: an empty ref
+    /// would address a blob the log never pinned, and `diff_view`'s null leg
+    /// rides this absence being honest.
+    ///
+    /// BREAKING on the SERIALIZED shape, disclosed by DR-057 §Decision 1's
+    /// in-place correction: derived state that used to serialize a string now
+    /// serializes an object. Additive on the INFORMATION axis (nothing is lost,
+    /// two fields are gained). [`WorktreeRow::last_diff`] deliberately does NOT
+    /// widen — `board_view`'s response shape is untouched (DR-039 unamended).
+    pub last_diff: Option<CasRef>,
 }
 
 /// The entity graph. `BTreeMap` everywhere so equality and serialization
@@ -966,13 +988,13 @@ pub fn apply(graph: &mut Graph, event: &Event) {
         }
         "diff.ready" => {
             if let Some(path) = event.payload()["worktree"].as_str()
-                && let Some(hash) = event.payload()["diff"]["hash"].as_str()
+                && let Some(diff) = payload_cas_ref(event)
             {
                 graph
                     .worktrees
                     .entry(path.to_string())
                     .or_default()
-                    .last_diff = Some(hash.to_string());
+                    .last_diff = Some(diff);
             }
         }
         "diff.merged" => {
@@ -986,8 +1008,8 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             if let Some(path) = event.payload()["worktree"].as_str() {
                 let wt = graph.worktrees.entry(path.to_string()).or_default();
                 wt.outcome = Some("merged".to_string());
-                if let Some(hash) = event.payload()["diff"]["hash"].as_str() {
-                    wt.last_diff = Some(hash.to_string());
+                if let Some(diff) = payload_cas_ref(event) {
+                    wt.last_diff = Some(diff);
                 }
             }
         }
@@ -1504,6 +1526,19 @@ fn payload_path(event: &Event) -> Option<String> {
     event.payload()["path"].as_str().map(String::from)
 }
 
+/// The WHOLE `diff` ref every `diff.ready` / `diff.merged` payload carries
+/// (ontology v1 pins `{hash, bytes, mime}` on both), for DR-057 §Decision 1.
+///
+/// ALL-OR-NOTHING by construction: a `diff` object missing a field, or carrying
+/// one of the wrong type, yields `None` and the arm folds nothing on that field
+/// rather than part-filling a ref. A synthesized `bytes: 0` / `mime: ""` would
+/// be derived state asserting a size and a type the log never stated, and
+/// `cas_read` would then bound-check and mime-check against the reducer's
+/// invention (I3).
+fn payload_cas_ref(event: &Event) -> Option<CasRef> {
+    serde_json::from_value(event.payload()["diff"].clone()).ok()
+}
+
 /// The `gate` key every `gate.*` payload carries (ontology v1 baselines).
 fn payload_gate(event: &Event) -> Option<String> {
     event.payload()["gate"].as_str().map(String::from)
@@ -1676,7 +1711,14 @@ pub struct WorktreeRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     pub branch: Option<String>,
-    /// Most recent `diff.ready`/`diff.merged` summary hash, if any.
+    /// Most recent `diff.ready`/`diff.merged` summary HASH, if any.
+    ///
+    /// Deliberately still the bare hash string while [`WorktreeState::last_diff`]
+    /// widened to a full [`CasRef`] (DR-057 §Decision 1): DR-057 leaves
+    /// `board_view`'s response shape UNTOUCHED and does not amend DR-039, so the
+    /// projection maps `ref.hash` explicitly rather than letting the widening
+    /// leak downstream. A client that wants the bytes/mime asks `diff_view`,
+    /// which is the tool DR-057 minted for exactly that.
     pub last_diff: Option<String>,
 }
 
@@ -1737,7 +1779,10 @@ pub fn project(graph: &Graph) -> BoardView {
             lifecycle: state.lifecycle.clone(),
             outcome: state.outcome.clone(),
             branch: state.branch.clone(),
-            last_diff: state.last_diff.clone(),
+            // DR-057 §Decision 1: the graph holds the WHOLE ref now; the board
+            // row keeps the hash it always carried. Mapping `ref.hash` here is
+            // what keeps `board_view`'s shape unchanged (DR-039 unamended).
+            last_diff: state.last_diff.as_ref().map(|r| r.hash.clone()),
         })
         .collect();
 

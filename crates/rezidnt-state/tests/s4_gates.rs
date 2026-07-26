@@ -159,9 +159,16 @@ fn diff_merged_marks_the_worktree() {
         "`diff.merged` writes the OUTCOME axis only; with no allocation on this log the \
          lifecycle stays unset rather than being invented (I3)"
     );
+    // DR-057 §Decision 1: `last_diff` retains the WHOLE ref, so this reads the
+    // triple the fact carried rather than its hash alone — strictly more than
+    // before, and the same fact.
     assert_eq!(
-        wt.last_diff.as_deref(),
-        Some("1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e")
+        wt.last_diff,
+        Some(rezidnt_types::refs::CasRef {
+            hash: "1d50030ca17af09eb6fad0eadfb3492275bfc76635d0965260cde6bc685d785e".to_string(),
+            bytes: 23,
+            mime: "text/plain".to_string(),
+        })
     );
 }
 

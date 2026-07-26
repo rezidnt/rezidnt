@@ -159,8 +159,11 @@ fn merged_sets_outcome_only_lifecycle_stays_allocated() {
     );
     assert_eq!(
         entry["last_diff"],
-        json!(MERGE_HASH),
-        "the merged summary ref is retained on the entry (existing S4 semantics, unchanged)"
+        json!({"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff"}),
+        "the merged summary ref is retained on the entry — WHOLE since DR-057 \
+         §Decision 1 widened the field from the bare hash to the full CasRef. \
+         The serialized shape changed (disclosed, breaking); the assertion is \
+         strictly stronger: it now pins the bytes and mime the fact carried too"
     );
 }
 

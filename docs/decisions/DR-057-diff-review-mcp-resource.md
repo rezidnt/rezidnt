@@ -43,6 +43,6 @@ Invariant: NONE (I2's scope left OPEN and named, not ruled — see Context). Sub
 
 **No intel memo cited.**
 
-**Following DR-056's cap voluntarily** (itself PROPOSED): second proof the Context/Decision/Ledger/Consequences shape holds for a design-bearing record.
+**Evidence against DR-056's cap, recorded while DR-056 is still PROPOSED.** This record adopted DR-056's four-section SHAPE voluntarily and the shape held. Its ~800-word CAP did not: this record ran 866 words as drafted and 986 after being narrowed to stop ruling on I2 — and DR-056 itself came in at 851. **Neither the record proposing the cap nor the first record following it met it.** Two data points, both over, one of them the proposal itself. The shape is worth keeping; the number wants revisiting before DR-056 is ratified — plausibly ~1000, or an explicit exemption for design-bearing records as against the ledger-and-correction records DR-056 was actually reacting to.
 
 Amendments to this record require DR-058.

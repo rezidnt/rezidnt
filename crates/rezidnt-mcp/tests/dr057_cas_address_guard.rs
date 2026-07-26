@@ -23,7 +23,11 @@
 //!    answer carries zero bits about the filesystem;
 //! 3. the guard is not a blanket refusal — a well-formed address still reaches
 //!    the store, still serves content, and still answers `cas.not_found` for a
-//!    blob this daemon does not hold.
+//!    blob this daemon does not hold;
+//! 4. the PREMISE above is not folklore — the refusals this guard stands in
+//!    FRONT of really are fact-bearing (`cas.too_large` states a byte count,
+//!    `cas.corrupt` a content hash), so a tree that quietly made them fact-free
+//!    could not retire this board's reason for existing without going red.
 //!
 //! WHAT THE MUTATION SHOWS NOW (corrected 2026-07-26; the claim this paragraph
 //! replaced was true of the pre-DR-058 tree and is FALSE of this one). Deleting
@@ -247,6 +251,91 @@ async fn a_well_formed_address_still_reaches_the_store() {
 
     let missing = util::tool_call(&core, 2, "cas_read", args(ABSENT, &badge)).await;
     util::assert_tool_refusal(&missing, codes::CAS_NOT_FOUND);
+}
+
+/// THE PREMISE, MADE NON-VACUOUS — the refusals this guard stands in FRONT of
+/// really do carry the facts the threat model says they carry.
+///
+/// The whole case for checking shape before the first syscall is that what lies
+/// downstream is fact-BEARING: `cas.too_large` states a byte count and
+/// `cas.corrupt` states a content hash. Those are legitimate answers to a badged
+/// caller about a blob inside the CAS — nothing here asks for them to change —
+/// but they were, until this test, an ASSUMPTION stated only in prose (this
+/// board's header, and `is_cas_address`'s doc). A tree that quietly made them
+/// fact-free would leave both documents asserting a leak that no longer exists,
+/// with nothing red. Now the assertion has a judge.
+#[tokio::test]
+async fn the_refusals_behind_the_guard_are_fact_bearing() {
+    let (_dir, cas, badge, core) = core_with_cas();
+
+    // SIZE. A well-formed in-CAS address over the read bound.
+    let over = text_of(MAX_CAS_READ_BYTES_DEFAULT as usize + 1);
+    let stored = cas
+        .put(over.as_bytes(), "text/plain")
+        .expect("put oversize");
+    let refused = util::tool_call(
+        &core,
+        1,
+        "cas_read",
+        json!({
+            "hash": stored.hash,
+            "bytes": stored.bytes,
+            "mime": stored.mime,
+            "badge": badge.token_hex(),
+        }),
+    )
+    .await;
+    util::assert_tool_refusal(&refused, codes::CAS_TOO_LARGE);
+    let message = util::tool_payload(&refused)["message"]
+        .as_str()
+        .expect("a refusal carries a message")
+        .to_string();
+    assert!(
+        message.contains(&over.len().to_string()),
+        "cas.too_large states the blob's EXACT size ({}) — that is the byte \
+         count the shape guard exists to keep off an out-of-CAS target, and a \
+         message that stopped stating it would silently retire half this \
+         board's premise. Message: {message:?}",
+        over.len()
+    );
+
+    // CONTENT HASH. Plant B's bytes at A's address; the refusal must name B.
+    let addressed = cas
+        .put(b"the content this address promises", "text/plain")
+        .expect("put a");
+    let planted = cas
+        .put(b"entirely different bytes", "text/plain")
+        .expect("put b");
+    std::fs::write(
+        cas.root().join(&addressed.hash),
+        b"entirely different bytes",
+    )
+    .expect("plant corruption");
+    let refused = util::tool_call(
+        &core,
+        2,
+        "cas_read",
+        json!({
+            "hash": addressed.hash,
+            "bytes": addressed.bytes,
+            "mime": addressed.mime,
+            "badge": badge.token_hex(),
+        }),
+    )
+    .await;
+    util::assert_tool_refusal(&refused, codes::CAS_CORRUPT);
+    let message = util::tool_payload(&refused)["message"]
+        .as_str()
+        .expect("a refusal carries a message")
+        .to_string();
+    assert!(
+        message.contains(&planted.hash),
+        "cas.corrupt states the blake3 of the bytes actually found ({}) — the \
+         leg that degrades a metadata oracle into a CONTENT oracle, and the \
+         reason the shape guard cannot be judged as mere hygiene. Message: \
+         {message:?}",
+        planted.hash
+    );
 }
 
 /// LAYER 1's ONLY JUDGE — a SOURCE-TEXT guard, scoped to the FIRST STATEMENT of

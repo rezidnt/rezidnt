@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "bytes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "hash": {
+      "type": "string"
+    },
+    "mime": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "hash",
+    "bytes",
+    "mime"
+  ],
+  "title": "CasReadArgs",
+  "type": "object"
+}

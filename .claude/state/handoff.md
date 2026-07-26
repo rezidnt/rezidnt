@@ -22,9 +22,44 @@ If agents write the code you need four verbs, not an editor:
 | **Compare** | PARKED — `open_trial` (DR-055). Deliberate: Compare doesn't close the IDE |
 | **Review** | **MCP tools SHIPPED today. The cockpit panel is THE LAST THING.** |
 
-## ► NEXT ACTION
+## ► NEXT ACTION — the panel is BUILT and the chain WORKS, but it shows the wrong thing
 
-**Finish the Review panel in `D:\github\rezidnt-operator`** (separate repo, sibling on disk, was at `7068b7f`
+**Run end-to-end 2026-07-26, WSL daemon + Windows client, and it proved the goal is NOT met.** The whole path
+works: daemon in WSL, `REZIDNT_MCP_LOCKFILE` pointed at a `/mnt/c/...` path so Windows can read it, loopback
+HTTP reaches it across the boundary, `open_project` → worktree allocated → files edited → notify watcher folds
+`diff.ready` → `diff_view` returns a `CasRef` → badged `cas_read` returns content, unbadged refuses
+`badge.required`. Every link verified from Windows.
+
+**But the content is not a diff.** `cas_read` returned, verbatim:
+
+```
+# rezidnt diff summary v1
+M README.md blake3:64e4c611…
+M main.rs blake3:c2e424b6…
+```
+
+**`gates::summarize_worktree` pins `git_diff_summary` — a file-status list with content hashes — and labels it
+`text/x-diff`.** It has never been a diff. DR-057's premise ("diff bytes are already CAS-pinned since S2") is
+FALSE; every citation in it is literally correct and the conclusion is wrong. The sibling
+`summarize_worktree_content` → `git_added_content` (DR-043, for secret-scan) is added-content only — no
+removals, no context, also not reviewable.
+
+**So the Review panel renders a list of filenames.** It cannot close an IDE. Both gates passed, two audit
+rounds hardened it, and none of that could catch this — only running it did.
+
+**THE WORK: pin the real unified diff.** Needs a DR (DR-059) because it changes what `diff.ready.diff` means
+or adds a sibling ref, and the `text/x-diff` mime is currently a lie that `cas_read`'s own mime gate trusts.
+Decide: widen the existing ref, or mint a second one and leave the summary for the gates that consume it
+(`secret-scan` reads the DR-043 content ref; check who reads the summary before changing it). Then the panel
+needs a one-line change to point at the new ref.
+
+**The panel itself is DONE and correct** — `366a0bd` in `D:\github\rezidnt-operator`, commits `3d5577d`/`366a0bd`.
+It renders whatever bytes it is handed, handles all seven refusal codes honestly, and shows
+"No diff was read, so none is shown." with no editor on screen for every refusal. Do not rebuild it.
+
+### Previous next-action, kept for context
+
+**The Review panel in `D:\github\rezidnt-operator`** (separate repo, sibling on disk, was at `7068b7f`
 with 8 commits, outside the rezidnt gauntlet by DR-038 — it does not inherit rezidnt's loop).
 
 An implementer was building it when this session ended; **check `git log` there first** — it may be done,

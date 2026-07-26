@@ -16,6 +16,13 @@
 //! RED MODE: `diff_view`/`cas_read` are unknown tools, so `mcp_tool_call`'s
 //! "must not be a protocol error" assertion fires. Red for the right reason:
 //! the tools do not exist.
+//!
+//! RE-CUT under DR-058 §Decision 2 (ACCEPTED, owner, 2026-07-26): `cas_read`
+//! moved behind the badge door, so its call presents the daemon's OWN
+//! operator badge from the 0600 lockfile — the same badge every badged e2e
+//! (`operator_liveops_e2e.rs`) reads. `diff_view` stays unbadged and its test
+//! is UNTOUCHED (§Decision 2's UNCHANGED leg). Every wiring assertion
+//! survives intact.
 #![cfg(unix)]
 
 mod common;
@@ -69,6 +76,8 @@ fn cas_read_serves_the_daemons_own_cas_over_http() {
     let (daemon, lock_path) = start_daemon_with_mcp(None);
     let lock = wait_for_lockfile(&lock_path, LOCK_DEADLINE);
     let url = lock["url"].as_str().expect("lockfile carries url");
+    // DR-058 §Decision 2: the read now rides the daemon's own operator badge.
+    let badge = lock["badge"].as_str().expect("lockfile carries badge");
 
     let cas_root = daemon.db.parent().expect("db has a parent dir").join("cas");
     let cas = Cas::open(&cas_root).expect("open the daemon's CAS root");
@@ -81,7 +90,12 @@ fn cas_read_serves_the_daemons_own_cas_over_http() {
         url,
         2,
         "cas_read",
-        json!({"hash": planted.hash, "bytes": planted.bytes, "mime": planted.mime}),
+        json!({
+            "hash": planted.hash,
+            "bytes": planted.bytes,
+            "mime": planted.mime,
+            "badge": badge,
+        }),
     );
     assert_ne!(
         result["isError"],

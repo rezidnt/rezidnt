@@ -47,11 +47,44 @@ removals, no context, also not reviewable.
 **So the Review panel renders a list of filenames.** It cannot close an IDE. Both gates passed, two audit
 rounds hardened it, and none of that could catch this — only running it did.
 
-**THE WORK: pin the real unified diff.** Needs a DR (DR-059) because it changes what `diff.ready.diff` means
-or adds a sibling ref, and the `text/x-diff` mime is currently a lie that `cas_read`'s own mime gate trusts.
-Decide: widen the existing ref, or mint a second one and leave the summary for the gates that consume it
-(`secret-scan` reads the DR-043 content ref; check who reads the summary before changing it). Then the panel
-needs a one-line change to point at the new ref.
+**THE WORK IS SCOPED AND DRAFTED — [DR-059](../../docs/decisions/DR-059-real-diff-sibling-ref.md) is PROPOSED
+(`5f6b12b`).** Run it in this order; the first step is not optional:
+
+1. **Owner ratifies DR-059.** It AUTHORIZES but does not mint the field — that is deliberate.
+2. **`/subject` (warden)** mints `patch?: CasRef` on `diff.ready` v1 and `diff.merged` v1, plus the mime
+   correction. `v` stays 1. **An implementer landing the payload key before this session runs is working
+   outside the record's authorization.**
+3. **`/oracle`** for the landing slice.
+4. **Implementer:** pin real `git diff` bytes at **BOTH** emitters — `gates::summarize_worktree` AND
+   `crates/rezidnt-adapters/git/src/lib.rs::summarize_to_cas` (the watcher's continuous emitter, a second site
+   producing the identical format under the identical false mime — fix one alone and the other keeps lying).
+   Widen `diff_view` with `patch: CasRef|null`. **Check whether that widening is additive or BREAKING on the
+   serialized axis and disclose it** — that is the exact question DR-057 and DR-058 each got wrong.
+5. **Recut the mime literals** — four goldens plus `dr057_partial_diff_ref_folds_none.rs:156` pin
+   `text/x-diff`. Behaviourally safe (nothing branches on the literal), not free.
+6. **One line in the panel** to read `patch` instead of `diff`. Nothing else in `rezidnt-operator` changes.
+
+`refs["diff"]` stays EXACTLY as it is — `DiffScope` and `ForbiddenPath` parse its line shape and are BINDING
+`pre_merge` inputs. This is DR-043's sibling-ref pattern, not a change in place.
+
+### Reproducing the end-to-end (it takes about two minutes)
+
+```bash
+# 1. daemon in WSL, lockfile on a path Windows can read
+wsl.exe -d Ubuntu-24.04 -e bash -lc '
+  export PATH=$HOME/.cargo/bin:$PATH
+  export REZIDNT_MCP_LOCKFILE=/mnt/c/Users/dakot/AppData/Local/Temp/rezidnt-mcp.lock
+  export REZIDNT_DB=$HOME/.local/state/rezidnt-e2e/events.db
+  nohup $HOME/.cache/rezidnt-target/debug/rezidentd >/tmp/rezidentd.log 2>&1 & sleep 4
+  cat $REZIDNT_MCP_LOCKFILE'
+# 2. the cockpit, pointed at the same lockfile (Windows path form)
+cd /d/github/rezidnt-operator/src-tauri && \
+  REZIDNT_MCP_LOCKFILE='C:\Users\dakot\AppData\Local\Temp\rezidnt-mcp.lock' ./target/debug/app.exe
+```
+
+The test repo is at `~/e2e-repo` in WSL with a worktree already carrying edits; `REZIDNT_DB` above rebuilds
+that state from the log, so `diff_view` answers immediately. In the app: **Look inside rezidnt → Worktrees →
+review**. The chain works; the bytes are the summary. That is the whole finding, visible in about two minutes.
 
 **The panel itself is DONE and correct** — `366a0bd` in `D:\github\rezidnt-operator`, commits `3d5577d`/`366a0bd`.
 It renders whatever bytes it is handed, handles all seven refusal codes honestly, and shows

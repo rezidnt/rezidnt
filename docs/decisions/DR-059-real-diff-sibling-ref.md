@@ -3,7 +3,7 @@
 # Decision Record DR-059 — Pin the real diff: an additive `patch` ref, and a mime that finally tells the truth
 
 **Date:** 2026-07-26
-**Status:** PROPOSED.
+**Status:** ACCEPTED 2026-07-26.
 **Amends:** [DR-057](DR-057-diff-review-mcp-resource.md) §Decision 1 — `diff_view`'s response gains a second optional ref, `patch: CasRef | null`, alongside the existing `diff` field, which is UNTOUCHED. Follows, does not amend, [DR-043](DR-043-secret-scan-content-ref.md)'s sibling-ref shape. Touches `spec/ontology.md`'s `diff.ready`/`diff.merged` v1 payload blocks and mime note — an amendment pointer is owed there, applied by the warden `/subject` session this record authorizes, not stamped here. Mints NO invariant, NO subject, NO trait method, NO dep — see Ledger for the FIELD limb, which is authorized, not minted, by design. Adds a §20 index row.
 
 ## Context

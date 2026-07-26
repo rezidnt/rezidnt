@@ -126,8 +126,10 @@ pub mod codes {
     /// all. Every `cas.*` code in this module, THIS ONE INCLUDED, is therefore
     /// an IMPLEMENTER ADDITION under the module's standing additive DEFAULT —
     /// the same footing as
-    /// [`ARGS_INVALID`]/[`SPAWN_FAILED`], not a board mint — and **ratification
-    /// is owed (DR-058)**. House practice since DR-035 is one-record-one-mint,
+    /// [`ARGS_INVALID`]/[`SPAWN_FAILED`], not a board mint — and all six are
+    /// **RATIFIED by DR-058 §Decision 1 (ACCEPTED, owner, 2026-07-26)**, which
+    /// ratifies the names as-written without rename. House practice since
+    /// DR-035 is one-record-one-mint,
     /// and citing a §Decision that minted nothing would misattribute a
     /// judgement the record never made. Additive either way: older peers
     /// tolerate an unknown refusal code (the `scope.requires_ttl` precedent, I5).
@@ -142,7 +144,7 @@ pub mod codes {
     /// route around it: content that fails its own address is served to nobody.
     /// Distinct from [`CAS_NOT_FOUND`] because the operator action differs — a
     /// corrupt store is an integrity incident, a missing blob is not.
-    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
+    /// Implementer addition, RATIFIED by DR-058 §Decision 1 — see [`CAS_NOT_FOUND`].
     pub const CAS_CORRUPT: &str = "cas.corrupt";
     /// The ACTUAL blob is larger than [`crate::MAX_CAS_READ_BYTES_DEFAULT`]
     /// (the 256 KiB DEFAULT bound is DR-057 §Decision 2's; this code's NAME is
@@ -150,12 +152,17 @@ pub mod codes {
     /// client that cannot tell a partial diff from a whole one is worse off than
     /// one with no review surface at all. Judged against the blob, never against
     /// the caller's claimed `bytes` — an under-claiming ref cannot smuggle
-    /// over-bound content through. Implementer addition, ratification owed
-    /// (DR-058) — see [`CAS_NOT_FOUND`].
+    /// over-bound content through. Implementer addition, RATIFIED by DR-058
+    /// §Decision 1 — see [`CAS_NOT_FOUND`].
     pub const CAS_TOO_LARGE: &str = "cas.too_large";
     /// The ref's CLAIMED mime is not a text type, and v1 serves text only.
     /// Refused plainly rather than mangled into a JSON string. Implementer
-    /// addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
+    /// addition, RATIFIED by DR-058 §Decision 1 — see [`CAS_NOT_FOUND`].
+    ///
+    /// NOT a security boundary, ruled explicitly by DR-058 §Decision 2: the CAS
+    /// persists bytes only and never a mime, so this gate judges the CALLER's
+    /// claim and bounds nothing about what is readable. Confidentiality rests on
+    /// the badge door, not here.
     pub const CAS_NOT_TEXT: &str = "cas.not_text";
     /// The ref claimed a text mime but the bytes are not valid UTF-8.
     /// Deliberately NOT [`CAS_NOT_TEXT`]: that one is a fact about the caller's
@@ -164,7 +171,7 @@ pub mod codes {
     /// mime is wrong when the STORE is what disagrees would misstate why (I6).
     /// Never served through `from_utf8_lossy`: U+FFFD substitution would hand
     /// back content that hashes to something other than the address.
-    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
+    /// Implementer addition, RATIFIED by DR-058 §Decision 1 — see [`CAS_NOT_FOUND`].
     pub const CAS_NOT_UTF8: &str = "cas.not_utf8";
     /// The `hash` argument is not a CAS ADDRESS: not exactly
     /// [`crate::CAS_ADDRESS_HEX_LEN`] lowercase blake3 hex characters. Refused
@@ -180,7 +187,7 @@ pub mod codes {
     /// fact about the store, so every rejected shape refuses byte-identically
     /// (pinned by `tests/dr057_cas_address_guard.rs`).
     ///
-    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
+    /// Implementer addition, RATIFIED by DR-058 §Decision 1 — see [`CAS_NOT_FOUND`].
     pub const CAS_HASH_INVALID: &str = "cas.hash_invalid";
 }
 

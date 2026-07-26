@@ -3,7 +3,7 @@
 # Decision Record DR-058 — Six `cas.*` codes ratified; `cas_read` moves behind the badge door; the CAS path-join guard centralized
 
 **Date:** 2026-07-26
-**Status:** PROPOSED.
+**Status:** ACCEPTED (owner, 2026-07-26). Ratified with §Decision 2 flagged as the departure most likely to warrant revisiting: it moves `cas_read` off the unbadged tier [DR-057](DR-057-diff-review-mcp-resource.md) §Decision 4 deliberately placed it on, making it the first read-class tool on this surface to carry a badge. Accepted knowingly, per the DR-049 Status-field pattern — the owner saw the tier change named as a departure, not folded in as a detail. **Ratification covers the DECISIONS; the code is a slice.** Landing Decisions 2/4/5 is implementer work with its own oracle board and gauntlet, and nothing here declares that work done.
 **Amends:** §9 — no new tool; ratifies six additive refusal codes already live under DR-057's own additive-DEFAULT clause, closing a standing "ratification owed (DR-058)" liability in six doc comments. [DR-057](DR-057-diff-review-mcp-resource.md) §Decision 2 — corrects "v1 serves text mimes only" from a bound on stored content to a bound on the CALLER'S CLAIM (the CAS persists no mime; verified against `rezidnt-cas/src/lib.rs`). §Decision 4 — narrows the unbadged tier: `cas_read` alone moves to the badge door; `diff_view`/`board_view`/`tail_events`/`get_escalations` are UNCHANGED. `rezidnt-cas::Cas::path_for` gains a crate-level address-shape guard, which also closes the Decision-3 log-integrity residual. Mints NO subject, NO field, NO trait method, NO dep — see Ledger.
 
 ## Context

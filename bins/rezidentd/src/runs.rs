@@ -2143,14 +2143,11 @@ async fn run_pre_merge(
             ctx.correlation,
             completed_id,
             1,
-            json!({
-                "worktree": ctx.worktree.display().to_string(),
-                "diff": pins.summary,
-                // The real unified diff, pinned as a SECOND blob beside the
-                // summary it describes — what Review renders (DR-059
-                // §Decision 1). Not wired into the gate refs map below.
-                "patch": pins.patch,
-            }),
+            // The real unified diff rides as a SECOND blob beside the summary
+            // it describes — what Review renders (DR-059 §Decision 1). Not
+            // wired into the gate refs map below, and OPTIONAL: a render
+            // failure emits the summary alone rather than aborting pre_merge.
+            gates::diff_ready_payload(&ctx.worktree, &pins),
         )?,
     )
     .await?;
@@ -2195,7 +2192,7 @@ async fn run_pre_merge(
             &plan.repo,
             &ctx.worktree,
             &pins.summary,
-            &pins.patch,
+            pins.patch.as_ref(),
         )
         .await?;
 

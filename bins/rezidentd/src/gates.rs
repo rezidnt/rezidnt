@@ -411,19 +411,25 @@ pub async fn pin_agent_spec(daemon: &Arc<Daemon>, agent: &AgentSpec) -> anyhow::
     Ok(format!("cas:blake3:{}", ref_.hash))
 }
 
-/// The two blobs one pre_merge pins for one worktree state (DR-059
-/// §Decision 1): the path-status SUMMARY the gate verifies, and the REAL
-/// unified diff a human reviews. Two blobs, one tree state, produced together
-/// so the fact that carries both describes a single moment.
+/// The blobs one pre_merge pins for one worktree state (DR-059 §Decision 1):
+/// the path-status SUMMARY the gate verifies, and — when it renders — the
+/// REAL unified diff a human reviews. Produced together so the fact that
+/// carries both describes a single moment.
 pub struct DiffPins {
     /// `cas:blake3:<hex>` of the summary — the pre_merge gate's `refs["diff"]`.
     /// The patch is deliberately NOT in that map (DR-059 §Decision 3).
     pub diff_ref: String,
     /// The summary's whole ref, for the `diff` field on `diff.ready` /
-    /// `diff.merged`.
+    /// `diff.merged`. Mandatory: it is what `DiffScope`/`ForbiddenPath`
+    /// consume as the gate's BINDING `pre_merge` input.
     pub summary: rezidnt_types::refs::CasRef,
-    /// The patch's whole ref, for the `patch` field on the same facts.
-    pub patch: rezidnt_types::refs::CasRef,
+    /// The patch's whole ref, for the optional `patch` field on the same
+    /// facts. `None` when the render failed — the ontology rules absence
+    /// honest and never-synthesized, and `v` stays 1, so a patch-less
+    /// `diff.ready`/`diff.merged` is a valid v1 fact. A review nicety must
+    /// not be able to block a merge, which is what a non-optional field
+    /// pinned by `?` made it.
+    pub patch: Option<rezidnt_types::refs::CasRef>,
 }
 
 /// Summarize a worktree's working-tree changes into the CAS and pin the real
@@ -444,20 +450,82 @@ pub async fn summarize_worktree(daemon: &Arc<Daemon>, worktree: &Path) -> anyhow
         .context("pin diff summary into cas")?;
     let ref_str = format!("cas:blake3:{}", r.hash);
 
-    let patch_bytes = rezidnt_adapter_git::patch::render_patch(worktree)
-        .await
-        .context("render the worktree's unified diff")?;
-    let cas = Arc::clone(&daemon.cas);
-    let patch = tokio::task::spawn_blocking(move || cas.put(&patch_bytes, "text/x-diff"))
-        .await
-        .context("cas put task panicked")?
-        .context("pin diff patch into cas")?;
-
     Ok(DiffPins {
         diff_ref: ref_str,
         summary: r,
-        patch,
+        patch: pin_patch(&daemon.cas, worktree).await,
     })
+}
+
+/// Render the worktree's REAL unified diff and pin it to the CAS as
+/// `text/x-diff` — the optional `patch` ref that rides beside the summary
+/// (DR-059 §Decision 1/5).
+///
+/// Degrades rather than fails, exactly as its sibling emitter in the git
+/// adapter's watcher does: a render or CAS-put failure is logged at `warn`
+/// and answered with `None`, so the caller emits the summary ALONE. Nothing
+/// is synthesized — absence is the honest answer — and, unlike a `?` here,
+/// a failed review nicety cannot abort the whole `pre_merge`.
+async fn pin_patch(
+    cas: &Arc<rezidnt_cas::Cas>,
+    worktree: &Path,
+) -> Option<rezidnt_types::refs::CasRef> {
+    let pinned = async {
+        let bytes = rezidnt_adapter_git::patch::render_patch(worktree)
+            .await
+            .context("render the worktree's unified diff")?;
+        let cas = Arc::clone(cas);
+        tokio::task::spawn_blocking(move || cas.put(&bytes, "text/x-diff"))
+            .await
+            .context("cas put task panicked")?
+            .context("pin diff patch into cas")
+    }
+    .await;
+    match pinned {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree.display(),
+                "patch render failed; diff.ready carries the summary only"
+            );
+            None
+        }
+    }
+}
+
+/// The gate-time `diff.ready` payload for one worktree state: the summary
+/// always, the patch only when it rendered (DR-059 §Decision 1). Absent means
+/// absent — the key is omitted rather than nulled or synthesized.
+pub fn diff_ready_payload(worktree: &Path, pins: &DiffPins) -> Value {
+    let mut payload = json!({
+        "worktree": worktree.display().to_string(),
+        "diff": pins.summary,
+    });
+    if let Some(patch) = &pins.patch {
+        payload["patch"] = json!(patch);
+    }
+    payload
+}
+
+/// The `diff.merged` payload: the SAME gate-time pins re-attested on the
+/// merge fact — one product, not a re-summarize — with `patch` present only
+/// when the gate-time render produced one.
+fn diff_merged_payload(
+    run: &str,
+    worktree: &Path,
+    diff_ref: &rezidnt_types::refs::CasRef,
+    patch_ref: Option<&rezidnt_types::refs::CasRef>,
+) -> Value {
+    let mut payload = json!({
+        "run": run,
+        "worktree": worktree.display().to_string(),
+        "diff": diff_ref,
+    });
+    if let Some(patch) = patch_ref {
+        payload["patch"] = json!(patch);
+    }
+    payload
 }
 
 /// Render the deterministic diff summary for a worktree via git-CLI
@@ -633,7 +701,7 @@ pub async fn merge_worktree(
     repo: &Path,
     worktree: &Path,
     diff_ref: &rezidnt_types::refs::CasRef,
-    patch_ref: &rezidnt_types::refs::CasRef,
+    patch_ref: Option<&rezidnt_types::refs::CasRef>,
 ) -> anyhow::Result<Ulid> {
     // 1. Stage + commit the worktree's change onto its head (detached or a
     //    rezidnt/<agent> branch — either way it becomes a mergeable commit).
@@ -690,14 +758,7 @@ pub async fn merge_worktree(
             correlation,
             causation,
             1,
-            json!({
-                "run": run,
-                "worktree": worktree.display().to_string(),
-                "diff": diff_ref,
-                // The SAME gate-time pins, re-attested on the merge fact —
-                // one product, not a re-summarize (DR-059 §Decision 1).
-                "patch": patch_ref,
-            }),
+            diff_merged_payload(run, worktree, diff_ref, patch_ref),
         )?,
     )
     .await?;
@@ -720,4 +781,165 @@ async fn git_in(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         String::from_utf8_lossy(&out.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// DR-059 remediation oracle — the gate-time patch pin DEGRADES, it does not
+/// abort.
+///
+/// PLATFORM DISCLOSURE: this module lives inside `gates.rs`, which is
+/// `#![cfg(unix)]` (declared `#[cfg(unix)] mod gates` in `main.rs`), so host
+/// `/vet` CANNOT see these tests. They run under the WSL gauntlet, alongside
+/// `tests/dr059_patch_e2e.rs`.
+///
+/// These are BEHAVIORAL judges, not source-text guards: the failure is
+/// injected for real (a directory that is not a git repository, where
+/// `git ls-files --others` genuinely fails inside
+/// [`rezidnt_adapter_git::patch::render_patch`]), and the positive control
+/// beside it renders a real patch from a real repository — so a
+/// [`pin_patch`] that returned `None` unconditionally would fail the control,
+/// and one that propagated the error would not compile.
+#[cfg(test)]
+mod patch_degrades_tests {
+    use super::*;
+    use rezidnt_cas::Cas;
+    use std::process::Command;
+
+    fn cas(dir: &Path) -> Arc<Cas> {
+        Arc::new(Cas::open(&dir.join("cas")).expect("open cas"))
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The finding: a patch-render failure must answer `None`, not an error.
+    /// A `?` here aborted the whole `pre_merge` — no `diff.ready`, no merge —
+    /// over a review nicety.
+    #[tokio::test]
+    async fn a_render_failure_answers_none_instead_of_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let not_a_repo = tmp.path().join("not-a-repo");
+        std::fs::create_dir(&not_a_repo).expect("mkdir");
+        std::fs::write(not_a_repo.join("a.txt"), b"hello\n").expect("write");
+
+        assert!(
+            rezidnt_adapter_git::patch::render_patch(&not_a_repo)
+                .await
+                .is_err(),
+            "precondition: rendering a patch outside a repository must genuinely fail — \
+             without that this test injects nothing"
+        );
+        assert!(
+            pin_patch(&cas(tmp.path()), &not_a_repo).await.is_none(),
+            "a failed patch render must degrade to `None` (summary alone), never abort"
+        );
+    }
+
+    /// Positive control: the same helper DOES pin a real patch from a real
+    /// repository, so the `None` above is caused by the failure and not by a
+    /// helper that never pins anything.
+    #[tokio::test]
+    async fn a_real_worktree_still_pins_a_real_patch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir");
+        git_ok(&repo, &["init", "-q", "."]);
+        std::fs::write(repo.join("a.txt"), b"one\n").expect("write");
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@localhost",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        std::fs::write(repo.join("a.txt"), b"two\n").expect("write");
+
+        let pinned = pin_patch(&cas(tmp.path()), &repo)
+            .await
+            .expect("a real change in a real repo pins a real patch");
+        assert_eq!(pinned.mime, "text/x-diff", "the patch blob's mime");
+    }
+
+    /// `diff.ready` with no patch carries the summary ALONE: the key is
+    /// absent, not null and not synthesized. The summary is unconditional —
+    /// it is the gate's BINDING `pre_merge` input.
+    #[tokio::test]
+    async fn diff_ready_without_a_patch_carries_the_summary_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let summary = cas(tmp.path())
+            .put(b"M\ta.txt\n", "text/x-diff-summary")
+            .expect("put summary");
+        let pins = DiffPins {
+            diff_ref: format!("cas:blake3:{}", summary.hash),
+            summary: summary.clone(),
+            patch: None,
+        };
+
+        let payload = diff_ready_payload(Path::new("/w"), &pins);
+        assert_eq!(
+            payload["diff"],
+            serde_json::to_value(&summary).expect("summary to json"),
+            "the summary rides unconditionally: {payload:#}"
+        );
+        assert!(
+            payload.get("patch").is_none(),
+            "an unrendered patch is ABSENT, never null or synthesized: {payload:#}"
+        );
+
+        let with_patch = diff_ready_payload(
+            Path::new("/w"),
+            &DiffPins {
+                patch: Some(summary.clone()),
+                ..pins
+            },
+        );
+        assert!(
+            with_patch.get("patch").is_some(),
+            "and a rendered patch IS carried: {with_patch:#}"
+        );
+    }
+
+    /// `diff.merged` republishes `patch` only when the gate-time render
+    /// produced one — the same absence rule, on the merge fact.
+    #[tokio::test]
+    async fn diff_merged_republishes_the_patch_only_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let summary = cas(tmp.path())
+            .put(b"M\ta.txt\n", "text/x-diff-summary")
+            .expect("put summary");
+
+        let without = diff_merged_payload("run-1", Path::new("/w"), &summary, None);
+        assert_eq!(
+            without["diff"],
+            serde_json::to_value(&summary).expect("summary to json"),
+            "the summary rides unconditionally: {without:#}"
+        );
+        assert!(
+            without.get("patch").is_none(),
+            "no gate-time patch means no `patch` key on diff.merged: {without:#}"
+        );
+
+        let with = diff_merged_payload("run-1", Path::new("/w"), &summary, Some(&summary));
+        assert!(
+            with.get("patch").is_some(),
+            "a gate-time patch IS republished: {with:#}"
+        );
+    }
 }

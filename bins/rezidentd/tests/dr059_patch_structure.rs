@@ -25,6 +25,16 @@
 //! simulated. After landing, re-running the deletion re-reds them.
 //!
 //! RED MODE: ASSERT-RED, all three, per the mutation-proof paragraph above.
+//!
+//! ## Remediation update (patch-render degradation)
+//!
+//! The gate-time payload moved out of an inline `json!` in `runs.rs` into
+//! `gates.rs::diff_ready_payload` / `diff_merged_payload` so a failed patch
+//! render OMITS the key instead of aborting `pre_merge`. The two guards below
+//! were re-aimed at the builders and re-proven by mutation (deleting the
+//! conditional insert reds them), and the degradation itself is judged
+//! behaviorally — not by source text — in
+//! `gates.rs::patch_degrades_tests` (unix, like every other daemon judge).
 
 use std::path::PathBuf;
 
@@ -50,28 +60,51 @@ fn gates_pins_the_summary_under_the_corrected_mime() {
     );
 }
 
-/// Criterion 1 backstop (gate-time emit) — `runs.rs` emits the `patch` key
-/// on the gate-time `diff.ready` payload.
+/// Criterion 1 backstop (gate-time emit) — the gate-time `diff.ready`
+/// payload carries the `patch` key.
+///
+/// The payload moved from an inline `json!` in `runs.rs` to
+/// `gates.rs::diff_ready_payload` in the degradation remediation (the key is
+/// now OMITTED when the render failed rather than nulled), so this guard
+/// follows it: `runs.rs` must call the builder, and the builder must set the
+/// key. Splitting it this way keeps the guard pinned to the emit path rather
+/// than to any occurrence of the literal.
 #[test]
 fn the_gate_time_diff_ready_carries_a_patch_key() {
     assert!(
-        src("runs.rs").contains("\"patch\""),
-        "bins/rezidentd/src/runs.rs (run_pre_merge's gate-time diff.ready \
-         payload) must carry the quoted `\"patch\"` key — the second CAS ref \
-         of real `git diff` bytes (DR-059 §Decision 1; ontology \
-         `diff.ready.patch?`). Behavioral judge: dr059_patch_e2e.rs (unix)."
+        src("runs.rs").contains("gates::diff_ready_payload("),
+        "bins/rezidentd/src/runs.rs (run_pre_merge) must build its gate-time \
+         diff.ready payload through `gates::diff_ready_payload`, the builder \
+         that carries the patch ref when it rendered and omits it when it did \
+         not (DR-059 §Decision 1; ontology `diff.ready.patch?`). Behavioral \
+         judge: dr059_patch_e2e.rs (unix)."
+    );
+    assert!(
+        src("gates.rs").contains("payload[\"patch\"] = json!(patch);"),
+        "bins/rezidentd/src/gates.rs::diff_ready_payload must set the quoted \
+         `\"patch\"` key — the second CAS ref of real `git diff` bytes — and \
+         set it from a PRESENT patch only. Behavioral judges: \
+         dr059_patch_e2e.rs and gates.rs::patch_degrades_tests (both unix)."
     );
 }
 
-/// Criterion 2 backstop — `gates.rs::merge_worktree` republishes `patch` on
-/// `diff.merged`, exactly as `diff` already rides through.
+/// Criterion 2 backstop — `merge_worktree` republishes `patch` on
+/// `diff.merged`, exactly as `diff` already rides through, via the
+/// `diff_merged_payload` builder that omits the key when the gate-time
+/// render produced none.
 #[test]
 fn merge_worktree_republishes_the_patch_key() {
+    let gates = src("gates.rs");
     assert!(
-        src("gates.rs").contains("\"patch\""),
-        "bins/rezidentd/src/gates.rs (merge_worktree's diff.merged payload) \
-         must republish the quoted `\"patch\"` key — the SAME gate-time ref \
-         threaded through as `diff` is (DR-059 §Decision 1; ontology \
-         `diff.merged.patch?`). Behavioral judge: dr059_patch_e2e.rs (unix)."
+        gates.contains("diff_merged_payload(run, worktree, diff_ref, patch_ref)"),
+        "bins/rezidentd/src/gates.rs::merge_worktree must build its \
+         diff.merged payload through `diff_merged_payload` (DR-059 \
+         §Decision 1; ontology `diff.merged.patch?`). Behavioral judges: \
+         dr059_patch_e2e.rs and gates.rs::patch_degrades_tests (both unix)."
+    );
+    assert!(
+        gates.contains("\"patch\""),
+        "bins/rezidentd/src/gates.rs must republish the quoted `\"patch\"` \
+         key — the SAME gate-time ref threaded through as `diff` is."
     );
 }

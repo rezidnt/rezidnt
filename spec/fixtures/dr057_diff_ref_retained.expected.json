@@ -18,7 +18,7 @@
       "last_diff": {
         "hash": "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef",
         "bytes": 34,
-        "mime": "text/x-diff"
+        "mime": "text/x-diff-summary"
       }
     }
   }

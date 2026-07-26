@@ -142,7 +142,7 @@ fn a_malformed_ref_does_not_poison_a_later_good_one() {
                 "diff.ready",
                 json!({
                     "worktree": WT,
-                    "diff": {"hash": HASH, "bytes": 21, "mime": "text/x-diff"},
+                    "diff": {"hash": HASH, "bytes": 21, "mime": "text/x-diff-summary"},
                 }),
             ),
         ]
@@ -153,5 +153,5 @@ fn a_malformed_ref_does_not_poison_a_later_good_one() {
     let got = wt.last_diff.as_ref().expect("the whole later ref folds");
     assert_eq!(got.hash, HASH);
     assert_eq!(got.bytes, 21);
-    assert_eq!(got.mime, "text/x-diff");
+    assert_eq!(got.mime, "text/x-diff-summary");
 }

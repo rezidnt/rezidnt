@@ -53,7 +53,7 @@ fn evt(id: &str, subject: &str, payload: Value) -> Event {
         "v": 1,
         "source": "git-adapter",
         "subject": subject,
-        "correlation": "01DR059PATCHF0LD00000000C0",
+        "correlation": "01DR059PATCHF0RD00000000C0",
         "payload": payload,
     }))
     .expect("test event must parse")
@@ -80,8 +80,8 @@ fn cas(hash: &str, bytes: u64, mime: &str) -> CasRef {
 /// before — two slots, one fact, nothing spliced.
 #[test]
 fn diff_ready_with_a_patch_folds_the_whole_ref() {
-    let events = vec![evt(
-        "01DR059PATCHF0LD00000000E1",
+    let events = [evt(
+        "01DR059PATCHF0RD00000000E1",
         "diff.ready",
         json!({"worktree": WT, "diff": summary_ref(), "patch": patch_ref()}),
     )];
@@ -105,11 +105,11 @@ fn diff_ready_with_a_patch_folds_the_whole_ref() {
 /// fold takes it, alongside the `outcome = "merged"` write it already does.
 #[test]
 fn diff_merged_folds_the_republished_patch() {
-    let events = vec![evt(
-        "01DR059PATCHF0LD00000000E2",
+    let events = [evt(
+        "01DR059PATCHF0RD00000000E2",
         "diff.merged",
         json!({
-            "run": "01DR059PATCHF0LD00000000R1",
+            "run": "01DR059PATCHF0RD00000000R1",
             "worktree": WT,
             "diff": summary_ref(),
             "patch": patch_ref(),
@@ -140,8 +140,8 @@ fn diff_merged_folds_the_republished_patch() {
 #[test]
 fn a_patchless_fact_folds_none_and_clears_a_stale_pairing() {
     // Leg 1: patch-less only — None, never CasRef::default().
-    let events = vec![evt(
-        "01DR059PATCHF0LD00000000E3",
+    let events = [evt(
+        "01DR059PATCHF0RD00000000E3",
         "diff.ready",
         json!({"worktree": WT, "diff": summary_ref()}),
     )];
@@ -154,14 +154,14 @@ fn a_patchless_fact_folds_none_and_clears_a_stale_pairing() {
     );
 
     // Leg 2: a patch-bearing fact, then a NEWER patch-less summary.
-    let events = vec![
+    let events = [
         evt(
-            "01DR059PATCHF0LD00000000E4",
+            "01DR059PATCHF0RD00000000E4",
             "diff.ready",
             json!({"worktree": WT, "diff": summary_ref(), "patch": patch_ref()}),
         ),
         evt(
-            "01DR059PATCHF0LD00000000E5",
+            "01DR059PATCHF0RD00000000E5",
             "diff.ready",
             json!({
                 "worktree": WT,

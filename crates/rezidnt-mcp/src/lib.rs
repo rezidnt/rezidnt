@@ -2265,11 +2265,22 @@ impl McpCore {
             }
             None => Value::Null,
         };
+        // The real unified diff beside the summary (DR-059 §Decision 2), same
+        // null-when-unfolded semantics: null is STATED, never a fabricated
+        // empty ref and never an absent key — a missing key would read on the
+        // wire like a daemon that predates the field.
+        let patch = match &state.last_patch {
+            Some(r) => {
+                serde_json::to_value(r).map_err(|e| (-32603, format!("encode patch ref: {e}")))?
+            }
+            None => Value::Null,
+        };
         Ok(tool_ok(json!({
             "worktree": parsed.worktree,
             "lifecycle": state.lifecycle,
             "outcome": state.outcome,
             "diff": diff,
+            "patch": patch,
         })))
     }
 

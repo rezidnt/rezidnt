@@ -182,7 +182,7 @@ fn diff_ready_records_last_diff_ref() {
         evt(
             2,
             "diff.ready",
-            json!({"worktree": WT_A, "diff": {"hash": hash, "bytes": 412, "mime": "text/x-diff"}}),
+            json!({"worktree": WT_A, "diff": {"hash": hash, "bytes": 412, "mime": "text/x-diff-summary"}}),
         ),
     ];
     let graph = fold(events.iter());
@@ -192,7 +192,7 @@ fn diff_ready_records_last_diff_ref() {
         Some(CasRef {
             hash: hash.to_string(),
             bytes: 412,
-            mime: "text/x-diff".to_string(),
+            mime: "text/x-diff-summary".to_string(),
         }),
         "diff.ready pins the latest summary ref — the WHOLE triple — on the worktree entry"
     );

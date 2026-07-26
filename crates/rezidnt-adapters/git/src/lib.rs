@@ -150,6 +150,7 @@
 //!   the sink only via [`GitAdapter::startup_facts`] — the seam that already
 //!   exists for exactly that reason.
 
+pub mod patch;
 mod summary;
 
 use std::collections::BTreeMap;
@@ -1581,7 +1582,20 @@ async fn debounce_loop(
                     continue;
                 }
                 let hash = r.hash.clone();
-                let payload = serde_json::json!({ "worktree": path_str, "diff": r });
+                // The patch rides beside the summary it describes (DR-059
+                // §Decision 1). A render failure emits the summary ALONE:
+                // absence is the honest answer, and nothing is synthesized.
+                let mut payload = serde_json::json!({ "worktree": path_str, "diff": r });
+                match patch_to_cas(&inner.cas, &path).await {
+                    Ok(p) => {
+                        payload["patch"] = serde_json::json!(p);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        worktree = %path_str,
+                        "patch render failed; diff.ready carries the summary only"
+                    ),
+                }
                 match inner.emit("diff.ready", &ctx, causation, payload) {
                     // The suppression hash advances ONLY on a fact that
                     // actually landed. Advancing it first (as this loop did
@@ -1608,16 +1622,32 @@ async fn debounce_loop(
 }
 
 /// Render the worktree's diff summary (gix, in `spawn_blocking`) and persist
-/// it to the CAS as `text/x-diff` (DEFAULT mime, ontology v1).
+/// it to the CAS as `text/x-diff-summary` (DEFAULT mime, ontology v1).
+///
+/// The mime says SUMMARY because the bytes are a summary: a header and one
+/// status-plus-hash line per changed file, never unified-diff markup. The
+/// `text/x-diff` label these bytes used to carry now belongs to
+/// [`patch_to_cas`], whose bytes earn it (DR-059 §Decision 4/5).
 async fn summarize_to_cas(cas: &Arc<Cas>, worktree: &Path) -> Result<CasRef, GitError> {
     let cas = Arc::clone(cas);
     let worktree = worktree.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let text = summary::diff_summary_text(&worktree)?;
-        Ok(cas.put(text.as_bytes(), "text/x-diff")?)
+        Ok(cas.put(text.as_bytes(), "text/x-diff-summary")?)
     })
     .await
     .map_err(join_err)?
+}
+
+/// Render the worktree's REAL unified diff ([`patch::render_patch`]) and
+/// persist it to the CAS as `text/x-diff` — the `patch` ref that rides beside
+/// the summary on `diff.ready` (DR-059 §Decision 1/5).
+async fn patch_to_cas(cas: &Arc<Cas>, worktree: &Path) -> Result<CasRef, GitError> {
+    let bytes = patch::render_patch(worktree).await?;
+    let cas = Arc::clone(cas);
+    tokio::task::spawn_blocking(move || Ok(cas.put(&bytes, "text/x-diff")?))
+        .await
+        .map_err(join_err)?
 }
 
 /// One linked worktree as reality reports it: canonical path plus the

@@ -83,7 +83,7 @@ fn merged(seq: u32) -> Event {
     evt(
         seq,
         "diff.merged",
-        json!({"run": "01DR049RUN000000000000R01", "worktree": WT, "diff": {"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff"}}),
+        json!({"run": "01DR049RUN000000000000R01", "worktree": WT, "diff": {"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff-summary"}}),
     )
 }
 
@@ -159,7 +159,7 @@ fn merged_sets_outcome_only_lifecycle_stays_allocated() {
     );
     assert_eq!(
         entry["last_diff"],
-        json!({"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff"}),
+        json!({"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff-summary"}),
         "the merged summary ref is retained on the entry — WHOLE since DR-057 \
          §Decision 1 widened the field from the bare hash to the full CasRef. \
          The serialized shape changed (disclosed, breaking); the assertion is \
@@ -309,7 +309,7 @@ proptest! {
                 _ => evt(
                     seq,
                     "diff.ready",
-                    json!({"worktree": WT, "diff": {"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff"}}),
+                    json!({"worktree": WT, "diff": {"hash": MERGE_HASH, "bytes": 412, "mime": "text/x-diff-summary"}}),
                 ),
             }
         };

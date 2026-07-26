@@ -411,23 +411,53 @@ pub async fn pin_agent_spec(daemon: &Arc<Daemon>, agent: &AgentSpec) -> anyhow::
     Ok(format!("cas:blake3:{}", ref_.hash))
 }
 
-/// Summarize a worktree's working-tree changes into the CAS and return the
-/// `cas:blake3:<hex>` ref — the pre_merge gate's `refs["diff"]`. The summary
-/// format matches the S2 git-adapter `diff.ready` shape: one
-/// `<status>\t<path>` line per touched file (deterministic, content-stable).
-pub async fn summarize_worktree(
-    daemon: &Arc<Daemon>,
-    worktree: &Path,
-) -> anyhow::Result<(String, rezidnt_types::refs::CasRef)> {
+/// The two blobs one pre_merge pins for one worktree state (DR-059
+/// §Decision 1): the path-status SUMMARY the gate verifies, and the REAL
+/// unified diff a human reviews. Two blobs, one tree state, produced together
+/// so the fact that carries both describes a single moment.
+pub struct DiffPins {
+    /// `cas:blake3:<hex>` of the summary — the pre_merge gate's `refs["diff"]`.
+    /// The patch is deliberately NOT in that map (DR-059 §Decision 3).
+    pub diff_ref: String,
+    /// The summary's whole ref, for the `diff` field on `diff.ready` /
+    /// `diff.merged`.
+    pub summary: rezidnt_types::refs::CasRef,
+    /// The patch's whole ref, for the `patch` field on the same facts.
+    pub patch: rezidnt_types::refs::CasRef,
+}
+
+/// Summarize a worktree's working-tree changes into the CAS and pin the real
+/// diff beside them.
+///
+/// The summary format matches the S2 git-adapter `diff.ready` shape: one
+/// `<status>\t<path>` line per touched file (deterministic, content-stable) —
+/// the shape the native verifiers parse, unchanged. Its mime is
+/// `text/x-diff-summary`, which is what those bytes are; `text/x-diff` now
+/// labels the patch blob, which is diff-formatted (DR-059 §Decision 4/5).
+pub async fn summarize_worktree(daemon: &Arc<Daemon>, worktree: &Path) -> anyhow::Result<DiffPins> {
     let summary = git_diff_summary(worktree).await?;
     let cas = Arc::clone(&daemon.cas);
     let bytes = summary.into_bytes();
-    let r = tokio::task::spawn_blocking(move || cas.put(&bytes, "text/x-diff"))
+    let r = tokio::task::spawn_blocking(move || cas.put(&bytes, "text/x-diff-summary"))
         .await
         .context("cas put task panicked")?
         .context("pin diff summary into cas")?;
     let ref_str = format!("cas:blake3:{}", r.hash);
-    Ok((ref_str, r))
+
+    let patch_bytes = rezidnt_adapter_git::patch::render_patch(worktree)
+        .await
+        .context("render the worktree's unified diff")?;
+    let cas = Arc::clone(&daemon.cas);
+    let patch = tokio::task::spawn_blocking(move || cas.put(&patch_bytes, "text/x-diff"))
+        .await
+        .context("cas put task panicked")?
+        .context("pin diff patch into cas")?;
+
+    Ok(DiffPins {
+        diff_ref: ref_str,
+        summary: r,
+        patch,
+    })
 }
 
 /// Render the deterministic diff summary for a worktree via git-CLI
@@ -603,6 +633,7 @@ pub async fn merge_worktree(
     repo: &Path,
     worktree: &Path,
     diff_ref: &rezidnt_types::refs::CasRef,
+    patch_ref: &rezidnt_types::refs::CasRef,
 ) -> anyhow::Result<Ulid> {
     // 1. Stage + commit the worktree's change onto its head (detached or a
     //    rezidnt/<agent> branch — either way it becomes a mergeable commit).
@@ -663,6 +694,9 @@ pub async fn merge_worktree(
                 "run": run,
                 "worktree": worktree.display().to_string(),
                 "diff": diff_ref,
+                // The SAME gate-time pins, re-attested on the merge fact —
+                // one product, not a re-summarize (DR-059 §Decision 1).
+                "patch": patch_ref,
             }),
         )?,
     )

@@ -2133,7 +2133,7 @@ async fn run_pre_merge(
     //    (one gate-time fact per pre_merge; every other `diff.ready` on the log
     //    carries the adapter's source) with a host-side single-site backstop in
     //    `bins/rezidentd/tests/registry_convergence_structure.rs`.
-    let (diff_ref, cas_ref) = gates::summarize_worktree(&ctx.daemon, &ctx.worktree).await?;
+    let pins = gates::summarize_worktree(&ctx.daemon, &ctx.worktree).await?;
     let diff_ready_id = publish(
         &ctx.daemon.fabric,
         Event::new(
@@ -2145,7 +2145,11 @@ async fn run_pre_merge(
             1,
             json!({
                 "worktree": ctx.worktree.display().to_string(),
-                "diff": cas_ref,
+                "diff": pins.summary,
+                // The real unified diff, pinned as a SECOND blob beside the
+                // summary it describes — what Review renders (DR-059
+                // §Decision 1). Not wired into the gate refs map below.
+                "patch": pins.patch,
             }),
         )?,
     )
@@ -2160,7 +2164,7 @@ async fn run_pre_merge(
     //    content is pinned exactly as the diff summary is at diff.ready).
     let content_ref = gates::summarize_worktree_content(&ctx.daemon, &ctx.worktree).await?;
     let refs = BTreeMap::from([
-        ("diff".to_string(), diff_ref),
+        ("diff".to_string(), pins.diff_ref),
         ("content".to_string(), content_ref),
     ]);
     let verifiers = gates::resolve_verifiers(&plan.gate);
@@ -2190,7 +2194,8 @@ async fn run_pre_merge(
             &run_str,
             &plan.repo,
             &ctx.worktree,
-            &cas_ref,
+            &pins.summary,
+            &pins.patch,
         )
         .await?;
 

@@ -107,7 +107,7 @@ async fn the_badge_required_message_is_true_of_a_read_tool_and_a_mutating_one() 
         json!({
             "hash": "aa11bb22cc33dd44ee55ff660718293a4b5c6d7e8f90a1b2c3d4e5f607182930",
             "bytes": 21,
-            "mime": "text/x-diff",
+            "mime": "text/x-diff-summary",
         }),
     )
     .await;

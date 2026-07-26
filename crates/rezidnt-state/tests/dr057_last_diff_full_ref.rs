@@ -109,7 +109,7 @@ fn diff_merged(seq: u32, r: &CasRef) -> Event {
 /// defect DR-057 §Decision 1 retires.
 #[test]
 fn diff_ready_folds_the_full_cas_ref_verbatim() {
-    let want = cas_ref(HASH_A, 21, "text/x-diff");
+    let want = cas_ref(HASH_A, 21, "text/x-diff-summary");
     let graph = fold([allocated(1), diff_ready(2, &want)].iter());
     let wt = graph.worktrees.get(WT).expect("worktree entry exists");
     assert_eq!(
@@ -125,7 +125,7 @@ fn diff_ready_folds_the_full_cas_ref_verbatim() {
 /// retain the triple exactly as `diff.ready` does, alongside its outcome write.
 #[test]
 fn diff_merged_folds_the_full_cas_ref_and_the_outcome() {
-    let want = cas_ref(HASH_B, 34, "text/x-diff");
+    let want = cas_ref(HASH_B, 34, "text/x-diff-summary");
     let graph = fold([allocated(1), diff_merged(2, &want)].iter());
     let wt = graph.worktrees.get(WT).expect("worktree entry exists");
     assert_eq!(wt.outcome.as_deref(), Some("merged"));
@@ -142,7 +142,7 @@ fn diff_merged_folds_the_full_cas_ref_and_the_outcome() {
 /// carry.
 #[test]
 fn a_later_diff_overwrites_the_whole_ref_never_a_splice() {
-    let first = cas_ref(HASH_A, 21, "text/x-diff");
+    let first = cas_ref(HASH_A, 21, "text/x-diff-summary");
     let second = cas_ref(HASH_B, 34, "text/plain");
     let graph = fold([allocated(1), diff_ready(2, &first), diff_ready(3, &second)].iter());
     let wt = graph.worktrees.get(WT).expect("worktree entry exists");
@@ -176,13 +176,13 @@ fn no_diff_fact_means_none_never_a_fabricated_default() {
 /// fold breaks rebuild equality).
 #[test]
 fn serialized_worktree_state_carries_all_three_fields() {
-    let want = cas_ref(HASH_A, 21, "text/x-diff");
+    let want = cas_ref(HASH_A, 21, "text/x-diff-summary");
     let graph = fold([allocated(1), diff_ready(2, &want)].iter());
     let wt = graph.worktrees.get(WT).expect("worktree entry exists");
     let entry = serde_json::to_value(wt).expect("worktree state serializes");
     assert_eq!(entry["last_diff"]["hash"], json!(HASH_A));
     assert_eq!(entry["last_diff"]["bytes"], json!(21));
-    assert_eq!(entry["last_diff"]["mime"], json!("text/x-diff"));
+    assert_eq!(entry["last_diff"]["mime"], json!("text/x-diff-summary"));
 }
 
 /// The standing fold properties hold over the widened field: applying events
@@ -191,7 +191,7 @@ fn serialized_worktree_state_carries_all_three_fields() {
 /// is a reducer bug and a release blocker (doc §6).
 #[test]
 fn incremental_apply_and_serde_round_trip_preserve_the_ref() {
-    let first = cas_ref(HASH_A, 21, "text/x-diff");
+    let first = cas_ref(HASH_A, 21, "text/x-diff-summary");
     let second = cas_ref(HASH_B, 34, "text/plain");
     let events = [
         allocated(1),
@@ -241,12 +241,12 @@ enum DiffOp {
 /// coincidence (every hash pairs with unique bytes/mime).
 fn ref_pool() -> Vec<CasRef> {
     vec![
-        cas_ref(HASH_A, 21, "text/x-diff"),
+        cas_ref(HASH_A, 21, "text/x-diff-summary"),
         cas_ref(HASH_B, 34, "text/plain"),
         cas_ref(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             4096,
-            "text/x-diff",
+            "text/x-diff-summary",
         ),
     ]
 }

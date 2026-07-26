@@ -351,7 +351,7 @@ fn missing_content_blob_is_inconclusive_not_pass() {
 fn diff_summary_only_input_is_inconclusive_never_pass() {
     // The path-status summary format the OTHER natives read — deliberately fed
     // under "diff", with NO "content" ref present.
-    let (_dir, cas, summary) = cas_with(b"A\tsrc/config/aws.rs\n", "text/x-diff");
+    let (_dir, cas, summary) = cas_with(b"A\tsrc/config/aws.rs\n", "text/x-diff-summary");
     let input = VerifierInput {
         gate: "pre_merge".to_string(),
         workspace: None,

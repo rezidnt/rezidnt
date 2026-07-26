@@ -740,6 +740,9 @@ impl AgentRunState {
 ///   WHOLE `{hash, bytes, mime}` ref (DR-057 §Decision 1) — on the entry keyed
 ///   by `worktree`. A `diff` that does not parse as a full ref folds NOTHING on
 ///   that field: the reducer never part-fills a ref it was not given (I3).
+///   The optional sibling `patch: CasRef` (DR-059) is ASSIGNED alongside —
+///   `Some` when the fact carries one, `None` when it does not, so the pair
+///   `last_diff`/`last_patch` always describes one fact;
 ///
 /// S4 addition (pinned by `tests/s4_gates.rs` and the `s4_verified_run`
 /// fixture; `diff.merged` is ratified in `spec/ontology.md` at `v = 1`):
@@ -812,6 +815,27 @@ pub struct WorktreeState {
     /// two fields are gained). [`WorktreeRow::last_diff`] deliberately does NOT
     /// widen — `board_view`'s response shape is untouched (DR-039 unamended).
     pub last_diff: Option<CasRef>,
+    /// The REAL `git diff` unified-format ref that rode beside
+    /// [`last_diff`](Self::last_diff) on the same fact, WHOLE — `{hash, bytes,
+    /// mime}` (DR-059 §Decision 1, `spec/ontology.md` `diff.ready`/
+    /// `diff.merged` `patch?`). Carried VERBATIM; the reducer parses nothing.
+    ///
+    /// ABSENT is honest and means exactly one thing: the LATEST diff-bearing
+    /// fact for this tree carried no patch — a log predating the field, or an
+    /// emitter that could not render one. Never a `Default`-fabricated ref.
+    ///
+    /// PAIRED, not accumulated: a later patch-less fact CLEARS this field
+    /// rather than leaving an older patch to be served beside a newer summary
+    /// it does not describe. The two refs travel together or not at all.
+    ///
+    /// ADDITIVE on the serialized axis, deliberately — `#[serde(default,
+    /// skip_serializing_if)]`, the [`outcome`](Self::outcome) pattern: a
+    /// serialized entry written before this field parses to `None`, and a
+    /// patch-less entry serializes without the key. A bare `Option` (the shape
+    /// [`last_diff`](Self::last_diff) landed with) would instead make every
+    /// committed worktree-bearing golden fail to PARSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_patch: Option<CasRef>,
 }
 
 /// The entity graph. `BTreeMap` everywhere so equality and serialization
@@ -990,11 +1014,12 @@ pub fn apply(graph: &mut Graph, event: &Event) {
             if let Some(path) = event.payload()["worktree"].as_str()
                 && let Some(diff) = payload_cas_ref(event)
             {
-                graph
-                    .worktrees
-                    .entry(path.to_string())
-                    .or_default()
-                    .last_diff = Some(diff);
+                let wt = graph.worktrees.entry(path.to_string()).or_default();
+                wt.last_diff = Some(diff);
+                // Assigned, never merged: the patch describes the summary it
+                // arrived with, so a patch-less fact clears any older one
+                // (DR-059; see `WorktreeState::last_patch`).
+                wt.last_patch = payload_patch_ref(event);
             }
         }
         "diff.merged" => {
@@ -1011,6 +1036,7 @@ pub fn apply(graph: &mut Graph, event: &Event) {
                 if let Some(diff) = payload_cas_ref(event) {
                     wt.last_diff = Some(diff);
                 }
+                wt.last_patch = payload_patch_ref(event);
             }
         }
         // S4 gate reducers, keyed under `AgentRunState::gates` by the payload
@@ -1537,6 +1563,14 @@ fn payload_path(event: &Event) -> Option<String> {
 /// invention (I3).
 fn payload_cas_ref(event: &Event) -> Option<CasRef> {
     serde_json::from_value(event.payload()["diff"].clone()).ok()
+}
+
+/// The optional `patch` ref a `diff.ready` / `diff.merged` payload may carry
+/// (DR-059 §Decision 1). Same all-or-nothing rule as [`payload_cas_ref`]: a
+/// missing key, or a half-shaped object, yields `None` — an absent patch is a
+/// fact about the log, never a ref the reducer part-fills.
+fn payload_patch_ref(event: &Event) -> Option<CasRef> {
+    serde_json::from_value(event.payload()["patch"].clone()).ok()
 }
 
 /// The `gate` key every `gate.*` payload carries (ontology v1 baselines).

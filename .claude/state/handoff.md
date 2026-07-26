@@ -89,6 +89,33 @@ twice. Back-pointers into *other* records still wait for acceptance — that par
 another module's behaviour, or citing `file:line`, must be pinned by a source-text guard proven red by
 deletion, or not written.
 
+## ► BATCHED CLEANUP — `cas-badge-door`'s final /debrief FAILed and the slice SHIPPED ANYWAY
+
+**This is a deliberate departure from "done = both gates pass," made under the loop policy above, and it needs
+the owner's ratification if it becomes standing practice.** The final `/debrief` returned FAIL with five
+findings. **All five are prose; ZERO change runtime behaviour.** F1 (the restored mutation proof), F3 (the
+honest `InvalidAddress` arm), F4's core, and the new fact-bearing test all HOLD — the auditor verified every
+mutation leg by tracing the code path rather than trusting the report. The security work is intact.
+
+Fix these together in one cleanup pass; none blocks anything:
+
+1. `crates/rezidnt-mcp/src/lib.rs` — the `// No echo of the argument.` comment above the `Internal` arm in
+   `read_bounded`. `format!("resolve blob path: {e}")` interpolates `rezidnt_cas::CasError`'s Display, and
+   `NotFound { hash }` renders the hash — so "no echo" is a claim about another crate, true only because the
+   arm is unreachable. State what the line guarantees, or drop the absolute.
+2. `crates/rezidnt-cas/tests/dr058_path_for_address_guard.rs` — the board header calls its own fragile leg
+   unpinnable; it is already pinned by `path_for_refuses_every_non_address_with_invalid_address`. Cite the
+   judge. Zero test code.
+3. Relabel the other two "unpinnable" items **"behaviourally unpinnable, deliberately unpinned by source
+   text"** — both ARE source-text pinnable by the instrument this slice built (~8 lines). One of three
+   misclassified is the answer to "is that category growing": yes, watch it.
+4. `crates/rezidnt-gate/tests/dr058_invalid_ref_honesty.rs` header — two `file:line` citations drifted when
+   this slice's own doc paragraphs pushed the targets down. **Strip line numbers, keep file+symbol** (the
+   warden's anchor discipline, at the bottom of this file, already says so).
+5. `crates/rezidnt-mcp/tests/badge_enforcement.rs` — the badge-message pin is a one-word blacklist on
+   "mutating"; "write tools require a badge" would pass while being false to a refused `cas_read` caller. The
+   doc asserts the general property; say what is actually pinned.
+
 ## ► OPEN, none blocking
 
 - **DR-053 is still PROPOSED** since 2026-07-25, back-pointers correctly withheld. Last unresolved record

@@ -88,10 +88,18 @@ pub mod codes {
     /// peers tolerate an unknown refusal code (the `scope.requires_ttl`
     /// precedent, I5).
     pub const WORKTREE_CONFLICT: &str = "worktree.conflict";
-    /// DR-049 §Decision 3 — `release_worktree` named a path this daemon holds
-    /// no live allocation for: never allocated here, already released, or
-    /// allocated before a restart (the daemon's allocation handle table is
-    /// process-lifetime, disclosed on `Daemon::allocations`).
+    /// A worktree path the daemon cannot answer for. TWO emitters, both by
+    /// ruling (DR-058 §Decision 5(ii) widened this doc to cover the second):
+    ///
+    /// - `release_worktree` (DR-049 §Decision 3) — named a path this daemon
+    ///   holds no live allocation for: never allocated here, already released,
+    ///   or allocated before a restart (the daemon's allocation handle table is
+    ///   process-lifetime, disclosed on `Daemon::allocations`).
+    /// - `diff_view` (DR-057 §Decision 1/3) — named a worktree path the LOG
+    ///   does not know, so the fold holds no row to serve. Honest absence, not
+    ///   an empty row; the code is reused rather than a second name minted for
+    ///   the same fact, since "this daemon cannot answer for that tree" is one
+    ///   condition with two doors.
     ///
     /// Distinct from a silent success on purpose. "Nothing was released" and
     /// "released" are different outcomes, and answering the first with the
@@ -225,22 +233,29 @@ pub const CAS_ADDRESS_HEX_LEN: usize = 64;
 /// Is this string a CAS ADDRESS — exactly [`CAS_ADDRESS_HEX_LEN`] LOWERCASE hex
 /// characters?
 ///
-/// A SECURITY BOUNDARY, not hygiene. [`rezidnt_cas::Cas::path_for`] is
-/// `root.join(hash)`, and `PathBuf::join` REPLACES the root on an absolute
-/// component and normalizes no `..` — so an unvalidated `hash` is an arbitrary
-/// path, and `cas_read` is unbadged. Without this gate a caller with no badge at
-/// all could aim the tool at any path the daemon can read and harvest three
-/// facts from the refusals alone: EXISTENCE (`cas.not_found` vs anything else),
-/// EXACT BYTE SIZE (`blob is {actual} bytes`), and — measured by the mutation
-/// probe on `tests/dr057_cas_address_guard.rs`, a leg stronger than the audit
-/// finding named — the BLAKE3 OF THE FILE'S CONTENT, which `cas.corrupt` prints
-/// as `the stored bytes hash to {actual}`. That last one degrades a metadata
-/// oracle into a content oracle for any file whose content a caller can guess
-/// and confirm. The bytes themselves stayed unserved only incidentally, because
+/// A SECURITY BOUNDARY, not hygiene. An unvalidated `hash` reaches a path join,
+/// so without this gate a caller could aim the tool at any path the daemon can
+/// read and harvest three facts from the refusals alone: EXISTENCE
+/// (`cas.not_found` vs anything else), EXACT BYTE SIZE (`blob is {actual}
+/// bytes`), and — measured by the mutation probe on
+/// `tests/dr057_cas_address_guard.rs`, a leg stronger than the audit finding
+/// named — the BLAKE3 OF THE FILE'S CONTENT, which `cas.corrupt` prints as `the
+/// stored bytes hash to {actual}`. That last one degrades a metadata oracle into
+/// a content oracle for any file whose content a caller can guess and confirm.
+/// The bytes themselves stayed unserved only incidentally, because
 /// [`rezidnt_cas::Cas::get`] re-hashes before returning. All of it is exactly
 /// the local-disk backchannel DR-038 §Decision 4 forecloses, so the shape is
 /// checked BEFORE the first syscall ([`read_bounded`]) rather than relied on
 /// from the schema's prose.
+///
+/// DEFENCE IN DEPTH, deliberately (DR-058 §Decision 4). The store now enforces
+/// the same rule at its own boundary ([`rezidnt_cas::Cas::path_for`], which
+/// refuses a non-address before joining anything), and this check is KEPT
+/// rather than retired: retiring an already-tested check in favour of one that
+/// duplicates it is pure regression. The two layers refuse INDEPENDENTLY —
+/// proven by deleting this call and confirming the store layer still refuses
+/// (see [`read_bounded`]'s `InvalidAddress` arm, which exists for exactly that
+/// reason and is not dead code).
 ///
 /// LOWERCASE only, deliberately narrow: `Cas::put` emits lowercase, so a
 /// lowercase-only rule admits every address this daemon can actually hold.
@@ -260,10 +275,19 @@ fn is_cas_address(hash: &str) -> bool {
 /// therefore cannot tell "invalid shape" from any other, and cannot tell either
 /// from what is on disk: the answer is a pure function of the argument it
 /// already holds.
-const CAS_HASH_INVALID_MESSAGE: &str = "hash is not a CAS address: cas_read addresses blobs by \
-     exactly 64 lowercase blake3 hex characters. Refused on the argument's SHAPE, before any \
-     lookup — this answer is a function of the argument alone and reports nothing about this \
-     daemon's store";
+///
+/// A FUNCTION, not a `const &str` (DR-058 §Decision 5(i)): the length it states
+/// must RENDER [`CAS_ADDRESS_HEX_LEN`] rather than hardcode a literal, and a
+/// `const` cannot interpolate. Still a pure function of no inputs, so
+/// byte-identity across rejected shapes is unchanged.
+fn cas_hash_invalid_message() -> String {
+    format!(
+        "hash is not a CAS address: cas_read addresses blobs by exactly \
+         {CAS_ADDRESS_HEX_LEN} lowercase blake3 hex characters. Refused on the argument's SHAPE, \
+         before any lookup — this answer is a function of the argument alone and reports nothing \
+         about this daemon's store"
+    )
+}
 
 /// MCP protocol version this server speaks (DEFAULT: the current spec rev).
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -2242,11 +2266,27 @@ impl McpCore {
     }
 
     /// `cas_read` — DR-057 §Decision 2/4: resolve ONE `CasRef` to its text
-    /// content, bounded, from THIS daemon's CAS. Read class, unbadged, same tier
-    /// as `diff_view`. Reads the wired store only ([`McpCore::with_cas`], which
-    /// the daemon already wires) — never the ephemeral permit fallback, which
-    /// holds no diff any operator ever wants and would answer `cas.not_found` for
-    /// every real one.
+    /// content, bounded, from THIS daemon's CAS. Reads the wired store only
+    /// ([`McpCore::with_cas`], which the daemon already wires) — never the
+    /// ephemeral permit fallback, which holds no diff any operator ever wants
+    /// and would answer `cas.not_found` for every real one.
+    ///
+    /// BADGED (DR-058 §Decision 2), alone in the read family: `diff_view`,
+    /// `board_view`, `tail_events` and `get_escalations` return structural
+    /// facts and stay unbadged, while this tool returns blob CONTENT — the doc
+    /// §12 line. The door is the standard dual path ([`Self::check_badge`]:
+    /// admitted operator token OR verified agent macaroon), and it runs FIRST:
+    /// before the mime check, before the substrate check, before any filesystem
+    /// call. A badgeless caller therefore cannot distinguish an existing blob
+    /// from an absent, over-bound, corrupt, non-text or malformed one, nor a
+    /// store-less core from a wired one — every refusal is byte-identical.
+    ///
+    /// ORDER GOTCHA, load-bearing: the door reads the badge off the RAW args,
+    /// BEFORE `serde_json::from_value`. With `badge` required by serde, parsing
+    /// first would answer a badgeless call `-32602` from a failed deserialize
+    /// instead of `badge.required` — rebuilding the very metadata oracle the
+    /// door exists to close, through a parse error. Every other badged tool on
+    /// this surface inspects raw args the same way, for the same reason.
     ///
     /// REFUSES, NEVER CHOPS. Over-bound content is refused WHOLE and bytes-free:
     /// no prefix, no partial, not even inside the refusal payload. `truncated` is
@@ -2281,10 +2321,18 @@ impl McpCore {
     /// `text/plain` over a binary blob buys nothing. Nothing is ever served
     /// through `from_utf8_lossy`.
     ///
-    /// The `hash` is a caller-controlled path component and this tool is
-    /// UNBADGED, so its shape is a security gate, enforced in [`read_bounded`]
-    /// before the first syscall ([`is_cas_address`], [`codes::CAS_HASH_INVALID`]).
+    /// The `hash` is a caller-controlled path component, so its shape is a
+    /// security gate, enforced in [`read_bounded`] before the first syscall
+    /// ([`is_cas_address`], [`codes::CAS_HASH_INVALID`]) and again by the store
+    /// itself ([`rezidnt_cas::Cas::path_for`]) — two independent layers, the
+    /// badge door in front of both.
     async fn call_cas_read(&self, args: Value) -> RpcOutcome {
+        // The door FIRST, on the RAW args — see the ORDER GOTCHA above. Nothing
+        // about the store, the blob or even the argument shape is reachable
+        // until it admits.
+        if let Err(refusal) = self.check_badge(&args, "read") {
+            return Ok(refusal);
+        }
         let parsed: rezidnt_types::mcp::CasReadArgs =
             serde_json::from_value(args).map_err(|e| (-32602, format!("cas_read args: {e}")))?;
         if !is_text_mime(&parsed.mime) {
@@ -2503,7 +2551,7 @@ fn tools_list() -> RpcOutcome {
             },
             {
                 "name": "cas_read",
-                "description": "Resolve one CasRef to its text content, bounded. Arguments are the full ref triple {hash, bytes, mime} exactly as diff_view served it. Returns {content, bytes_returned, truncated}; v1 serves whole blobs only, so truncated is always false. Content larger than the read bound is REFUSED whole (cas.too_large), never truncated — the bound is judged against the stored blob, not the claimed bytes. v1 serves text/* only: a non-text mime is refused cas.not_text, a text-claimed blob that is not valid UTF-8 cas.not_utf8, a missing blob cas.not_found, and a blob that fails its own hash cas.corrupt. Read-class, no badge (DR-057).",
+                "description": "Resolve one CasRef to its text content, bounded. BADGE REQUIRED (operator token or agent macaroon): this is the one read tool that returns blob CONTENT rather than structural facts, so it sits behind the same door as the mutating tools (DR-058); the badge is checked before the mime check and before any filesystem call, and a badgeless call is refused badge.required identically whatever the blob's state. Arguments are the full ref triple {hash, bytes, mime} exactly as diff_view served it, plus the badge. Returns {content, bytes_returned, truncated}; v1 serves whole blobs only, so truncated is always false. Content larger than the read bound is REFUSED whole (cas.too_large), never truncated — the bound is judged against the stored blob, not the claimed bytes. v1 serves text/* only: a non-text mime is refused cas.not_text, a text-claimed blob that is not valid UTF-8 cas.not_utf8, a missing blob cas.not_found, and a blob that fails its own hash cas.corrupt.",
                 "inputSchema": schema(schemars::schema_for!(rezidnt_types::mcp::CasReadArgs))?,
             },
             {
@@ -2558,12 +2606,14 @@ enum CasReadOutcome {
 /// Blocking (filesystem); called only from `spawn_blocking`. Order is chosen so
 /// each refusal names the FIRST thing actually wrong:
 ///
-/// 0. the ADDRESS SHAPE ([`is_cas_address`]) — before any syscall, because
-///    `Cas::path_for` is a bare `root.join(hash)` and an unchecked `hash` is an
-///    arbitrary path on an UNBADGED tool. The guard lives here, immediately in
+/// 0. the ADDRESS SHAPE ([`is_cas_address`]) — before any syscall, because an
+///    unchecked `hash` reaches a path join. The guard lives here, immediately in
 ///    front of the syscalls it protects rather than up in [`McpCore::call_cas_read`],
-///    so no future caller of this function can route around it. One door, not
-///    defence-in-depth;
+///    so no future caller of this function can route around it. DEFENCE IN
+///    DEPTH since DR-058 §Decision 4: the store enforces the same rule at its
+///    own boundary, and every `path_for`/`get` call below maps its
+///    `InvalidAddress` to this same refusal — so deleting the check above leaves
+///    the tool refusing, one layer down, with the identical answer;
 /// 1. size of the blob AS STORED, before anything is read into memory — so an
 ///    over-bound blob is never even materialized, let alone partially served;
 /// 2. read + hash-verify through [`Cas::get`], the store's own door, which
@@ -2574,12 +2624,19 @@ enum CasReadOutcome {
 /// 4. UTF-8 decode, whole or not at all.
 fn read_bounded(cas: &Cas, addressed: &rezidnt_types::refs::CasRef) -> CasReadOutcome {
     if !is_cas_address(&addressed.hash) {
-        return CasReadOutcome::Refused(
-            codes::CAS_HASH_INVALID,
-            CAS_HASH_INVALID_MESSAGE.to_string(),
-        );
+        return CasReadOutcome::Refused(codes::CAS_HASH_INVALID, cas_hash_invalid_message());
     }
-    let stored = match std::fs::metadata(cas.path_for(&addressed.hash)) {
+    // The store's own guard, second layer (DR-058 §Decision 4). Reachable only
+    // if the check above is bypassed, which is exactly the independence the
+    // mutation probe proves — so it refuses with the SAME code and the SAME
+    // message rather than a differently-shaped answer.
+    let blob = match cas.path_for(&addressed.hash) {
+        Ok(path) => path,
+        Err(_) => {
+            return CasReadOutcome::Refused(codes::CAS_HASH_INVALID, cas_hash_invalid_message());
+        }
+    };
+    let stored = match std::fs::metadata(&blob) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return CasReadOutcome::Refused(
@@ -2610,6 +2667,9 @@ fn read_bounded(cas: &Cas, addressed: &rezidnt_types::refs::CasRef) -> CasReadOu
                      Content that fails its own address is served to nobody"
                 ),
             );
+        }
+        Err(rezidnt_cas::CasError::InvalidAddress { .. }) => {
+            return CasReadOutcome::Refused(codes::CAS_HASH_INVALID, cas_hash_invalid_message());
         }
         Err(rezidnt_cas::CasError::Io(e)) => {
             return CasReadOutcome::Internal(format!("read blob {}: {e}", addressed.hash));

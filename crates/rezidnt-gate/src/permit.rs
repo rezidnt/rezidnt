@@ -388,18 +388,29 @@ pub struct PermitOutcome {
 /// format is not recorded — never a fabricated `text/plain` claim).
 ///
 /// Returns `None` when there is no evidence, the evidence carries no ref, the
-/// ref is not a `cas:blake3:` ref, or the blob cannot be `stat`ed (a missing
-/// blob is not an error here — it just means no honest metadata to pin, so the
-/// emit site omits the ref rather than assert a fabricated one).
+/// ref is not a `cas:blake3:` ref, the hash part is not a CAS ADDRESS, or the
+/// blob cannot be `stat`ed (a missing blob is not an error here — it just means
+/// no honest metadata to pin, so the emit site omits the ref rather than assert
+/// a fabricated one).
+///
+/// The address check is the crate guard's (DR-058 §Decision 4), and it is
+/// load-bearing rather than hygiene: this `Evidence` is deserialized from an
+/// exec verifier's STDOUT, so before the guard a subprocess could name
+/// `cas:blake3:../<file>` and have an unrelated file's size pinned as the
+/// `bytes` of a durable permit-decision fact — an evidence ref addressing
+/// nothing in the store, which `gate_explain`/`debrief` would then try to
+/// resolve. An invalid address maps exactly like an unstat-able blob: `None`,
+/// no ref pinned, never a fabricated one (I6).
 fn honest_evidence_ref(evidence: &[Evidence], cas: &Cas) -> Option<CasRef> {
     let hash = evidence
         .first()
         .and_then(|e| e.cas_ref.as_deref())
         .and_then(|r| r.strip_prefix("cas:blake3:"))?;
     // `stat` the content-addressed blob for its TRUE size — metadata only, the
-    // bytes never leave the store (I2). A blob the store cannot stat yields no
-    // honest ref (None), never a fabricated one.
-    let bytes = std::fs::metadata(cas.path_for(hash)).ok()?.len();
+    // bytes never leave the store (I2). A non-address (no path is ever joined)
+    // and a blob the store cannot stat both yield no honest ref (None), never
+    // a fabricated one.
+    let bytes = std::fs::metadata(cas.path_for(hash).ok()?).ok()?.len();
     Some(CasRef {
         hash: hash.to_string(),
         bytes,

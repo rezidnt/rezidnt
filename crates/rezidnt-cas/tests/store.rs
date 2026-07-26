@@ -57,7 +57,10 @@ fn get_round_trips_content() {
 fn corrupted_blob_detected_on_get() {
     let (_dir, cas) = temp_store();
     let r = cas.put(b"pristine content", "text/plain").expect("put");
-    std::fs::write(cas.path_for(&r.hash), b"tampered!").expect("tamper blob on disk");
+    let blob = cas
+        .path_for(&r.hash)
+        .expect("put's own hash is a valid address");
+    std::fs::write(blob, b"tampered!").expect("tamper blob on disk");
     match cas.get(&r) {
         Err(CasError::Corrupt { addressed, actual }) => {
             assert_eq!(addressed, r.hash);

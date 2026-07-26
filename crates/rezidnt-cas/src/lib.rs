@@ -8,6 +8,21 @@ use std::path::{Path, PathBuf};
 
 use rezidnt_types::refs::CasRef;
 
+/// Length of a CAS address in hex characters: blake3 is 32 bytes, so 64.
+/// [`Cas::put`] returns exactly this shape and nothing else addresses a blob.
+const ADDRESS_HEX_LEN: usize = 64;
+
+/// Is this string a CAS ADDRESS — exactly [`ADDRESS_HEX_LEN`] LOWERCASE hex
+/// characters?
+///
+/// LOWERCASE only, deliberately narrow: [`Cas::put`] emits lowercase, so a
+/// lowercase-only rule admits every address this store can actually hold.
+/// Accepting uppercase would admit a string addressing nothing on a
+/// case-sensitive filesystem and a DIFFERENT-cased duplicate on Windows.
+fn is_address(hash: &str) -> bool {
+    hash.len() == ADDRESS_HEX_LEN && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Errors for store operations (thiserror per lib convention).
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
@@ -17,6 +32,16 @@ pub enum CasError {
     NotFound { hash: String },
     #[error("blob corrupt: addressed {addressed}, content hashes to {actual}")]
     Corrupt { addressed: String, actual: String },
+    /// DR-058 §Decision 4 — the argument is not a CAS ADDRESS, so no path was
+    /// ever joined and nothing on disk was touched. Deliberately DISTINCT from
+    /// [`CasError::NotFound`]: that one says the store LOOKED and did not find,
+    /// which would be false here and would misstate why (I6).
+    ///
+    /// The message carries NO echo of the offending string and no fact about
+    /// the store — the verdict is a pure function of the argument the caller
+    /// already holds, so every rejected shape is refused identically.
+    #[error("not a CAS address: expected exactly {expected} lowercase hex characters")]
+    InvalidAddress { expected: usize },
 }
 
 /// A content-addressed store rooted at one directory.
@@ -47,8 +72,11 @@ impl Cas {
         // cross-process writers sharing a root.
         static PUT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+        // blake3 hex IS an address by construction, so the guard admits it;
+        // `?` rather than an unreachable! keeps the invariant stated in one
+        // place (the guard) instead of asserted twice.
         let hash = blake3::hash(bytes).to_hex().to_string();
-        let dest = self.path_for(&hash);
+        let dest = self.path_for(&hash)?;
         if !dest.exists() {
             let n = PUT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = self
@@ -74,8 +102,13 @@ impl Cas {
 
     /// Fetch a blob and verify its content against the addressed hash —
     /// corruption is an error, never silently returned data.
+    ///
+    /// Inherits [`Cas::path_for`]'s address guard: a `hash` that is not an
+    /// address is [`CasError::InvalidAddress`] with no filesystem access at
+    /// all — never `NotFound` (which would claim the store looked) and never
+    /// `Corrupt` (which would prove it read something).
     pub fn get(&self, r: &CasRef) -> Result<Vec<u8>, CasError> {
-        let path = self.path_for(&r.hash);
+        let path = self.path_for(&r.hash)?;
         let content = match std::fs::read(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -95,9 +128,26 @@ impl Cas {
         Ok(content)
     }
 
-    /// Filesystem path a hash resolves to (`<root>/<hex>`).
-    pub fn path_for(&self, hash: &str) -> PathBuf {
-        self.root.join(hash)
+    /// Filesystem path a hash resolves to (`<root>/<hex>`), or
+    /// [`CasError::InvalidAddress`] if the argument is not an address.
+    ///
+    /// THE CRATE-LEVEL GUARD (DR-058 §Decision 4). `PathBuf::join` REPLACES
+    /// the root on an absolute component and normalizes no `..`, so an
+    /// unvalidated string joined here is an arbitrary host path. The shape is
+    /// therefore checked BEFORE the join — the refusal is a pure function of
+    /// the argument, decidable without touching the filesystem, so no caller
+    /// can turn this into an existence oracle.
+    ///
+    /// Callers reaching this with data they did not mint (a caller's argument,
+    /// a subprocess's stdout) must map [`CasError::InvalidAddress`] the way
+    /// they already map [`CasError::NotFound`]: can't-run, never a decision.
+    pub fn path_for(&self, hash: &str) -> Result<PathBuf, CasError> {
+        if !is_address(hash) {
+            return Err(CasError::InvalidAddress {
+                expected: ADDRESS_HEX_LEN,
+            });
+        }
+        Ok(self.root.join(hash))
     }
 
     pub fn root(&self) -> &Path {

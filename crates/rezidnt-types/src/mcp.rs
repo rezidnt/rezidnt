@@ -339,7 +339,15 @@ pub struct DiffViewArgs {
 }
 
 /// `cas_read` — DR-057 §Decision 2: resolve ONE `CasRef` to its text content,
-/// bounded. Read-only, idempotent, no badge — same read class as `diff_view`.
+/// bounded. Read-only and idempotent, but BADGED (DR-058 §Decision 2): this is
+/// the one tool in the read family that hands back blob CONTENT rather than
+/// structural facts, and content is what the doc §12 door gates everywhere else
+/// on this surface. `diff_view`/`board_view`/`tail_events`/`get_escalations`
+/// are UNCHANGED and stay unbadged.
+///
+/// The badge is a DECLARED field, not door-level folklore, because the §9
+/// schema is the contract (I5): a door invisible to the schema is one a
+/// schema-only client discovers only by being refused.
 ///
 /// The args ARE the ref triple, all three required: the caller presents its own
 /// ref (the value `diff_view` served, verbatim) and the daemon echoes and
@@ -360,10 +368,16 @@ pub struct DiffViewArgs {
 /// the wire for the reason given on [`DiffViewArgs`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CasReadArgs {
+    /// Operator badge token (hex) or agent macaroon, doc §12 / DR-058
+    /// §Decision 2. Checked BEFORE the mime check and before any filesystem
+    /// call, so a refused caller learns nothing about the store. Never logged —
+    /// the verified id is loggable, the token never (§12/I2).
+    pub badge: String,
     /// Lowercase blake3 hex, exactly 64 characters — the blob's address, and the
     /// only field the daemon can verify content against. ENFORCED, not merely
-    /// documented: anything else is refused `cas.hash_invalid` on shape, before
-    /// any lookup (`rezidnt_mcp::is_cas_address`).
+    /// documented: anything that is not 64 lowercase hex characters is refused
+    /// `cas.hash_invalid` on shape alone, before any lookup, so the refusal
+    /// reports nothing about this daemon's store.
     pub hash: String,
     /// The caller's claimed blob length. Advisory: never used to authorize or
     /// to bound the read (a claim that could widen the bound would be a

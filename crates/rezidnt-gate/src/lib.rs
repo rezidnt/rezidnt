@@ -199,6 +199,15 @@ pub trait NativeVerifier {
 /// can't-run signal (`Ok(None)`), never an engine error — the caller maps it
 /// to `inconclusive` (I6 honesty). A malformed ref string is likewise a
 /// can't-run.
+///
+/// DR-058 §Decision 4: a ref whose hash part is not a CAS ADDRESS
+/// ([`rezidnt_cas::CasError::InvalidAddress`], raised by the crate guard
+/// before any syscall) maps EXACTLY like an absent blob. Ref strings arrive
+/// from data this engine did not mint — an exec verifier's stdout among them —
+/// so an unresolvable one must not error the engine and must not decide: the
+/// verifier says "I could not run" and the caller's `cannot_run` carries why.
+/// Coercing it toward a verdict in either direction would decide on evidence
+/// that was never read (I6).
 fn resolve_ref(cas: &Cas, ref_str: &str) -> Result<Option<Vec<u8>>, GateError> {
     let Some(hash) = ref_str.strip_prefix("cas:blake3:") else {
         return Ok(None);
@@ -210,7 +219,9 @@ fn resolve_ref(cas: &Cas, ref_str: &str) -> Result<Option<Vec<u8>>, GateError> {
     };
     match cas.get(&want) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(rezidnt_cas::CasError::NotFound { .. }) => Ok(None),
+        Err(
+            rezidnt_cas::CasError::NotFound { .. } | rezidnt_cas::CasError::InvalidAddress { .. },
+        ) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }

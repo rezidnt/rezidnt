@@ -3,7 +3,7 @@
 # Decision Record DR-057 — `diff_view` + `cas_read`: the read-only MCP surface that closes Review
 
 **Date:** 2026-07-26
-**Status:** PROPOSED.
+**Status:** ACCEPTED (owner, 2026-07-26). Both gates passed on its slice — `/vet` green and `/debrief` PASS after one FAIL and a remediation round. Ratified WITH its own amendments already applied: §Decision 2's "text mimes only" struck as vacuous and §Decision 4's "no badge" narrowed, both by [DR-058](DR-058-cas-code-ratification-and-cas-read-badge.md), and three in-place corrections carried during drafting (the I2 narrowing, a false self-claim about the word cap, the "additive" error). Accepted as the corrected record, not the drafted one.
 **Amends:** §9 (adds two READ-class, unbadged MCP tools, no-drift generated like `board_view`/`get_escalations`). Reaffirms — does not touch — I1, I5, I6. **Rules NOTHING about I2's scope** (see Context; an earlier draft did, and was narrowed). Mints NO ontology subject or field. Adds a §20 index row.
 
 ## Context

@@ -23,7 +23,8 @@
 //!   (doc §9 no-drift rule).
 //! - resources: `rezidnt://run/<ulid>/dossier` — the run's folded dossier
 //!   state (I3: derived from the log, never a side store).
-//! - badges (doc §12): mutating tools are refused with a machine-readable
+//! - badges (doc §12): a tool behind the badge door — every mutating tool, plus
+//!   `cas_read` since DR-058 §Decision 2 — is refused with a machine-readable
 //!   code BEFORE any side effect when the badge is missing or unknown.
 //! - tool errors ride the MCP result shape: `isError: true` and
 //!   `content[0].text` parsing as JSON `{"code": "...", ...}` ([`codes`]).
@@ -48,7 +49,11 @@ use tracing::Instrument as _;
 /// Machine-readable tool/resource error codes (mirrors the socket-side
 /// `rezidnt_proto::codes` discipline: strings, additive evolution).
 pub mod codes {
-    /// A mutating tool was called with no `badge` argument.
+    /// A tool behind the doc §12 badge door was called with no `badge`
+    /// argument. TWO classes share that door: every mutating tool, and — since
+    /// DR-058 §Decision 2 — `cas_read`, the one read tool that hands back blob
+    /// CONTENT rather than structural facts. The served message must therefore
+    /// stay true of a read tool as well as a mutating one.
     pub const BADGE_REQUIRED: &str = "badge.required";
     /// The presented badge token is not one the daemon issued (or it was
     /// revoked).
@@ -233,29 +238,24 @@ pub const CAS_ADDRESS_HEX_LEN: usize = 64;
 /// Is this string a CAS ADDRESS — exactly [`CAS_ADDRESS_HEX_LEN`] LOWERCASE hex
 /// characters?
 ///
-/// A SECURITY BOUNDARY, not hygiene. An unvalidated `hash` reaches a path join,
-/// so without this gate a caller could aim the tool at any path the daemon can
-/// read and harvest three facts from the refusals alone: EXISTENCE
-/// (`cas.not_found` vs anything else), EXACT BYTE SIZE (`blob is {actual}
-/// bytes`), and — measured by the mutation probe on
-/// `tests/dr057_cas_address_guard.rs`, a leg stronger than the audit finding
-/// named — the BLAKE3 OF THE FILE'S CONTENT, which `cas.corrupt` prints as `the
-/// stored bytes hash to {actual}`. That last one degrades a metadata oracle into
-/// a content oracle for any file whose content a caller can guess and confirm.
-/// The bytes themselves stayed unserved only incidentally, because
-/// [`rezidnt_cas::Cas::get`] re-hashes before returning. All of it is exactly
-/// the local-disk backchannel DR-038 §Decision 4 forecloses, so the shape is
-/// checked BEFORE the first syscall ([`read_bounded`]) rather than relied on
-/// from the schema's prose.
+/// A SECURITY BOUNDARY, not hygiene: `hash` is a caller-controlled PATH
+/// COMPONENT. `PathBuf::join` REPLACES its root on an absolute component and
+/// normalizes no `..`, so an unvalidated `hash` reaching a join addresses an
+/// arbitrary host path, and the refusals alone then carry three facts about it.
+/// All three are readable off [`read_bounded`] below, which shapes every one of
+/// these refusals: EXISTENCE (`cas.not_found` where a present file answers
+/// otherwise), EXACT BYTE SIZE (the `cas.too_large` message states it), and the
+/// BLAKE3 OF THE CONTENT (the `cas.corrupt` message states it) — the last
+/// degrading a metadata oracle into a content oracle for any file whose content
+/// a caller can guess and confirm. That is the local-disk backchannel DR-038
+/// §Decision 4 forecloses, and it is why the shape is checked BEFORE the first
+/// syscall rather than relied on from the schema's prose.
 ///
-/// DEFENCE IN DEPTH, deliberately (DR-058 §Decision 4). The store now enforces
-/// the same rule at its own boundary ([`rezidnt_cas::Cas::path_for`], which
-/// refuses a non-address before joining anything), and this check is KEPT
-/// rather than retired: retiring an already-tested check in favour of one that
-/// duplicates it is pure regression. The two layers refuse INDEPENDENTLY —
-/// proven by deleting this call and confirming the store layer still refuses
-/// (see [`read_bounded`]'s `InvalidAddress` arm, which exists for exactly that
-/// reason and is not dead code).
+/// DEFENCE IN DEPTH, deliberately: DR-058 §Decision 4 KEPT this check when the
+/// store gained a boundary of its own, on the ground that retiring an
+/// already-tested check in favour of one that duplicates it is pure regression.
+/// What the store does with a non-address is the store's own story: see
+/// [`rezidnt_cas::Cas::path_for`]. Nothing here asserts it.
 ///
 /// LOWERCASE only, deliberately narrow: `Cas::put` emits lowercase, so a
 /// lowercase-only rule admits every address this daemon can actually hold.
@@ -315,7 +315,8 @@ pub enum McpError {
     Json(#[from] serde_json::Error),
 }
 
-/// The set of badges the surface will honor on mutating calls (doc §12).
+/// The set of badges the surface will honor at the doc §12 door (every
+/// mutating call, plus `cas_read` since DR-058 §Decision 2).
 /// Maps token → loggable badge id; the token itself is never logged.
 #[derive(Debug, Default)]
 pub struct BadgeBook {
@@ -327,7 +328,7 @@ impl BadgeBook {
         Self::default()
     }
 
-    /// Admit a minted badge: its token becomes valid on mutating calls,
+    /// Admit a minted badge: its token becomes valid at the §12 door,
     /// attributable in the log as `badge.id()`.
     pub fn admit(&mut self, badge: &Badge) {
         self.entries
@@ -860,8 +861,15 @@ impl McpCore {
         }
     }
 
-    /// §12 door for mutating tools: the badge is checked BEFORE any parsing
-    /// or side effect. Returns the loggable badge id on success.
+    /// The §12 badge door: the badge is checked BEFORE any parsing or side
+    /// effect. Returns the loggable badge id on success.
+    ///
+    /// TWO tool classes come through here, so nothing this door says may be
+    /// true of only one of them: every mutating tool, and — since DR-058
+    /// §Decision 2 — `cas_read`, the one read tool that returns blob CONTENT.
+    /// The `BADGE_REQUIRED` message below is served over the wire to the caller
+    /// it refuses, and a refused `cas_read` caller told "mutating tools require
+    /// a badge" is told something false about the call it just made.
     ///
     /// DR-017 §Decision 4 — DUAL-PATH. The opaque operator badge (DR-005
     /// `BadgeBook`, token-equality) is tried FIRST and left completely
@@ -879,7 +887,7 @@ impl McpCore {
         let Some(presented) = args.get("badge").and_then(Value::as_str) else {
             return Err(tool_refused(
                 codes::BADGE_REQUIRED,
-                "mutating tools require a badge argument (doc §12)",
+                "this tool requires a badge argument (doc §12)",
             ));
         };
 
@@ -2323,9 +2331,9 @@ impl McpCore {
     ///
     /// The `hash` is a caller-controlled path component, so its shape is a
     /// security gate, enforced in [`read_bounded`] before the first syscall
-    /// ([`is_cas_address`], [`codes::CAS_HASH_INVALID`]) and again by the store
-    /// itself ([`rezidnt_cas::Cas::path_for`]) — two independent layers, the
-    /// badge door in front of both.
+    /// ([`is_cas_address`], [`codes::CAS_HASH_INVALID`]). The store keeps a
+    /// boundary of its own (DR-058 §Decision 4, [`rezidnt_cas::Cas::path_for`]);
+    /// the badge door above stands in front of both.
     async fn call_cas_read(&self, args: Value) -> RpcOutcome {
         // The door FIRST, on the RAW args — see the ORDER GOTCHA above. Nothing
         // about the store, the blob or even the argument shape is reachable
@@ -2606,14 +2614,14 @@ enum CasReadOutcome {
 /// Blocking (filesystem); called only from `spawn_blocking`. Order is chosen so
 /// each refusal names the FIRST thing actually wrong:
 ///
-/// 0. the ADDRESS SHAPE ([`is_cas_address`]) — before any syscall, because an
-///    unchecked `hash` reaches a path join. The guard lives here, immediately in
-///    front of the syscalls it protects rather than up in [`McpCore::call_cas_read`],
-///    so no future caller of this function can route around it. DEFENCE IN
-///    DEPTH since DR-058 §Decision 4: the store enforces the same rule at its
-///    own boundary, and every `path_for`/`get` call below maps its
-///    `InvalidAddress` to this same refusal — so deleting the check above leaves
-///    the tool refusing, one layer down, with the identical answer;
+/// 0. the ADDRESS SHAPE ([`is_cas_address`]) — the FIRST statement of this
+///    function, before any syscall, because an unchecked `hash` reaches a path
+///    join. The guard lives here, immediately in front of the syscalls it
+///    protects rather than up in [`McpCore::call_cas_read`], so no future
+///    caller of this function can route around it. DR-058 §Decision 4 KEEPS it
+///    as defence in depth behind the store's own boundary
+///    ([`rezidnt_cas::Cas::path_for`]), whose address refusal this function
+///    answers with the SAME shape refusal a few lines down;
 /// 1. size of the blob AS STORED, before anything is read into memory — so an
 ///    over-bound blob is never even materialized, let alone partially served;
 /// 2. read + hash-verify through [`Cas::get`], the store's own door, which
@@ -2626,14 +2634,24 @@ fn read_bounded(cas: &Cas, addressed: &rezidnt_types::refs::CasRef) -> CasReadOu
     if !is_cas_address(&addressed.hash) {
         return CasReadOutcome::Refused(codes::CAS_HASH_INVALID, cas_hash_invalid_message());
     }
-    // The store's own guard, second layer (DR-058 §Decision 4). Reachable only
-    // if the check above is bypassed, which is exactly the independence the
-    // mutation probe proves — so it refuses with the SAME code and the SAME
-    // message rather than a differently-shaped answer.
+    // The store's own boundary (DR-058 §Decision 4), answered here because
+    // `path_for` is fallible. The arms are NAMED, not caught wholesale: only a
+    // SHAPE refusal may be reported as a shape refusal. Every other store error
+    // is `Internal` — "the daemon could not look" is not a statement about the
+    // caller's argument, and answering one with the other would misstate why
+    // (I6). The catch-all therefore sits on the honest side: a variant added to
+    // `CasError` tomorrow lands in `Internal`, never in "your argument is
+    // malformed".
     let blob = match cas.path_for(&addressed.hash) {
         Ok(path) => path,
-        Err(_) => {
+        Err(rezidnt_cas::CasError::InvalidAddress { .. }) => {
             return CasReadOutcome::Refused(codes::CAS_HASH_INVALID, cas_hash_invalid_message());
+        }
+        Err(e) => {
+            // No echo of the argument. Step 0 has already refused every shape
+            // it rejects, so anything arriving here in a tree WITHOUT step 0
+            // would be an arbitrary caller string.
+            return CasReadOutcome::Internal(format!("resolve blob path: {e}"));
         }
     };
     let stored = match std::fs::metadata(&blob) {

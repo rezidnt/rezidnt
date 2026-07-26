@@ -25,10 +25,24 @@
 //!    the store, still serves content, and still answers `cas.not_found` for a
 //!    blob this daemon does not hold.
 //!
-//! MUTATION-PROVEN: deleting the `is_cas_address` gate in `read_bounded` turns
-//! the first two tests red with the leak in the failure text (`cas.too_large`
-//! naming the exact byte count, `cas.corrupt` vs `cas.not_found` separating
-//! present from absent). This is a behavioral board, not a source-text guard.
+//! WHAT THE MUTATION SHOWS NOW (corrected 2026-07-26; the claim this paragraph
+//! replaced was true of the pre-DR-058 tree and is FALSE of this one). Deleting
+//! the `is_cas_address` gate in `read_bounded` leaves the two behavioral tests
+//! below GREEN. Control falls through to the `Cas::path_for` call beneath it,
+//! whose `InvalidAddress` arm answers the same `cas.hash_invalid` with the same
+//! message, so the tool's answer does not move — §Decision 4's defence in depth
+//! doing exactly what it was kept for, and equally the reason these two tests
+//! judge the TOOL's answer (whichever layer produced it), never the MCP layer
+//! alone. Moving the gate BELOW the first syscall is likewise invisible to
+//! them.
+//!
+//! That leaves layer 1 with no behavioral judge at all, and a check nothing can
+//! reach is a check the next reader deletes as dead. Its PRESENCE and POSITION
+//! are pinned instead as SOURCE TEXT, by the third test below, scoped to
+//! `read_bounded`'s first statement so that no comment and no prose elsewhere
+//! can green it. Mutation-proven the other way: delete that `if` block, or move
+//! it past the `fs::metadata` call, and the source-text test goes red while
+//! these two stay green.
 //!
 //! RE-CUT under DR-058 §Decision 2 (ACCEPTED, owner, 2026-07-26): `cas_read`
 //! moved behind the badge door, so every call below presents an ADMITTED
@@ -233,4 +247,71 @@ async fn a_well_formed_address_still_reaches_the_store() {
 
     let missing = util::tool_call(&core, 2, "cas_read", args(ABSENT, &badge)).await;
     util::assert_tool_refusal(&missing, codes::CAS_NOT_FOUND);
+}
+
+/// LAYER 1's ONLY JUDGE — a SOURCE-TEXT guard, scoped to the FIRST STATEMENT of
+/// `read_bounded`.
+///
+/// Everything above judges the TOOL's answer, and the tool answers identically
+/// with this check present or absent (see the header). POSITION is the whole
+/// content of the claim: "before any syscall" stops being true the moment the
+/// check moves below the first `fs::metadata`, and no served refusal would
+/// change if it did. So the first line of the body that is neither blank nor a
+/// comment is what this asserts. Comment lines are SKIPPED rather than
+/// searched, which is the scoping that keeps the guard honest: prose naming
+/// `is_cas_address` — including this doc comment — can never green it.
+#[test]
+fn the_address_check_is_read_bounded_s_first_statement() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+    )
+    .expect("read rezidnt-mcp/src/lib.rs");
+
+    let lines: Vec<&str> = source.lines().collect();
+    let signature = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("fn read_bounded("))
+        .expect("guard sanity: rezidnt-mcp defines `fn read_bounded`");
+    let body = &lines[signature + 1..];
+
+    let start = body
+        .iter()
+        .position(|l| {
+            let trimmed = l.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with("//")
+        })
+        .expect("guard sanity: read_bounded has a body");
+    let first_statement = body[start].trim();
+
+    assert!(
+        first_statement.contains("is_cas_address(&addressed.hash)"),
+        "read_bounded's FIRST statement must be the address-shape check — \
+         DR-058 §Decision 4 KEEPS it as defence in depth, and deleting it \
+         reddens nothing else on this board (the store answers one layer down \
+         with the same code and the same message), so this assertion is the \
+         only thing standing between that ruling and a tidy-up. First \
+         statement found: {first_statement:?}"
+    );
+    assert!(
+        first_statement.ends_with('{'),
+        "guard sanity: the check is expected to open a block, so the refusal \
+         below can be scoped to it. Got: {first_statement:?}"
+    );
+
+    // The check's OWN block, up to its closing brace — not the rest of the
+    // function, so an unrelated `CAS_HASH_INVALID` further down cannot green
+    // the refusal assertion.
+    let end = start
+        + body[start..]
+            .iter()
+            .position(|l| l.trim() == "}")
+            .expect("guard sanity: the first statement's block closes")
+        + 1;
+    let guard_block = body[start..end].join("\n");
+    assert!(
+        guard_block.contains("codes::CAS_HASH_INVALID"),
+        "the shape check must refuse `cas.hash_invalid` — a check that fell \
+         through to a lookup, or answered a code implying one, would rebuild \
+         the metadata oracle this board exists to kill. Block:\n{guard_block}"
+    );
 }

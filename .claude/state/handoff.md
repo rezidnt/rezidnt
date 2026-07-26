@@ -1,211 +1,174 @@
-# Handoff — 2026-07-26 (session 32)
+# Handoff — 2026-07-26 (session 33)
 
-## ► THE GOAL — read this before anything else
+## ► THE GOAL — and it is MET
 
 **rezidnt is a fast, lightweight tool for agentic engineering, and the measure is: STOP NEEDING AN IDE.**
-Owner direction, this session. This is not the compliance/audit-trail product the README and arch §1 still
-describe — that framing is stale and owes a DR.
-
-The origin, in the owner's words: combine herdr + Omnigent into one product *and get rid of IDE use*. What
-actually happened is that rezidnt shipped the **Omnigent half** (permits, gates, containment, evidence) and
-deferred the **herdr half** — the place you sit and watch agents. DR-001 replaced herdr's plumbing; herdr's
-*product* was never built. Net effect: **rezidnt has only ever ADDED to the owner's workflow and never removed
-anything.** That is the whole problem, and closing it is the whole job.
-
-Don't try to *replace* the IDE (panes/tree/editor — DR-038 priced that at Tauri scale). **Make it unnecessary.**
-If agents write the code you need four verbs, not an editor:
 
 | Verb | State |
 |---|---|
 | **Watch** | DONE — `board_view`, `tail_events`, `orchestration_graph`, wired in the cockpit |
 | **Steer** | DONE — `kill_run`, `resolve_permit`, `allow`/`deny`, escalations, wired |
 | **Compare** | PARKED — `open_trial` (DR-055). Deliberate: Compare doesn't close the IDE |
-| **Review** | **MCP tools SHIPPED today. The cockpit panel is THE LAST THING.** |
+| **Review** | **DONE — the panel renders a real diff, proven end to end today** |
 
-## ► NEXT ACTION — the panel is BUILT and the chain WORKS, but it shows the wrong thing
+Session 32 found the last defect by running the golden path and reading the bytes: `cas_read` returned a
+file-status list, not a diff. This session closed it. **Verified by re-running the same repro, not by a test.**
 
-**Run end-to-end 2026-07-26, WSL daemon + Windows client, and it proved the goal is NOT met.** The whole path
-works: daemon in WSL, `REZIDNT_MCP_LOCKFILE` pointed at a `/mnt/c/...` path so Windows can read it, loopback
-HTTP reaches it across the boundary, `open_project` → worktree allocated → files edited → notify watcher folds
-`diff.ready` → `diff_view` returns a `CasRef` → badged `cas_read` returns content, unbadged refuses
-`badge.required`. Every link verified from Windows.
+## ► WHAT SHIPPED
 
-**But the content is not a diff.** `cas_read` returned, verbatim:
+The full DR-059 sequence, in the order the last handoff specified:
+
+1. **DR-059 ACCEPTED** (`ce952e2`) — ratified under the standing autonomy grant: it mints no invariant, no
+   subject, no trait method, no dep. §20 row flipped in the same commit.
+2. **`/subject`** (`0ae61de`) — the warden minted `patch?: CasRef` on `diff.ready` v1 and `diff.merged` v1,
+   `v` stays 1, and corrected the summary's mime `text/x-diff` → `text/x-diff-summary`. **No `rezidnt-types`
+   edit was owed** — the crate carries no typed event-payload structs (payloads ride `serde_json::Value`,
+   `taxonomy.rs` holds subject NAMES only, and no table row was added), so nothing serialized moved.
+3. **`/oracle`** (`10c8a45`) — five boards, 12 judges, every one verified red by running it.
+4. **Implementer** (`35aedae`) — both emitters, the fold, `diff_view`, and the mime recut.
+5. **`/gauntlet`** — host `/vet` pass, WSL `/vet` pass, `/debrief` inconclusive-then-closed (below).
+6. **Remediation** (`e6e84b6`) — the one runtime-impact finding.
+7. **The cockpit one-liner** — `d81bdfd` in `D:\github\rezidnt-operator`, pushed.
+
+`main` at `e6e84b6`, **pushed**, working tree clean. `rezidnt-operator` at `d81bdfd`, pushed.
+
+### The design decision worth knowing
+
+`crates/rezidnt-adapters/git/src/patch.rs` is a NEW shared renderer both emitters call, so they cannot drift.
+It renders through a **scratch `GIT_INDEX_FILE`** in a temp dir — `read-tree HEAD`, then intent-to-add for
+**untracked paths only**, then `git diff`. The repository's own index is never touched, and the scratch file
+sits outside the worktree so no watcher wakes.
+
+**The obvious `git add -A -N` is WRONG and was rejected on evidence:** `-A` stages removals, which silently
+drops every DELETED file from the patch. The e2e below proves all three cases render.
+
+### The debrief, and why it shipped
+
+`/debrief` returned **inconclusive** for exactly one reason: the gate-time emitter's behavioural judge is
+`#[cfg(unix)]` and the WSL gauntlet had not reported when the auditor wrote. **That closed** — WSL `/vet` is
+green and `dr059_patch_e2e::the_golden_path_pins_and_republishes_the_real_patch` was confirmed genuinely
+running (`--nocapture`), not cfg'd away. The auditor explicitly said "flip to pass on a green WSL run."
+
+It also verified the serialized-axis claim **holds, for the reason stated** — the first time in this arc.
+`#[serde(default, skip_serializing_if)]`, no `deny_unknown_fields`, and **no `WorktreeState { .. }` struct
+literal anywhere in the workspace** (the exact DR-057 failure mode, absent here). Zero golden recuts owed for
+the field; the 23 golden/suite edits are the disclosed mime-literal recut only.
+
+**One finding had runtime impact and was fixed before the gate** (loop policy: security and correctness fix,
+prose batches). `summarize_worktree` propagated a render failure with `?` and `DiffPins::patch` was
+non-optional, so a patch-render failure aborted the whole `pre_merge` — a review nicety became a merge
+blocker, and it was asymmetric with the sibling emitter DR-059 rules must move together. Now `Option<CasRef>`,
+infallible by type, key OMITTED when absent (never nulled, never synthesized). Judge:
+`gates.rs::patch_degrades_tests`, failure injected for real, mutation-proven red both ways.
+
+**I did NOT run a second debrief round.** One remediation round per slice is the standing policy, and the
+auditor had already classified everything else as batch.
+
+### The end-to-end, re-run and passing
+
+Same repro as last session (WSL daemon, fresh DB, `open_project` → worktree → edit → `diff_view` →
+badged `cas_read`). `diff_view` served both refs with honest mimes; `cas_read` on `patch` returned:
 
 ```
-# rezidnt diff summary v1
-M README.md blake3:64e4c611…
-M main.rs blake3:c2e424b6…
+diff --git a/README.md b/README.md
+@@ -1,2 +1,6 @@
+ # e2e
++## Review
++The cockpit reads the patch now.
+diff --git a/added.rs b/added.rs
+new file mode 100644
++fn added() { … }
+diff --git a/main.rs b/main.rs
+deleted file mode 100644
+-fn main() { … }
 ```
 
-**`gates::summarize_worktree` pins `git_diff_summary` — a file-status list with content hashes — and labels it
-`text/x-diff`.** It has never been a diff. DR-057's premise ("diff bytes are already CAS-pinned since S2") is
-FALSE; every citation in it is literally correct and the conclusion is wrong. The sibling
-`summarize_worktree_content` → `git_added_content` (DR-043, for secret-scan) is added-content only — no
-removals, no context, also not reviewable.
+A modification with context, an **untracked addition** (bare `git diff` omits these — the scratch index earns
+its keep), and a **deletion with its removed lines** (`git add -A -N` would have dropped it). Unbadged
+`cas_read` still answers `badge.required`. **Note `cas_read` takes the CasRef fields FLATTENED**
+(`{badge, hash, bytes, mime}`), not a nested `ref` — a nested one answers `-32602 missing field hash`.
 
-**So the Review panel renders a list of filenames.** It cannot close an IDE. Both gates passed, two audit
-rounds hardened it, and none of that could catch this — only running it did.
+## ► NEXT ACTION — the batched cleanup slice, then pick the next verb
 
-**THE WORK IS SCOPED AND RATIFIED — [DR-059](../../docs/decisions/DR-059-real-diff-sibling-ref.md) is
-ACCEPTED (owner, 2026-07-26).** Step 1 is DONE. **Start at step 2**, and it is not optional:
+Nothing is blocking. The obvious next move is the **cleanup slice**, which now carries two arcs' findings.
+None of these changes runtime behaviour; none blocks a ship.
 
-1. ~~Owner ratifies DR-059.~~ **DONE.** The record AUTHORIZES but does not mint the field — deliberate, so
-   step 2 cannot be skipped.
-2. **`/subject` (warden)** mints `patch?: CasRef` on `diff.ready` v1 and `diff.merged` v1, plus the mime
-   correction. `v` stays 1. **An implementer landing the payload key before this session runs is working
-   outside the record's authorization.**
-3. **`/oracle`** for the landing slice.
-4. **Implementer:** pin real `git diff` bytes at **BOTH** emitters — `gates::summarize_worktree` AND
-   `crates/rezidnt-adapters/git/src/lib.rs::summarize_to_cas` (the watcher's continuous emitter, a second site
-   producing the identical format under the identical false mime — fix one alone and the other keeps lying).
-   Widen `diff_view` with `patch: CasRef|null`. **Check whether that widening is additive or BREAKING on the
-   serialized axis and disclose it** — that is the exact question DR-057 and DR-058 each got wrong.
-5. **Recut the mime literals** — four goldens plus `dr057_partial_diff_ref_folds_none.rs:156` pin
-   `text/x-diff`. Behaviourally safe (nothing branches on the literal), not free.
-6. **One line in the panel** to read `patch` instead of `diff`. Nothing else in `rezidnt-operator` changes.
+**From this slice's `/debrief` (all LOW or NONE impact, auditor-triaged as batch):**
 
-`refs["diff"]` stays EXACTLY as it is — `DiffScope` and `ForbiddenPath` parse its line shape and are BINDING
-`pre_merge` inputs. This is DR-043's sibling-ref pattern, not a change in place.
+1. `crates/rezidnt-adapters/git/src/patch.rs::render_with_index` — non-UTF-8 untracked paths are dropped
+   silently via `filter_map(String::from_utf8().ok())`, with no log line. Such a file shows in the summary as
+   `A <path>` but contributes nothing to the patch — **the same summary-says-one-thing class DR-059 exists to
+   close**, narrowed to non-UTF-8 names. Batch pathspecs as `OsString`.
+2. `patch.rs::PATHSPEC_BATCH` — bounds by pathspec COUNT (100), but its doc comment claims it prevents
+   overrunning the platform's command-line limit, which is a BYTE limit (~32 KiB on Windows). Accumulate
+   byte length, not count.
+3. `crates/rezidnt-state/src/lib.rs::apply` — reducer asymmetry: the `diff.ready` arm assigns `last_patch`
+   INSIDE the `if let Some(diff)` guard, the `diff.merged` arm OUTSIDE. Unreachable today (no emitter produces
+   it), but it falsifies the doc claim that the pair always describes one fact.
+4. `crates/rezidnt-types/src/mcp.rs::DiffViewArgs` doc — still states the response is
+   `{worktree, lifecycle, outcome, diff}`. Now incomplete, asserts another module's behaviour, unpinned.
+   **DR-056 §Decision 2 class.**
+5. **`spec/ontology.md`'s own wiring-status prose is now FALSE** — the `diff.ready.diff`, `diff.ready.patch?`
+   and `diff.merged.patch?` bullets all say "NOT wired this session" / "both pin sites still write the old
+   literal". All three ARE wired. **This is the arc's described-vs-tree defect INVERTED** — the spec now
+   understates the tree. Needs a warden `/subject` (hook-blocked otherwise).
+6. `patch.rs` module doc claims determinism ("the same tree state renders the same bytes"). The bytes are
+   config-dependent — `diff.algorithm`, `diff.context`, `diff.renames`, `core.autocrlf` all move them.
+   **Harmless while the patch is NOT a gate input** (`refs["diff"]` is unchanged, so I6 is not engaged) —
+   **load-bearing the moment any record wires the patch into a verifier.** Pin the config with `-c` flags, or
+   narrow the sentence.
+7. Plan §201 owes a one-line note that unified-diff rendering is CLI-side. **The auditor RULED gix-vs-CLI
+   acceptable as built, not DR-shaped**: §201's only BINDING clause is the worktree-registry rule, "reads via
+   gix" is DEFAULT prose, and `gates.rs::git_diff_summary` already shells `git status --porcelain` for a read.
 
-### Reproducing the end-to-end (it takes about two minutes)
-
-```bash
-# 1. daemon in WSL, lockfile on a path Windows can read
-wsl.exe -d Ubuntu-24.04 -e bash -lc '
-  export PATH=$HOME/.cargo/bin:$PATH
-  export REZIDNT_MCP_LOCKFILE=/mnt/c/Users/dakot/AppData/Local/Temp/rezidnt-mcp.lock
-  export REZIDNT_DB=$HOME/.local/state/rezidnt-e2e/events.db
-  nohup $HOME/.cache/rezidnt-target/debug/rezidentd >/tmp/rezidentd.log 2>&1 & sleep 4
-  cat $REZIDNT_MCP_LOCKFILE'
-# 2. the cockpit, pointed at the same lockfile (Windows path form)
-cd /d/github/rezidnt-operator/src-tauri && \
-  REZIDNT_MCP_LOCKFILE='C:\Users\dakot\AppData\Local\Temp\rezidnt-mcp.lock' ./target/debug/app.exe
-```
-
-The test repo is at `~/e2e-repo` in WSL with a worktree already carrying edits; `REZIDNT_DB` above rebuilds
-that state from the log, so `diff_view` answers immediately. In the app: **Look inside rezidnt → Worktrees →
-review**. The chain works; the bytes are the summary. That is the whole finding, visible in about two minutes.
-
-**The panel itself is DONE and correct** — `366a0bd` in `D:\github\rezidnt-operator`, commits `3d5577d`/`366a0bd`.
-It renders whatever bytes it is handed, handles all seven refusal codes honestly, and shows
-"No diff was read, so none is shown." with no editor on screen for every refusal. Do not rebuild it.
-
-### Previous next-action, kept for context
-
-**The Review panel in `D:\github\rezidnt-operator`** (separate repo, sibling on disk, was at `7068b7f`
-with 8 commits, outside the rezidnt gauntlet by DR-038 — it does not inherit rezidnt's loop).
-
-An implementer was building it when this session ended; **check `git log` there first** — it may be done,
-partly done, or untouched. It consumes two tools that are live and green on rezidnt `main`:
-
-- **`diff_view`** — unbadged. `{worktree}` → `{worktree, lifecycle, outcome, diff: CasRef|null}`.
-  `null` means no diff folded — render an honest empty state, **never an empty diff**.
-- **`cas_read`** — **BADGED** (DR-058; `badge` is first in the args schema). Pass the whole `CasRef`, not a
-  bare hash. → `{content, bytes_returned, truncated}`. The cockpit already threads an operator badge for
-  `kill_run` — reuse it.
-
-**The one failure mode this surface exists to prevent:** a refused read rendering as an empty or partial diff.
-`cas.too_large` means the daemon REFUSED (256 KiB bound; it never truncates) — show the size, never a partial
-diff presented as whole. Same for `cas.not_found` / `corrupt` / `not_text` / `not_utf8` / `hash_invalid` and
-`badge.required` / `badge.invalid`.
-
-**When that panel renders a diff, the IDE is closed and the goal is met.** Everything below is secondary.
+**Carried from the `cas-badge-door` slice's FAILed-but-shipped debrief** — five prose items, still owed, listed
+in full in the previous handoff (`git show 2563772:.claude/state/handoff.md`, §BATCHED CLEANUP): the "no echo"
+comment in `read_bounded`, the `dr058_path_for_address_guard.rs` board header, two mislabelled "unpinnable"
+items, the drifted `file:line` citations in `dr058_invalid_ref_honesty.rs`, and the one-word badge-message
+blacklist in `badge_enforcement.rs`.
 
 ## ► DO NOT — each of these will burn a session
 
 1. **Do not propose making `delivery-harness` a rezidnt client.** The owner used it and rejected it: didn't
-   beat plain Claude Code, too much ceremony, too slow. It is rezidnt's own loop with the serial numbers filed
-   off, so that critique lands here too.
-2. **Do not build approve / reject / redirect buttons.** Read-only Review is enough to close the editor.
-   `approve` needs a merge hold that does not exist (merge is automatic on a verified pass) plus its own DR;
-   **`redirect` is BLOCKED AT THE SUBSTRATE** — agents spawn `.stdin(Stdio::null())`, `attach` is one-way, and
-   `claude -p` is one-shot. Reject (`kill_run`) and keep-for-triage (DR-049 §D3 default) already exist if you
-   want them cheaply.
+   beat plain Claude Code, too much ceremony, too slow.
+2. **Do not build approve / reject / redirect buttons.** Read-only Review is enough. `approve` needs a merge
+   hold that does not exist; **`redirect` is BLOCKED AT THE SUBSTRATE** — agents spawn `.stdin(Stdio::null())`,
+   `attach` is one-way, `claude -p` is one-shot. `kill_run` and DR-049 §D3 keep-for-triage already exist.
 3. **Do not restart slice B without reconciling TWO contradictory boards** — `ddc892d` on
    `worktree-agent-ac2146777f0403fee`, and branch `slice-b-board-onmain`. They disagree on which crate owns
-   key-derivation (`rezidnt-run` vs `rezidnt-mcp`). Handing an implementer both gives it two work orders.
-4. **Do not chase audit findings that don't change runtime behaviour.** See the loop policy.
+   key-derivation (`rezidnt-run` vs `rezidnt-mcp`).
+4. **Do not chase audit findings that don't change runtime behaviour.** Loop policy below.
+5. **Do not re-run `/debrief` to see if the remediation is clean.** One round per slice. That is the policy,
+   and asking the auditor progressively more meta questions reliably manufactures findings.
 
-## ► LOOP POLICY (new this session — the owner called out looping)
+## ► LOOP POLICY (standing)
 
 **Triage `/debrief` findings by runtime impact. Security and correctness get fixed before the gate; prose,
 pinning, and doc-comment accuracy get BATCHED into a cleanup slice and never block a ship. ONE remediation
-round per slice, not N.**
-
-This session ran two full debrief→remediate→re-debrief cycles. Round 1 found a real security hole (worth it).
-Round 2 found a vacated mutation proof (real, but meta). Returns were clearly diminishing and the loop should
-have been called sooner. Asking the auditor progressively more meta questions reliably manufactures more
-findings — don't.
-
-## ► STATE
-
-`main` at `f7f8562`, working tree clean, **27 commits ahead of `origin/main` — NOT PUSHED.**
-
-**Shipped:** `diff_view` + `cas_read` (DR-057; both gates passed) · the `cas_read` badge door + crate-level
-`Cas::path_for` address guard + honest `InvalidAddress` mapping in `resolve_ref`/`honest_evidence_ref`
-(DR-058; `/vet` green, **final `/debrief` was still running at session end — check it**).
-
-**Records:** DR-056 (prose tax, ACCEPTED — its ~800-word cap was revised to ~1500 before ratification because
-it was 0-for-5, and rejected-alternatives/counterargument text is excluded from the count), DR-057 (ACCEPTED),
-DR-058 (ACCEPTED). **Next record is DR-059.**
-
-**§20 index convention CHANGED:** a record takes its row and moves the pointer **when the file lands, whatever
-its status.** The old withhold-until-acceptance practice went three records stale and would have minted DR-056
-twice. Back-pointers into *other* records still wait for acceptance — that part was always right.
-
-**DR-056 §Decision 2 is now a standing rule** and is in the rust-conventions skill: a doc comment asserting
-another module's behaviour, or citing `file:line`, must be pinned by a source-text guard proven red by
-deletion, or not written.
-
-## ► BATCHED CLEANUP — `cas-badge-door`'s final /debrief FAILed and the slice SHIPPED ANYWAY
-
-**This is a deliberate departure from "done = both gates pass," made under the loop policy above, and it needs
-the owner's ratification if it becomes standing practice.** The final `/debrief` returned FAIL with five
-findings. **All five are prose; ZERO change runtime behaviour.** F1 (the restored mutation proof), F3 (the
-honest `InvalidAddress` arm), F4's core, and the new fact-bearing test all HOLD — the auditor verified every
-mutation leg by tracing the code path rather than trusting the report. The security work is intact.
-
-Fix these together in one cleanup pass; none blocks anything:
-
-1. `crates/rezidnt-mcp/src/lib.rs` — the `// No echo of the argument.` comment above the `Internal` arm in
-   `read_bounded`. `format!("resolve blob path: {e}")` interpolates `rezidnt_cas::CasError`'s Display, and
-   `NotFound { hash }` renders the hash — so "no echo" is a claim about another crate, true only because the
-   arm is unreachable. State what the line guarantees, or drop the absolute.
-2. `crates/rezidnt-cas/tests/dr058_path_for_address_guard.rs` — the board header calls its own fragile leg
-   unpinnable; it is already pinned by `path_for_refuses_every_non_address_with_invalid_address`. Cite the
-   judge. Zero test code.
-3. Relabel the other two "unpinnable" items **"behaviourally unpinnable, deliberately unpinned by source
-   text"** — both ARE source-text pinnable by the instrument this slice built (~8 lines). One of three
-   misclassified is the answer to "is that category growing": yes, watch it.
-4. `crates/rezidnt-gate/tests/dr058_invalid_ref_honesty.rs` header — two `file:line` citations drifted when
-   this slice's own doc paragraphs pushed the targets down. **Strip line numbers, keep file+symbol** (the
-   warden's anchor discipline, at the bottom of this file, already says so).
-5. `crates/rezidnt-mcp/tests/badge_enforcement.rs` — the badge-message pin is a one-word blacklist on
-   "mutating"; "write tools require a badge" would pass while being false to a refused `cas_read` caller. The
-   doc asserts the general property; say what is actually pinned.
+round per slice, not N.** This session ran exactly one and shipped. It worked.
 
 ## ► OPEN, none blocking
 
-- **DR-053 is still PROPOSED** since 2026-07-25, back-pointers correctly withheld. Last unresolved record
-  status in the tree. Owner's call.
+- **DR-053 is still PROPOSED** since 2026-07-25 — the last unresolved record status in the tree. Owner's call.
 - **The macaroon verb for `cas_read` is unruled** — the implementer picked `"read"`; no test pins it, so a
   `Verb`-caveated agent badge is refused today. Rule it before an agent consumer ships.
 - **`CasReadArgs.bytes`' doc serves `rezidnt_mcp::MAX_CAS_READ_BYTES_DEFAULT`** — a private symbol, over the
   wire, to every MCP client. Same class DR-058 fixed for `hash`; owed to a later record.
 - **arch §1 still names "Microsoft-stack enterprises that need an audit trail a compliance reviewer will
-  sign"** as a wedge buyer, and the README leads with compliance evidence. Both contradict the stated goal.
-  Owes a DR — it is a BINDING thesis change, not a slice.
-- **A pattern worth its own rule:** three records this arc claimed a shape was unchanged when it wasn't
-  (DR-049 via DR-052 item (d); DR-057's "additive"; DR-058's "shape unchanged"). All three reasoned about the
-  *information* a change carries rather than the *serialized surface* it moves across. A ledger's shape claim
-  should be checked against goldens, schemas, and wire responses — DR-053's five-limb form has no slot for it.
+  sign"** as a wedge buyer, and the README leads with compliance evidence. **Both contradict the stated goal,
+  and the goal is now DEMONSTRABLY met** — the thesis change is a BINDING one and owes a DR. With Review
+  landed, this is the most valuable record left to write.
+- **The "described, tree lacks" pattern** claimed four records this arc. DR-059 was the fourth and the only
+  one to reach a user-facing surface. **Item 5 in the cleanup list is the fifth, inverted** — worth noticing
+  that the mitigation (source-text guards, DR-056 §2) does not cover spec prose about wiring status.
 
 ## Also (carried)
 
 - `.claude/worktrees/agent-ab4e17a54fbbdb421/` is still an empty dir a Windows handle refused to delete.
   Gitignored, deregistered, harmless.
 - If rust-analyzer reports phantom errors, restart it — the running instance can predate the pinned toolchain.
+- **`pkill -f rezidentd` from a `bash -lc` string kills your own shell** (the pattern matches the command
+  line). Use `pkill -x rezidentd`.
 
 **Anchor discipline (warden-ratified 2026-07-24):** cite by SYMBOL, not line. A line number is admissible only
 bolted to a commit hash.

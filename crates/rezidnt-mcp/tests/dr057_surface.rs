@@ -23,6 +23,26 @@
 //! - NEITHER schema carries a `badge` property: read-class, unbadged
 //!   (DR-057 §Decision 4; DR-005/DR-039 precedent).
 //!
+//! ## AUDITOR-DIRECTED CORRECTION (DR-057 debrief, finding F2)
+//!
+//! The golden leg of this board was originally compared VERBATIM, which made a
+//! doc-comment reword flip a structural golden red. The implementer resolved
+//! that by stripping the prose out of the PRODUCT
+//! (`#[schemars(description = "")]` on `DiffViewArgs`/`CasReadArgs`) — the wrong
+//! direction: the golden ended up dictating the wire format, and `diff_view`/
+//! `cas_read` served field schemas barer than every other tool's.
+//!
+//! Corrected here the way the house already solved it twice
+//! (`rezidnt-types/tests/fanout_schema_no_drift.rs:57`,
+//! `orchestration_schema_no_drift.rs:27`): the TEST normalizes. The golden leg
+//! strips `description` keys, so it pins STRUCTURE — types, properties,
+//! `required` — and a reword moves nothing. NOTHING IS SOFTENED: all three legs
+//! still hold (served == `schema_for!` == golden), just modulo prose, and the
+//! served leg below is compared VERBATIM because both its sides come from the
+//! same `schema_for!` and prose cannot skew it. A fourth assertion, which did
+//! not exist before, now pins that the served schema CARRIES the prose — so
+//! re-suppressing descriptions goes red instead of passing quietly.
+//!
 //! ## RED MODE (against the tree at cut time — post-`1094f40`)
 //!
 //! COMPILE-RED: `rezidnt_types::mcp::DiffViewArgs` and
@@ -44,6 +64,31 @@ fn golden(name: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: golden must parse: {e}"))
 }
 
+/// Recursively drop every `"description"` key so the golden pins STRUCTURE
+/// (types, properties, required) and not the embedded doc-comment prose.
+/// Identical to `fanout_schema_no_drift.rs`'s and
+/// `orchestration_schema_no_drift.rs`'s helpers — deliberately duplicated rather
+/// than shared, so the goldens cannot drift together through one helper edit.
+fn strip_descriptions(mut v: Value) -> Value {
+    match &mut v {
+        Value::Object(map) => {
+            map.remove("description");
+            let stripped: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, val)| (k.clone(), strip_descriptions(val.clone())))
+                .collect();
+            Value::Object(stripped)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| strip_descriptions(i.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Both DR-057 read tools are served in `tools/list`.
 #[tokio::test]
 async fn tools_list_serves_diff_view_and_cas_read() {
@@ -54,8 +99,14 @@ async fn tools_list_serves_diff_view_and_cas_read() {
 }
 
 /// §9 BINDING no-drift, three ways: generated == committed golden (the shape
-/// the record ruled), and served == generated (the surface cannot drift from
+/// the record ruled) and served == generated (the surface cannot drift from
 /// the published types).
+///
+/// The GOLDEN leg compares modulo `description` prose (see the module header):
+/// the golden pins STRUCTURE, so rewording a doc-comment is free and only a
+/// real shape change flips it. The SERVED leg is compared VERBATIM — both its
+/// sides come from `schema_for!`, so prose cannot skew it and a verbatim
+/// comparison there is strictly the stronger claim.
 #[tokio::test]
 async fn dr057_schemas_match_types_and_goldens() {
     let (_dir, core) = util::core();
@@ -78,17 +129,51 @@ async fn dr057_schemas_match_types_and_goldens() {
 
     for (name, generated, committed) in cases {
         assert_eq!(
-            generated, committed,
-            "{name}: schemars::schema_for! of the rezidnt-types shape must \
-             EQUAL the committed golden — the golden pins the shape DR-057 \
-             ruled, not whatever shape got typed"
+            strip_descriptions(generated.clone()),
+            strip_descriptions(committed),
+            "{name}: the STRUCTURE schemars::schema_for! generates from the \
+             rezidnt-types shape must EQUAL the committed golden — the golden \
+             pins the shape DR-057 ruled, not whatever shape got typed. \
+             Structure only; description prose is stripped from BOTH sides so \
+             the golden can never dictate the wire format's prose"
         );
         let tool = util::find_tool(&tools, name);
         assert_eq!(
             tool["inputSchema"], generated,
             "{name}: served inputSchema must EQUAL the generated schema \
-             (no drift, doc §9 BINDING)"
+             VERBATIM, prose included (no drift, doc §9 BINDING)"
         );
+    }
+}
+
+/// PRODUCT LEG (auditor finding F2) — the served arg schemas CARRY field
+/// descriptions, like every other tool on this surface. Without this, the
+/// `#[schemars(description = "")]` suppression that stripped prose to keep a
+/// verbatim golden quiet would pass every assertion above; with it, a
+/// re-suppression is red. Prose CONTENT is deliberately unpinned — only its
+/// presence — so a reword stays free.
+#[tokio::test]
+async fn dr057_served_schemas_carry_field_descriptions() {
+    let (_dir, core) = util::core();
+    let tools = util::list_tools(&core).await;
+
+    for (name, fields) in [
+        ("diff_view", &["worktree"][..]),
+        ("cas_read", &["hash", "bytes", "mime"][..]),
+    ] {
+        let schema = &util::find_tool(&tools, name)["inputSchema"];
+        for field in fields {
+            let described = schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !described.trim().is_empty(),
+                "{name}.{field} must serve a non-empty description — a client \
+                 reading the schema gets the same field guidance every other \
+                 tool offers. Suppressing prose to keep a golden verbatim \
+                 inverts test and product (F2): {schema:#}"
+            );
+        }
     }
 }
 

@@ -322,19 +322,19 @@ pub struct FanOutTask {
 /// against. A caller passes back the key it was served; the tool re-canonicalizes
 /// nothing (I3).
 ///
-/// SCHEMA PROSE, deliberately suppressed: `#[schemars(description = "")]` keeps
-/// the doc-comment above out of the generated schema (schemars drops an empty
-/// description rather than emitting one), so the rustdoc a human reads and the
-/// wire schema a client reads evolve independently. The DR-057 board compares
-/// `schema_for!` to its committed golden VERBATIM — unlike the DR-044 golden pin,
-/// which strips `description` keys before comparing — so a doc-comment reword
-/// would otherwise flip a structural golden red. The guidance a client needs
-/// rides the tool's own `description` in `tools/list`, not the arg schema.
+/// SCHEMA PROSE rides the wire, like every other tool on this surface. An
+/// earlier revision carried `#[schemars(description = "")]` here to keep these
+/// doc-comments OUT of the served schema, so that a DR-057 golden comparing
+/// `schema_for!` VERBATIM could not be reddened by a reword. That inverted the
+/// order: the test's convenience dictated the product's wire format, and clients
+/// lost the field guidance every other tool serves. The house fix — already
+/// shipped twice, in `tests/fanout_schema_no_drift.rs` and
+/// `tests/orchestration_schema_no_drift.rs` — normalizes the TEST: the golden
+/// leg strips `description` keys before comparing, so it pins STRUCTURE and a
+/// reword moves nothing. Prose is a product feature here, not a test liability.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "")]
 pub struct DiffViewArgs {
     /// The worktree path key (graph `worktrees` key / `WorktreeRow.path`).
-    #[schemars(description = "")]
     pub worktree: String,
 }
 
@@ -356,24 +356,25 @@ pub struct DiffViewArgs {
 ///
 /// Field ORDER is load-bearing for the doc §9 no-drift pin: it fixes the
 /// generated `required` array against
-/// `spec/fixtures/dr057_cas_read_args.schema.golden.json`. Schema prose is
-/// suppressed for the reason given on [`DiffViewArgs`].
+/// `spec/fixtures/dr057_cas_read_args.schema.golden.json`. Schema prose rides
+/// the wire for the reason given on [`DiffViewArgs`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "")]
 pub struct CasReadArgs {
-    /// Lowercase blake3 hex (64 chars) of the blob — the address, and the only
-    /// field the daemon can verify content against.
-    #[schemars(description = "")]
+    /// Lowercase blake3 hex, exactly 64 characters — the blob's address, and the
+    /// only field the daemon can verify content against. ENFORCED, not merely
+    /// documented: anything else is refused `cas.hash_invalid` on shape, before
+    /// any lookup (`rezidnt_mcp::is_cas_address`).
     pub hash: String,
     /// The caller's claimed blob length. Advisory: never used to authorize or
     /// to bound the read (a claim that could widen the bound would be a
     /// smuggling channel; one that could narrow it would deny an in-bound read
-    /// over the caller's own bad metadata).
-    #[schemars(description = "")]
+    /// over the caller's own bad metadata). An OVER-claim is served the actual
+    /// blob, with `bytes_returned` reporting what was really served.
     pub bytes: u64,
     /// The caller's claimed media type, from the event payload the ref rode on.
-    /// v1 admits text only; a non-text claim is refused rather than mangled.
-    #[schemars(description = "")]
+    /// v1 admits `text/*` only — `application/json` is NOT text here — and a
+    /// non-text claim is refused rather than mangled. Mime PARAMETERS are
+    /// ignored, so `text/plain; charset=utf-8` is text.
     pub mime: String,
 }
 

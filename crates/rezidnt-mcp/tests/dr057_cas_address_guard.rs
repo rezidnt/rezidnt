@@ -1,0 +1,210 @@
+//! DR-057 debrief finding F1 (SECURITY) — `cas_read`'s `hash` is a
+//! caller-controlled PATH COMPONENT on an UNBADGED tool, and its shape is a
+//! security boundary.
+//!
+//! `rezidnt_cas::Cas::path_for` is a bare `root.join(hash)`. `PathBuf::join`
+//! REPLACES the root on an absolute component and normalizes no `..`, so before
+//! this guard an unbadged caller could aim `cas_read` at any path the daemon can
+//! read and harvest two facts from the refusal alone: EXISTENCE (a missing
+//! target answers `cas.not_found`, a present one answers `cas.corrupt` or
+//! `cas.too_large`) and EXACT BYTE SIZE (`blob is {actual} bytes`). Content
+//! stayed safe only incidentally, because `Cas::get` re-hashes. The metadata
+//! oracle was real, and it is exactly the local-disk backchannel DR-038
+//! §Decision 4 forecloses.
+//!
+//! What this board pins:
+//!
+//! 1. every malformed address refuses BYTE-IDENTICALLY (`cas.hash_invalid`,
+//!    a message carrying neither the input nor any fact about the store), so a
+//!    caller cannot separate a traversal from an absolute path from uppercase
+//!    hex from a wrong length from a stray non-hex character;
+//! 2. the refusal is IDENTICAL whether or not the traversal target exists, and
+//!    identical whichever size it is. That equality IS the oracle's death: the
+//!    answer carries zero bits about the filesystem;
+//! 3. the guard is not a blanket refusal — a well-formed address still reaches
+//!    the store, still serves content, and still answers `cas.not_found` for a
+//!    blob this daemon does not hold.
+//!
+//! MUTATION-PROVEN: deleting the `is_cas_address` gate in `read_bounded` turns
+//! the first two tests red with the leak in the failure text (`cas.too_large`
+//! naming the exact byte count, `cas.corrupt` vs `cas.not_found` separating
+//! present from absent). This is a behavioral board, not a source-text guard.
+
+mod util;
+
+use std::sync::Arc;
+
+use rezidnt_cas::Cas;
+use rezidnt_fabric::{EventLog, Fabric};
+use rezidnt_mcp::{BadgeBook, MAX_CAS_READ_BYTES_DEFAULT, McpCore, codes};
+use serde_json::{Value, json};
+
+/// A core with a WIRED CAS rooted at `<tmp>/cas`, an EMPTY badge book, no
+/// substrate and no root key. The empty badge book is the point: every call
+/// below is unbadged, which is the trust tier the oracle was reachable from.
+fn core_with_cas() -> (tempfile::TempDir, Arc<Cas>, Arc<McpCore>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = EventLog::open(&dir.path().join("events.db")).expect("open log");
+    let fabric = Fabric::new(log, 1024);
+    let cas = Arc::new(Cas::open(&dir.path().join("cas")).expect("open cas"));
+    let core = McpCore::new(fabric, BadgeBook::new()).with_cas(Arc::clone(&cas));
+    (dir, cas, Arc::new(core))
+}
+
+/// Args with an arbitrary `hash` and an otherwise VALID text ref, so nothing
+/// but the address shape can be what refuses.
+fn args(hash: &str) -> Value {
+    json!({"hash": hash, "bytes": 21, "mime": "text/x-diff"})
+}
+
+/// A deterministic ASCII blob of exactly `len` bytes.
+fn text_of(len: usize) -> String {
+    "0123456789abcdef".repeat(len / 16 + 1)[..len].to_string()
+}
+
+/// The five malformed shapes, each a distinct class of wrong. `TRAVERSAL` and
+/// `ABSOLUTE` are the two that actually escape the CAS root; the other three are
+/// strings that address nothing this daemon can hold.
+const TRAVERSAL: &str = "../probe.txt";
+const UPPERCASE: &str = "AA11BB22CC33DD44EE55FF660718293A4B5C6D7E8F90A1B2C3D4E5F607182930";
+const TOO_SHORT: &str = "aa11bb22cc33dd44ee55ff660718293a4b5c6d7e8f90a1b2c3d4e5f60718293";
+const NON_HEX: &str = "zz11bb22cc33dd44ee55ff660718293a4b5c6d7e8f90a1b2c3d4e5f607182930";
+
+/// A REAL, well-formed address (64 lowercase hex) that this daemon does not
+/// hold — the control for "valid shape, absent blob".
+const ABSENT: &str = "aa11bb22cc33dd44ee55ff660718293a4b5c6d7e8f90a1b2c3d4e5f607182930";
+
+/// THE GUARD — every malformed address is refused `cas.hash_invalid`, and every
+/// refusal is BYTE-IDENTICAL. The traversal and absolute targets are planted as
+/// REAL, OVER-BOUND files, so a tree without the guard answers `cas.too_large`
+/// and prints the exact byte count; with it, all five answers are one answer.
+#[tokio::test]
+async fn every_malformed_address_refuses_identically() {
+    let (dir, _cas, core) = core_with_cas();
+
+    // Plant real files at both escape targets, deliberately over the read bound
+    // so the pre-guard behavior would have leaked their exact size.
+    let leaky = text_of(MAX_CAS_READ_BYTES_DEFAULT as usize + 1);
+    std::fs::write(dir.path().join("probe.txt"), &leaky).expect("plant traversal target");
+    let absolute = dir.path().join("absolute_probe.txt");
+    std::fs::write(&absolute, &leaky).expect("plant absolute target");
+    let absolute = absolute.to_string_lossy().to_string();
+
+    let shapes = [
+        ("path traversal", TRAVERSAL),
+        ("absolute path", absolute.as_str()),
+        ("uppercase hex", UPPERCASE),
+        ("wrong length", TOO_SHORT),
+        ("non-hex character", NON_HEX),
+    ];
+
+    let mut payloads: Vec<(&str, Value)> = Vec::new();
+    for (label, hash) in shapes {
+        let result = util::tool_call(&core, 1, "cas_read", args(hash)).await;
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "{label}: a hash that is not a CAS address must be REFUSED: {result:#}"
+        );
+        let payload = util::tool_payload(&result);
+        assert_eq!(
+            payload["code"],
+            json!(codes::CAS_HASH_INVALID),
+            "{label}: refused on SHAPE, before any lookup — never a code that \
+             claims the daemon looked at the store: {payload:#}"
+        );
+        assert!(
+            payload.get("content").is_none(),
+            "{label}: a refusal carries no content: {payload:#}"
+        );
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains(&leaky.len().to_string()),
+            "{label}: the refusal must not name the target's size — that byte \
+             count IS the metadata oracle: {payload:#}"
+        );
+        assert!(
+            !message.contains(hash),
+            "{label}: the refusal echoes no part of the argument, so the five \
+             shapes cannot be told apart by their messages: {payload:#}"
+        );
+        payloads.push((label, payload));
+    }
+
+    let (first_label, first) = &payloads[0];
+    for (label, payload) in &payloads[1..] {
+        assert_eq!(
+            payload, first,
+            "{label} must be indistinguishable from {first_label}: every \
+             rejected shape answers with ONE refusal, so a caller learns \
+             nothing it did not already know from its own argument"
+        );
+    }
+}
+
+/// THE ORACLE'S DEATH — the same traversal hash gets the SAME answer whether
+/// the target file is absent, small, or over-bound. A refusal that does not move
+/// when the filesystem moves carries zero bits about the filesystem.
+///
+/// Pre-guard this test is red three ways: absent answers `cas.not_found`, small
+/// answers `cas.corrupt` (naming the target's real blake3), and over-bound
+/// answers `cas.too_large` (naming its exact length).
+#[tokio::test]
+async fn the_refusal_does_not_move_when_the_filesystem_does() {
+    let (dir, _cas, core) = core_with_cas();
+    let target = dir.path().join("probe.txt");
+
+    let absent = util::tool_payload(&util::tool_call(&core, 1, "cas_read", args(TRAVERSAL)).await);
+
+    std::fs::write(&target, b"a small secret").expect("plant small target");
+    let small = util::tool_payload(&util::tool_call(&core, 2, "cas_read", args(TRAVERSAL)).await);
+
+    std::fs::write(&target, text_of(MAX_CAS_READ_BYTES_DEFAULT as usize + 1))
+        .expect("plant over-bound target");
+    let large = util::tool_payload(&util::tool_call(&core, 3, "cas_read", args(TRAVERSAL)).await);
+
+    assert_eq!(
+        absent, small,
+        "existence must not be observable: an absent target and a present one \
+         answer identically"
+    );
+    assert_eq!(
+        small, large,
+        "size must not be observable: a 14-byte target and an over-bound one \
+         answer identically"
+    );
+    assert_eq!(
+        absent["code"],
+        json!(codes::CAS_HASH_INVALID),
+        "all three are the one shape refusal: {absent:#}"
+    );
+}
+
+/// NON-VACUITY — the guard admits what it should. A well-formed address still
+/// reaches the store and serves its blob whole, and a well-formed address the
+/// daemon does not hold still answers `cas.not_found`, distinct from the shape
+/// refusal. Without this, a guard that refused every read would pass the two
+/// tests above.
+#[tokio::test]
+async fn a_well_formed_address_still_reaches_the_store() {
+    let (_dir, cas, core) = core_with_cas();
+    let text = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let stored = cas.put(text.as_bytes(), "text/x-diff").expect("put diff");
+
+    let served = util::tool_call(
+        &core,
+        1,
+        "cas_read",
+        json!({"hash": stored.hash, "bytes": stored.bytes, "mime": stored.mime}),
+    )
+    .await;
+    assert_ne!(
+        served["isError"],
+        json!(true),
+        "a 64-lowercase-hex address is a CAS address and reads normally: {served:#}"
+    );
+    assert_eq!(util::tool_payload(&served)["content"], json!(text));
+
+    let missing = util::tool_call(&core, 2, "cas_read", args(ABSENT)).await;
+    util::assert_tool_refusal(&missing, codes::CAS_NOT_FOUND);
+}

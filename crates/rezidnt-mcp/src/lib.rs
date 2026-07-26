@@ -120,37 +120,68 @@ pub mod codes {
     /// caller its badge is bad would be false, an honesty regression (I6,
     /// DR-045 §Invariant posture). Refused on POLICY, before any effect.
     pub const FAN_OUT_LEAD_ONLY: &str = "fan_out.lead_only";
-    /// DR-057 §Decision 2 — `cas_read` addressed a blob this daemon's CAS does
-    /// not hold. An honest refusal, never an empty success: a
-    /// `{content: "", truncated: false}` for an absent blob would fabricate a
-    /// zero-byte diff the log never pinned (I6, and the sibling of `diff_view`'s
-    /// null-vs-fabricated-ref leg). Additive code — older peers tolerate an
-    /// unknown refusal code (the `scope.requires_ttl` precedent, I5).
+    /// The `cas.*` refusal family — ATTRIBUTION, stated plainly. DR-057
+    /// §Decision 2 rules the tool's BEHAVIOR ("a non-text mime is refused with a
+    /// plain code", "over-bound content is REFUSED") but mints NO code names at
+    /// all. Every `cas.*` code in this module, THIS ONE INCLUDED, is therefore
+    /// an IMPLEMENTER ADDITION under the module's standing additive DEFAULT —
+    /// the same footing as
+    /// [`ARGS_INVALID`]/[`SPAWN_FAILED`], not a board mint — and **ratification
+    /// is owed (DR-058)**. House practice since DR-035 is one-record-one-mint,
+    /// and citing a §Decision that minted nothing would misattribute a
+    /// judgement the record never made. Additive either way: older peers
+    /// tolerate an unknown refusal code (the `scope.requires_ttl` precedent, I5).
+    ///
+    /// `cas_read` addressed a blob this daemon's CAS does not hold. An honest
+    /// refusal, never an empty success: a `{content: "", truncated: false}` for
+    /// an absent blob would fabricate a zero-byte diff the log never pinned (I6,
+    /// and the sibling of `diff_view`'s null-vs-fabricated-ref leg).
     pub const CAS_NOT_FOUND: &str = "cas.not_found";
-    /// DR-057 §Decision 2 — the bytes at the addressed path do not hash to the
-    /// address. [`rezidnt_cas::Cas::get`] refuses this already and the tool does
-    /// not route around it: content that fails its own address is served to
-    /// nobody. Distinct from [`CAS_NOT_FOUND`] because the operator action
-    /// differs — a corrupt store is an integrity incident, a missing blob is not.
+    /// The bytes at the addressed path do not hash to the address.
+    /// [`rezidnt_cas::Cas::get`] refuses this already and the tool does not
+    /// route around it: content that fails its own address is served to nobody.
+    /// Distinct from [`CAS_NOT_FOUND`] because the operator action differs — a
+    /// corrupt store is an integrity incident, a missing blob is not.
+    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
     pub const CAS_CORRUPT: &str = "cas.corrupt";
-    /// DR-057 §Decision 2 — the ACTUAL blob is larger than
-    /// [`crate::MAX_CAS_READ_BYTES_DEFAULT`]. Refused WHOLE and bytes-free: v1
-    /// serves no partial reads, because a client that cannot tell a partial diff
-    /// from a whole one is worse off than one with no review surface at all.
-    /// Judged against the blob, never against the caller's claimed `bytes` — an
-    /// under-claiming ref cannot smuggle over-bound content through.
+    /// The ACTUAL blob is larger than [`crate::MAX_CAS_READ_BYTES_DEFAULT`]
+    /// (the 256 KiB DEFAULT bound is DR-057 §Decision 2's; this code's NAME is
+    /// not). Refused WHOLE and bytes-free: v1 serves no partial reads, because a
+    /// client that cannot tell a partial diff from a whole one is worse off than
+    /// one with no review surface at all. Judged against the blob, never against
+    /// the caller's claimed `bytes` — an under-claiming ref cannot smuggle
+    /// over-bound content through. Implementer addition, ratification owed
+    /// (DR-058) — see [`CAS_NOT_FOUND`].
     pub const CAS_TOO_LARGE: &str = "cas.too_large";
-    /// DR-057 §Decision 2 — the ref's CLAIMED mime is not a text type, and v1
-    /// serves text only. Refused plainly rather than mangled into a JSON string.
+    /// The ref's CLAIMED mime is not a text type, and v1 serves text only.
+    /// Refused plainly rather than mangled into a JSON string. Implementer
+    /// addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
     pub const CAS_NOT_TEXT: &str = "cas.not_text";
-    /// DR-057 §Decision 2 — the ref claimed a text mime but the bytes are not
-    /// valid UTF-8. Deliberately NOT [`CAS_NOT_TEXT`]: that one is a fact about
-    /// the caller's own ref (visible to the caller before it calls), this one is
-    /// a fact about the stored content (only the daemon can see it), and telling
-    /// a caller its mime is wrong when the STORE is what disagrees would misstate
-    /// why (I6). Never served through `from_utf8_lossy`: U+FFFD substitution
-    /// would hand back content that hashes to something other than the address.
+    /// The ref claimed a text mime but the bytes are not valid UTF-8.
+    /// Deliberately NOT [`CAS_NOT_TEXT`]: that one is a fact about the caller's
+    /// own ref (visible to the caller before it calls), this one is a fact about
+    /// the stored content (only the daemon can see it), and telling a caller its
+    /// mime is wrong when the STORE is what disagrees would misstate why (I6).
+    /// Never served through `from_utf8_lossy`: U+FFFD substitution would hand
+    /// back content that hashes to something other than the address.
+    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
     pub const CAS_NOT_UTF8: &str = "cas.not_utf8";
+    /// The `hash` argument is not a CAS ADDRESS: not exactly
+    /// [`crate::CAS_ADDRESS_HEX_LEN`] lowercase blake3 hex characters. Refused
+    /// on SHAPE, before any filesystem call — see `is_cas_address` for why the
+    /// check is a security boundary and not merely hygiene.
+    ///
+    /// Distinct from [`CAS_NOT_FOUND`] on the [`SUBSTRATE_UNAVAILABLE`]
+    /// reasoning: answering "no blob X in this daemon's CAS" would claim the
+    /// daemon LOOKED and did not find, when it never looked — blaming the store
+    /// for the caller's own malformed argument (I6). The distinction leaks
+    /// nothing: this verdict is a pure function of the argument, decidable by
+    /// the caller offline, and its message carries no echo of the input and no
+    /// fact about the store, so every rejected shape refuses byte-identically
+    /// (pinned by `tests/dr057_cas_address_guard.rs`).
+    ///
+    /// Implementer addition, ratification owed (DR-058) — see [`CAS_NOT_FOUND`].
+    pub const CAS_HASH_INVALID: &str = "cas.hash_invalid";
 }
 
 /// DR-044 §Decision 4 — the DEFAULT width cap: at most this many tasks ride one
@@ -177,6 +208,55 @@ pub const MAX_FAN_OUT_DEFAULT: usize = 8;
 /// The bound is enforced against the ACTUAL blob, never against the caller's
 /// claimed `CasReadArgs::bytes` (see [`McpCore::call_cas_read`]).
 pub const MAX_CAS_READ_BYTES_DEFAULT: u64 = 256 * 1024;
+
+/// Length of a CAS address in hex characters: blake3 is 32 bytes, so 64.
+/// [`rezidnt_cas::Cas::put`] returns exactly this shape and nothing else is a
+/// valid address (`crates/rezidnt-cas/src/lib.rs`, "The returned hash is
+/// lowercase blake3 hex").
+pub const CAS_ADDRESS_HEX_LEN: usize = 64;
+
+/// Is this string a CAS ADDRESS — exactly [`CAS_ADDRESS_HEX_LEN`] LOWERCASE hex
+/// characters?
+///
+/// A SECURITY BOUNDARY, not hygiene. [`rezidnt_cas::Cas::path_for`] is
+/// `root.join(hash)`, and `PathBuf::join` REPLACES the root on an absolute
+/// component and normalizes no `..` — so an unvalidated `hash` is an arbitrary
+/// path, and `cas_read` is unbadged. Without this gate a caller with no badge at
+/// all could aim the tool at any path the daemon can read and harvest three
+/// facts from the refusals alone: EXISTENCE (`cas.not_found` vs anything else),
+/// EXACT BYTE SIZE (`blob is {actual} bytes`), and — measured by the mutation
+/// probe on `tests/dr057_cas_address_guard.rs`, a leg stronger than the audit
+/// finding named — the BLAKE3 OF THE FILE'S CONTENT, which `cas.corrupt` prints
+/// as `the stored bytes hash to {actual}`. That last one degrades a metadata
+/// oracle into a content oracle for any file whose content a caller can guess
+/// and confirm. The bytes themselves stayed unserved only incidentally, because
+/// [`rezidnt_cas::Cas::get`] re-hashes before returning. All of it is exactly
+/// the local-disk backchannel DR-038 §Decision 4 forecloses, so the shape is
+/// checked BEFORE the first syscall ([`read_bounded`]) rather than relied on
+/// from the schema's prose.
+///
+/// LOWERCASE only, deliberately narrow: `Cas::put` emits lowercase, so a
+/// lowercase-only rule admits every address this daemon can actually hold.
+/// Accepting uppercase would admit a string that addresses nothing on a
+/// case-sensitive filesystem and a DIFFERENT-cased duplicate on Windows —
+/// widening later is additive, narrowing later would break callers.
+fn is_cas_address(hash: &str) -> bool {
+    hash.len() == CAS_ADDRESS_HEX_LEN
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The malformed-address refusal message.
+///
+/// Carries NO echo of the caller's input and NO fact about the store, so every
+/// rejected shape — a `../` traversal, an absolute path, uppercase hex, the
+/// wrong length, a non-hex character — refuses BYTE-IDENTICALLY. A caller
+/// therefore cannot tell "invalid shape" from any other, and cannot tell either
+/// from what is on disk: the answer is a pure function of the argument it
+/// already holds.
+const CAS_HASH_INVALID_MESSAGE: &str = "hash is not a CAS address: cas_read addresses blobs by \
+     exactly 64 lowercase blake3 hex characters. Refused on the argument's SHAPE, before any \
+     lookup — this answer is a function of the argument alone and reports nothing about this \
+     daemon's store";
 
 /// MCP protocol version this server speaks (DEFAULT: the current spec rev).
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -2193,6 +2273,10 @@ impl McpCore {
     /// bytes must then decode as UTF-8 ([`codes::CAS_NOT_UTF8`]) — so claiming
     /// `text/plain` over a binary blob buys nothing. Nothing is ever served
     /// through `from_utf8_lossy`.
+    ///
+    /// The `hash` is a caller-controlled path component and this tool is
+    /// UNBADGED, so its shape is a security gate, enforced in [`read_bounded`]
+    /// before the first syscall ([`is_cas_address`], [`codes::CAS_HASH_INVALID`]).
     async fn call_cas_read(&self, args: Value) -> RpcOutcome {
         let parsed: rezidnt_types::mcp::CasReadArgs =
             serde_json::from_value(args).map_err(|e| (-32602, format!("cas_read args: {e}")))?;
@@ -2467,6 +2551,12 @@ enum CasReadOutcome {
 /// Blocking (filesystem); called only from `spawn_blocking`. Order is chosen so
 /// each refusal names the FIRST thing actually wrong:
 ///
+/// 0. the ADDRESS SHAPE ([`is_cas_address`]) — before any syscall, because
+///    `Cas::path_for` is a bare `root.join(hash)` and an unchecked `hash` is an
+///    arbitrary path on an UNBADGED tool. The guard lives here, immediately in
+///    front of the syscalls it protects rather than up in [`McpCore::call_cas_read`],
+///    so no future caller of this function can route around it. One door, not
+///    defence-in-depth;
 /// 1. size of the blob AS STORED, before anything is read into memory — so an
 ///    over-bound blob is never even materialized, let alone partially served;
 /// 2. read + hash-verify through [`Cas::get`], the store's own door, which
@@ -2476,6 +2566,12 @@ enum CasReadOutcome {
 ///    slip past on the strength of a stale measurement;
 /// 4. UTF-8 decode, whole or not at all.
 fn read_bounded(cas: &Cas, addressed: &rezidnt_types::refs::CasRef) -> CasReadOutcome {
+    if !is_cas_address(&addressed.hash) {
+        return CasReadOutcome::Refused(
+            codes::CAS_HASH_INVALID,
+            CAS_HASH_INVALID_MESSAGE.to_string(),
+        );
+    }
     let stored = match std::fs::metadata(cas.path_for(&addressed.hash)) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
